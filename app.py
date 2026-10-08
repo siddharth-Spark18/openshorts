@@ -31,6 +31,7 @@ from pydantic import BaseModel
 from s3_uploader import upload_job_artifacts, list_all_clips, upload_actor_to_s3, list_actor_gallery, upload_video_to_gallery, list_video_gallery
 import recut
 import layout_ranges
+import jobs_db
 
 load_dotenv()
 
@@ -141,7 +142,7 @@ async def resolve_gemini(request: Request) -> Optional[str]:
     Cloud (hosted) is PAID-ONLY: there is no BYOK for the core pipeline, so the
     ``X-Gemini-Key`` header is ignored — an entitled user (active plan or trial)
     gets the managed server key, everyone else gets ``None`` (→ 402, start trial).
-    Self-host keeps BYOK: header wins, else the env fallback.
+    Self-host keeps BYOK: header wins, then DB-persisted key, then env fallback.
     """
     if BILLING_ENABLED:
         user = await _user_from_request(request)
@@ -151,7 +152,10 @@ async def resolve_gemini(request: Request) -> Optional[str]:
     header = request.headers.get("X-Gemini-Key")
     if header:
         return header
-    return os.environ.get("GEMINI_API_KEY")
+    # DB-persisted key (set via /api/settings) takes priority over env var so
+    # users who configure keys in the UI don't need to restart the container.
+    db_key = jobs_db.get_setting("gemini_key")
+    return db_key or os.environ.get("GEMINI_API_KEY")
 
 
 async def resolve_upload_post(request: Request, body_key: Optional[str] = None):
@@ -169,7 +173,8 @@ async def resolve_upload_post(request: Request, body_key: Optional[str] = None):
             return managed_keys.upload_post_key(), profile
         return None, None
     header = request.headers.get("X-Upload-Post-Key")
-    key = header or body_key or os.environ.get("UPLOAD_POST_API_KEY")
+    db_key = jobs_db.get_setting("upload_post_key")
+    key = header or body_key or db_key or os.environ.get("UPLOAD_POST_API_KEY")
     return key, None
 
 
@@ -1739,6 +1744,8 @@ def _purge_local_jobs_for_user(user_id) -> int:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Initialise persistent SQLite store (Fix 2 & 3).
+    jobs_db.init_db()
     # Rehydrate finished jobs from disk before serving (survives restarts).
     _recover_jobs_from_disk()
     # Re-enqueue jobs that were mid-processing when we stopped (redeploy). Their
@@ -1920,6 +1927,7 @@ async def run_job(job_id, job_data):
     
     jobs[job_id]['status'] = 'processing'
     jobs[job_id]['logs'].append("Job started by worker.")
+    jobs_db.record_job_started(job_id)
     print(f"🎬 [run_job] Executing command for {job_id}: {' '.join(cmd)}")
     
     try:
@@ -2020,6 +2028,7 @@ async def run_job(job_id, job_data):
                     # Nothing to hand over: fail the job so _settle_reservation
                     # releases the minutes instead of committing them.
                     jobs[job_id]['status'] = 'failed'
+                    jobs_db.record_job_finished(job_id, 'failed')
                     jobs[job_id]['logs'].append(
                         "No clips could be rendered from this video.")
                 else:
@@ -2027,15 +2036,19 @@ async def run_job(job_id, job_data):
                         jobs[job_id]['logs'].append(
                             f"⚠️ {missing} of {len(clips)} clips failed to render.")
                     jobs[job_id]['result'] = {'clips': rendered, 'cost_analysis': cost_analysis}
+                    jobs_db.record_job_finished(job_id, 'completed', clip_count=len(rendered))
             else:
                  jobs[job_id]['status'] = 'failed'
+                 jobs_db.record_job_finished(job_id, 'failed')
                  jobs[job_id]['logs'].append("No metadata file generated.")
         else:
             jobs[job_id]['status'] = 'failed'
+            jobs_db.record_job_finished(job_id, 'failed')
             jobs[job_id]['logs'].append(_scrub_secrets(f"Process failed with exit code {returncode}"))
             
     except Exception as e:
         jobs[job_id]['status'] = 'failed'
+        jobs_db.record_job_finished(job_id, 'failed')
         # Exception text can embed URLs with credentials (e.g. the proxy URL
         # inside a yt-dlp/httpx error) — scrub before it reaches client logs.
         jobs[job_id]['logs'].append(_scrub_secrets(f"Execution error: {str(e)}"))
@@ -2061,6 +2074,9 @@ async def health_ready():
 
 @app.get("/api/config")
 async def get_config():
+    # Include server-side key-presence flags so the frontend can skip
+    # the key-entry prompt when keys are already persisted in the DB.
+    _stored = jobs_db.get_all_settings() if not BILLING_ENABLED else {}
     return {
         "youtubeUrlEnabled": not DISABLE_YOUTUBE_URL,
         "billingEnabled": BILLING_ENABLED,
@@ -2069,6 +2085,10 @@ async def get_config():
         # Self-host only: tells the dashboard the Gemini key is optional
         # because the moment picker runs on an OpenAI-compatible server.
         "localLlm": None if BILLING_ENABLED else llm_backend.describe(),
+        # Key-presence flags (self-host only). Values are never exposed here.
+        "hasGeminiKey": bool(_stored.get("gemini_key") or os.environ.get("GEMINI_API_KEY")),
+        "hasUploadPostKey": bool(_stored.get("upload_post_key") or os.environ.get("UPLOAD_POST_API_KEY")),
+        "uploadUserId": _stored.get("upload_user_id") or "",
     }
 
 async def _probe_youtube_quality(url: str) -> dict:
@@ -2620,6 +2640,10 @@ async def process_endpoint(
         'base_url': api_base,
     }
 
+    # Persist job record to SQLite (Fix 2).
+    _input_source = url or (file.filename if file else input_path or "")
+    jobs_db.record_job_created(job_id, input_source=str(_input_source or ""))
+
     # Persist the owner so recovered jobs keep their multi-tenant guard after a
     # restart (see _recover_jobs_from_disk).
     if user_id is not None:
@@ -2695,6 +2719,104 @@ async def get_status(job_id: str, request: Request):
         # offer), so the dashboard can say so next to the clips.
         "partial": job.get('partial'),
     }
+
+
+# --- Job history (Fix 2) ---------------------------------------------------
+
+@app.get("/api/jobs")
+async def list_jobs_endpoint(limit: int = 100):
+    """Return the most-recent jobs from persistent storage, newest first."""
+    return {"jobs": jobs_db.list_jobs(limit=min(limit, 500))}
+
+
+# --- Projects (Fix 3) -------------------------------------------------------
+
+class _ProjectCreate(BaseModel):
+    name: str
+
+
+class _ProjectRename(BaseModel):
+    name: str
+
+
+class _JobAssign(BaseModel):
+    project_id: Optional[str] = None  # None = unassign
+
+
+@app.get("/api/projects")
+async def list_projects_endpoint():
+    """Return all named projects with their associated jobs."""
+    return {"projects": jobs_db.list_projects()}
+
+
+@app.post("/api/projects", status_code=201)
+async def create_project_endpoint(body: _ProjectCreate):
+    """Create a new named project. Returns the created project record."""
+    name = (body.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="name is required")
+    project = jobs_db.create_project(name)
+    return project
+
+
+@app.get("/api/projects/{project_id}")
+async def get_project_endpoint(project_id: str):
+    project = jobs_db.get_project(project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return project
+
+
+@app.patch("/api/projects/{project_id}")
+async def rename_project_endpoint(project_id: str, body: _ProjectRename):
+    name = (body.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="name is required")
+    ok = jobs_db.rename_project(project_id, name)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return {"ok": True}
+
+
+@app.delete("/api/projects/{project_id}", status_code=204)
+async def delete_project_endpoint(project_id: str):
+    ok = jobs_db.delete_project(project_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+
+@app.patch("/api/jobs/{job_id}/project")
+async def assign_job_project_endpoint(job_id: str, body: _JobAssign):
+    """Assign a job to a project (or unassign it by passing project_id=null)."""
+    ok = jobs_db.assign_job_to_project(job_id, body.project_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Job not found in history")
+    return {"ok": True}
+
+
+
+# --- Settings (Fix 4) -------------------------------------------------------
+
+class _SettingsUpdate(BaseModel):
+    settings: Dict[str, Optional[str]]
+
+
+@app.get("/api/settings")
+async def get_settings_endpoint():
+    """Return all persisted settings."""
+    if BILLING_ENABLED:
+        raise HTTPException(status_code=403, detail="Settings are managed in cloud mode")
+    return {"settings": jobs_db.get_all_settings()}
+
+
+@app.patch("/api/settings")
+async def update_settings_endpoint(body: _SettingsUpdate):
+    """Update settings. Pass None to clear a setting."""
+    if BILLING_ENABLED:
+        raise HTTPException(status_code=403, detail="Settings are managed in cloud mode")
+    for key, value in body.settings.items():
+        jobs_db.set_setting(key, value)
+    return {"ok": True}
 
 
 def _locate_source(job_id: str):

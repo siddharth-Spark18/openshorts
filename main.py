@@ -803,23 +803,13 @@ def download_youtube_video(url, output_dir="."):
     print("📥 Downloading video from YouTube...")
     step_start_time = time.time()
 
-    cookies_path = '/app/cookies.txt'
-    cookies_env = os.environ.get("YOUTUBE_COOKIES")
-    if cookies_env:
-        print("🍪 Found YOUTUBE_COOKIES env var, creating cookies file inside container...")
-        try:
-            with open(cookies_path, 'w') as f:
-                f.write(cookies_env)
-            if os.path.exists(cookies_path):
-                 # Never print file CONTENT here: with a headerless cookies
-                 # blob this would leak live YouTube session cookies to logs.
-                 print(f"   Debug: Cookies file created. Size: {os.path.getsize(cookies_path)} bytes")
-        except Exception as e:
-            print(f"⚠️ Failed to write cookies file: {e}")
-            cookies_path = None
+    _cookies_candidate = '/app/cookies.txt'
+    if os.path.exists(_cookies_candidate):
+        cookies_path = _cookies_candidate
+        print(f"🍪 Found cookies file at {_cookies_candidate} ({os.path.getsize(_cookies_candidate)} bytes)")
     else:
         cookies_path = None
-        print("⚠️ YOUTUBE_COOKIES env var not found.")
+        print("⚠️ No cookies file found at /app/cookies.txt — proceeding without cookies.")
     
     # Optional HTTP proxy. Set PROXY_URL to route downloads through it; unset
     # (self-host) goes direct as before.

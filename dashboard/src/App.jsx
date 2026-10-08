@@ -628,29 +628,64 @@ function App() {
   useEffect(() => {
     // Encrypt Gemini Key too for consistency if desired, but user asked specifically about Social integration not saving well.
     // For now keeping gemini plain for compatibility unless requested.
-    if (apiKey) localStorage.setItem('gemini_key', apiKey);
-  }, [apiKey]);
+    if (apiKey) {
+      localStorage.setItem('gemini_key', apiKey);
+      if (!billingEnabled) {
+        apiJson('/api/settings', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ settings: { gemini_key: apiKey } }) }).catch(console.error);
+      }
+    }
+  }, [apiKey, billingEnabled]);
 
   useEffect(() => {
     if (uploadPostKey) {
       localStorage.setItem('uploadPostKey_v3', encrypt(uploadPostKey));
+      if (!billingEnabled) {
+        apiJson('/api/settings', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ settings: { upload_post_key: uploadPostKey } }) }).catch(console.error);
+      }
     }
     if (uploadUserId) {
       localStorage.setItem('uploadUserId', uploadUserId);
+      if (!billingEnabled) {
+        apiJson('/api/settings', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ settings: { upload_user_id: uploadUserId } }) }).catch(console.error);
+      }
     }
-  }, [uploadPostKey, uploadUserId]);
+  }, [uploadPostKey, uploadUserId, billingEnabled]);
 
   useEffect(() => {
     if (elevenLabsKey) {
       localStorage.setItem('elevenLabsKey_v1', encrypt(elevenLabsKey));
+      if (!billingEnabled) {
+        apiJson('/api/settings', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ settings: { elevenlabs_key: elevenLabsKey } }) }).catch(console.error);
+      }
     }
-  }, [elevenLabsKey]);
+  }, [elevenLabsKey, billingEnabled]);
 
   useEffect(() => {
     if (falKey) {
       localStorage.setItem('falKey_v1', encrypt(falKey));
+      if (!billingEnabled) {
+        apiJson('/api/settings', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ settings: { fal_key: falKey } }) }).catch(console.error);
+      }
     }
-  }, [falKey]);
+  }, [falKey, billingEnabled]);
+
+  // Initial load of server-side settings
+  useEffect(() => {
+    if (!billingEnabled) {
+      apiJson('/api/settings')
+        .then(data => {
+          if (data && data.settings) {
+            if (data.settings.gemini_key && !apiKey) setApiKey(data.settings.gemini_key);
+            if (data.settings.upload_post_key && !uploadPostKey) setUploadPostKey(data.settings.upload_post_key);
+            if (data.settings.upload_user_id && !uploadUserId) setUploadUserId(data.settings.upload_user_id);
+            if (data.settings.elevenlabs_key && !elevenLabsKey) setElevenLabsKey(data.settings.elevenlabs_key);
+            if (data.settings.fal_key && !falKey) setFalKey(data.settings.fal_key);
+          }
+        })
+        .catch(console.error);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [billingEnabled]);
 
   useEffect(() => {
     if ((uploadPostKey || isManaged) && userProfiles.length === 0) {
