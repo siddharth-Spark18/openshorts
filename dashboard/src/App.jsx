@@ -23,6 +23,7 @@ import TrialGate from './components/TrialGate';
 import AdvancedBanner from './components/AdvancedBanner';
 import ManageClips from './components/ManageClips';
 import YoutubeCookies from './components/YoutubeCookies';
+import DriveConnection from './components/DriveConnection';
 import JobHistory from './components/JobHistory';
 import HistoryTab from './components/HistoryTab';
 import ProfileMenu from './components/ProfileMenu';
@@ -1488,6 +1489,7 @@ function App() {
               </div>
               {/* Self-hosted installs have no account page, so the agent
                   how-to lives here; cloud users get it (with OAuth) in Account. */}
+              {ownerWorkspace && <DriveConnection />}
               {ownerWorkspace && <YoutubeCookies />}
               {!billingEnabled && <div className="mb-6"><McpConnectCard cloud={false} /></div>}
               {isManaged ? (

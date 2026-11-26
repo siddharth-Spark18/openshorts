@@ -55,3 +55,19 @@ def test_youtube_cookies_are_private_persistent_and_removable(tmp_path, monkeypa
     assert client.get("/api/youtube-cookies").json() == {"configured": True}
     assert client.delete("/api/youtube-cookies").status_code == 204
     assert not path.exists()
+
+
+def test_drive_authorization_requires_login_and_checks_state(tmp_path, monkeypatch):
+    monkeypatch.setenv("DRIVE_CLIENT_ID", "123-test.apps.googleusercontent.com")
+    monkeypatch.setenv("DRIVE_CLIENT_SECRET", "test-secret")
+    monkeypatch.setenv("DRIVE_PICKER_API_KEY", "test-picker")
+    app = FastAPI()
+    install(app, "password", ClipLibrary(tmp_path / "library"))
+    client = TestClient(app, follow_redirects=False)
+    assert client.get("/api/drive/connect").status_code == 401
+    client.post("/owner/login", data={"password": "password"})
+    response = client.get("/api/drive/connect")
+    assert response.status_code == 307
+    assert "code_challenge=" in response.headers["location"]
+    assert client.get("/api/drive/callback?state=invalid&code=invalid").status_code == 400
+    assert client.get("/api/drive/status").json()["connected"] is False

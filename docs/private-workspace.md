@@ -26,7 +26,7 @@ The `library` Docker volume uses space on the host disk and requires no storage 
 
 ## Long videos
 
-The private defaults run one video job and one clip render at a time, keep downloaded speech models on disk, and use a Whisper beam size of one. Videos of 20 minutes or longer are transcribed in ten-minute sections with overlapping audio for boundary words. Each finished section is saved to the job directory so restarting an interrupted transcription can reuse it. The first run includes a model download. For more thorough decoding set `WHISPER_BEAM_SIZE=5`. For full-source transcription set `ASR_PART_SECONDS=0`. Recreate the backend after changing settings.
+The private defaults run one video job and one clip render at a time, keep downloaded speech models on disk, and use a Whisper beam size of one. Videos of four minutes or longer are transcribed in two-minute sections with overlapping audio for boundary words. Each finished section is saved to the job directory so restarting an interrupted transcription can reuse it. The default Whisper base model, two-minute sections, lazy video detector loading, and lighter scene detector reduce peak memory use on small servers. Set `SCENE_ENGINE=transnetv2` to use the neural scene detector when memory permits. The first run includes a model download. Set `WHISPER_MODEL=small` for a larger model when the server has enough memory. For more thorough decoding set `WHISPER_BEAM_SIZE=5`. For full-source transcription set `ASR_PART_SECONDS=0`. Recreate the backend after changing settings.
 
 ## YouTube links
 
@@ -45,3 +45,29 @@ The importer prompts for the workspace password and prints the submitted job ID.
 The GitHub Actions workflow deploys pushes to `dev` after you configure the repository. On EC2, keep a clean checkout of `dev`, configure the private `.env`, and ensure the SSH user can run Git and Docker Compose. The server must be able to fetch the repository.
 
 In GitHub repository settings, add the Actions secrets `EC2_HOST`, `EC2_USER`, `EC2_SSH_KEY` (the private key for that user), and `EC2_KNOWN_HOSTS` (the verified SSH host key line). Add the Actions variable `EC2_DIRECTORY` with the absolute path to the checkout. Set the variable `EC2_DEPLOY_ENABLED` to `true` when ready. The workflow also supports manual runs from the Actions tab. It fetches `dev`, requires a fast-forward update, then rebuilds and starts the private Compose stack. GitHub's runner must be able to reach the instance's SSH port.
+
+## Google Drive folder connection
+
+The Settings page can connect a Google account and select a folder with Google Picker. This connection setup does not yet upload clips to Drive.
+
+In Google Cloud, enable the Google Drive API and Google Picker API. Configure an OAuth web client with this authorized JavaScript origin:
+
+```text
+https://openshorts-dev.duckdns.org
+```
+
+Add this authorized redirect URI:
+
+```text
+https://openshorts-dev.duckdns.org/api/drive/callback
+```
+
+Create a browser API key for Picker and restrict it to the Picker API and this website origin. Add your Google account as an OAuth test user if the application is in testing. Add these settings to the server's private `.env`:
+
+```text
+DRIVE_CLIENT_ID='your-web-client-id'
+DRIVE_CLIENT_SECRET='your-client-secret'
+DRIVE_PICKER_API_KEY='your-picker-api-key'
+```
+
+Recreate the backend with Docker Compose, sign out and back into OpenShorts, then use **Settings → Google Drive** to authorize and choose the folder. The refresh token is stored with owner-only permissions in the persistent library volume. Disconnect removes the local token. You can also revoke access in your Google account.

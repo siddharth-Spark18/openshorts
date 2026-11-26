@@ -10,14 +10,11 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from scenedetect import open_video, SceneManager
 from scenedetect.detectors import ContentDetector
-from ultralytics import YOLO
-import torch
 import os
 import math
 import numpy as np
 from tqdm import tqdm
 import yt_dlp
-import mediapipe as mp
 # import whisper (replaced by faster_whisper inside function)
 from google import genai
 from google.genai import types as genai_types
@@ -82,15 +79,9 @@ OUTPUT — RETURN ONLY VALID JSON (no markdown, no comments). Order clips by pre
 }}
 """
 
-# Load the YOLO model once (Keep for backup or scene analysis if needed)
-# YOLO_MODEL_PATH lets deployments point at a pre-downloaded weights file so a
-# volume mounted over the workdir doesn't trigger a re-download at startup.
-model = YOLO(os.environ.get("YOLO_MODEL_PATH", "yolov8n.pt"))
-
-# --- MediaPipe Setup ---
-# Use standard Face Detection (BlazeFace) for speed
-mp_face_detection = mp.solutions.face_detection
-face_detection = mp_face_detection.FaceDetection(model_selection=1, min_detection_confidence=0.5)
+# Detectors are loaded on first use during rendering, after transcription.
+model = None
+face_detection = None
 
 # Consecutive detections a large target move must survive before the camera
 # follows it (see SmoothedCameraman.update_target). Env-overridable so the
@@ -436,7 +427,12 @@ def detect_face_candidates(frame):
     height, width, _ = frame.shape
     small, _scale = _detection_frame(frame)
     rgb_frame = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+    global face_detection
     with DETECT_LOCK:
+        if face_detection is None:
+            import mediapipe as mp
+            face_detection = mp.solutions.face_detection.FaceDetection(
+                model_selection=1, min_detection_confidence=0.5)
         results = face_detection.process(rgb_frame)
     
     candidates = []
@@ -465,8 +461,11 @@ def detect_person_yolo(frame):
     ORIGINAL frame coordinates (inference runs on a downscaled copy).
     """
     small, scale = _detection_frame(frame)
-    # Use the globally loaded model
+    global model
     with DETECT_LOCK:
+        if model is None:
+            from ultralytics import YOLO
+            model = YOLO(os.environ.get("YOLO_MODEL_PATH", "yolov8n.pt"))
         results = model(small, verbose=False, classes=[0]) # class 0 is person
 
     if not results:
@@ -2019,6 +2018,11 @@ if __name__ == '__main__':
                 save_transcript_checkpoint(output_dir, transcript, input_video, duration)
             except NoAudioError as e:
                 print(f"🔇 {e} — switching to visual analysis.")
+
+        # Free speech model weights before loading video detection models.
+        if os.environ.get("LOW_MEMORY_MODE") == "1":
+            from transcribe_backends import release_models
+            release_models()
 
         # Music-only or wordless footage transcribes to a handful of words.
         # Clip it by what is on screen instead, like a video with no audio.

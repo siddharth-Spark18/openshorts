@@ -2089,7 +2089,11 @@ async def run_job(job_id, job_data):
         else:
             jobs[job_id]['status'] = 'failed'
             jobs_db.record_job_finished(job_id, 'failed')
-            jobs[job_id]['logs'].append(_scrub_secrets(f"Process failed with exit code {returncode}"))
+            if returncode == -signal.SIGKILL:
+                jobs[job_id]['logs'].append(
+                    "The video worker was killed by the system. Check server memory and system logs.")
+            else:
+                jobs[job_id]['logs'].append(_scrub_secrets(f"Process failed with exit code {returncode}"))
             
     except Exception as e:
         jobs[job_id]['status'] = 'failed'

@@ -247,9 +247,8 @@ def release_models():
     import gc
     gc.collect()
     try:
-        import torch
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        if "torch" in sys.modules and sys.modules["torch"].cuda.is_available():
+            sys.modules["torch"].cuda.empty_cache()
     except Exception:
         pass
     if "onnxruntime" in sys.modules or "faster_whisper" in sys.modules:

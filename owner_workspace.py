@@ -98,7 +98,7 @@ def install(app, password, library):
         sessions[token] = now + SESSION_SECONDS
         response = RedirectResponse("/#app", status_code=303)
         response.set_cookie(COOKIE, token, max_age=SESSION_SECONDS, httponly=True,
-                            secure=request.url.scheme == "https", samesite="strict")
+                            secure=request.url.scheme == "https", samesite="lax")
         return response
 
     @app.post("/owner/logout")
@@ -149,6 +149,9 @@ def install(app, password, library):
         if path:
             Path(path).unlink(missing_ok=True)
         return Response(status_code=204)
+
+    import drive_connection
+    drive_connection.install(app, library)
 
     @app.get("/api/library")
     def list_clips():
