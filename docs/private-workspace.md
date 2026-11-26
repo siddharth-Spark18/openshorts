@@ -37,3 +37,9 @@ python3 cli/import_youtube.py --own-content 'https://www.youtube.com/watch?v=VID
 ```
 
 The importer prompts for the workspace password and prints the submitted job ID. Temporary media and the cookie file are removed when the command exits. The file upload limit is 2 GiB. Private or otherwise inaccessible videos still require a source you can access.
+
+## Deploy updates from GitHub
+
+The GitHub Actions workflow deploys pushes to `dev` after you configure the repository. On EC2, keep a clean checkout of `dev`, configure the private `.env`, and ensure the SSH user can run Git and Docker Compose. The server must be able to fetch the repository.
+
+In GitHub repository settings, add the Actions secrets `EC2_HOST`, `EC2_USER`, `EC2_SSH_KEY` (the private key for that user), and `EC2_KNOWN_HOSTS` (the verified SSH host key line). Add the Actions variable `EC2_DIRECTORY` with the absolute path to the checkout. Set the variable `EC2_DEPLOY_ENABLED` to `true` when ready. The workflow also supports manual runs from the Actions tab. It fetches `dev`, requires a fast-forward update, then rebuilds and starts the private Compose stack. GitHub's runner must be able to reach the instance's SSH port.

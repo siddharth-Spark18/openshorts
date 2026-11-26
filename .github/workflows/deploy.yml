@@ -1,0 +1,41 @@
+name: Deploy private workspace
+
+on:
+  push:
+    branches: [dev]
+  workflow_dispatch:
+
+concurrency:
+  group: private-ec2-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: vars.EC2_DEPLOY_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Configure SSH
+        env:
+          SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.EC2_KNOWN_HOSTS }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/id_ed25519 ~/.ssh/known_hosts
+      - name: Update and start the workspace
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+          EC2_DIRECTORY: ${{ vars.EC2_DIRECTORY }}
+        run: |
+          case "$EC2_DIRECTORY" in
+            /*) ;;
+            *) echo "EC2_DIRECTORY must be an absolute path." >&2; exit 1 ;;
+          esac
+          case "$EC2_DIRECTORY" in
+            *[!a-zA-Z0-9_./-]*) echo "Invalid EC2_DIRECTORY." >&2; exit 1 ;;
+          esac
+          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes "$EC2_USER@$EC2_HOST" \
+            "cd '$EC2_DIRECTORY' && git fetch origin dev && git merge --ff-only origin/dev && docker compose -f docker-compose.private.yml up --build -d"

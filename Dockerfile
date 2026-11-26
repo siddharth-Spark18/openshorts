@@ -14,7 +14,7 @@ COPY requirements.txt requirements-billing.txt ./
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 RUN pip install --upgrade pip
-ARG CPU_ONLY=0
+ARG CPU_ONLY=1
 RUN if [ "$CPU_ONLY" = "1" ]; then \
       pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu \
         torch==2.11.0 torchvision==0.26.0; \
@@ -24,7 +24,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # are only imported when BILLING_ENABLED is set. Harmless/unused in self-host.
 RUN pip install --no-cache-dir -r requirements-billing.txt
 
-# GPU build (--build-arg GPU=1): user-space CUDA libs only — the NVIDIA
+# GPU build (--build-arg GPU=1 --build-arg CPU_ONLY=0): user-space CUDA libs only — the NVIDIA
 # container runtime injects the driver. cuBLAS 12 + cuDNN 9 for CTranslate2
 # (faster-whisper CUDA), onnx-asr + onnxruntime-gpu for Parakeet. Adds ~2GB,
 # so the default CPU image stays slim.
@@ -33,6 +33,12 @@ RUN if [ "$GPU" = "1" ]; then \
       pip install --no-cache-dir \
         "nvidia-cublas-cu12<13" "nvidia-cudnn-cu12>=9,<10" \
         onnx-asr onnxruntime-gpu; \
+    fi
+
+# PyTorch's C++ headers and static build metadata are unnecessary for inference.
+# Remove them in the builder before copying the environment into the final image.
+RUN if [ "$CPU_ONLY" = "1" ] && [ "$GPU" != "1" ]; then \
+      python -c "import pathlib, shutil, torch; p = pathlib.Path(torch.__file__).parent; [shutil.rmtree(p / name, ignore_errors=True) for name in ('include', 'share', 'test')]"; \
     fi
 
 # Final stage
