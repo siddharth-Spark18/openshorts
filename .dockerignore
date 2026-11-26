@@ -62,3 +62,9 @@ README.md
 
 
 
+
+output/
+uploads/
+library/
+.cache/
+*cookies.txt

@@ -27,7 +27,7 @@ def get_whisper_config():
 # Decode params shared by both transcription paths. condition_on_previous_text
 # is off to avoid repetition/hallucination loops; vad_filter drops silence.
 WHISPER_TRANSCRIBE_PARAMS = {
-    "beam_size": 5,
+    "beam_size": max(1, int(os.environ.get("WHISPER_BEAM_SIZE", "5"))),
     "vad_filter": True,
     "condition_on_previous_text": False,
     "word_timestamps": True,

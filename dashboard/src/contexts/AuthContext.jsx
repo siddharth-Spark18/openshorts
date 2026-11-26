@@ -137,6 +137,8 @@ export function AuthProvider({ children }) {
   }, []);
 
   const value = {
+    hasServerGeminiKey: !!config.hasGeminiKey,
+    ownerWorkspace: !!config.ownerWorkspace,
     billingEnabled: config.billingEnabled,
     localLlm: config.localLlm || null,
     googleAuthEnabled: config.googleAuthEnabled,

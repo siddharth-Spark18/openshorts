@@ -803,8 +803,9 @@ def download_youtube_video(url, output_dir="."):
     print("📥 Downloading video from YouTube...")
     step_start_time = time.time()
 
-    _cookies_candidate = '/app/cookies.txt'
-    if os.path.exists(_cookies_candidate):
+    from quality_probe import _find_cookies_path
+    _cookies_candidate = _find_cookies_path()
+    if _cookies_candidate:
         cookies_path = _cookies_candidate
         print(f"🍪 Found cookies file at {_cookies_candidate} ({os.path.getsize(_cookies_candidate)} bytes)")
     else:
@@ -856,17 +857,17 @@ def download_youtube_video(url, output_dir="."):
         if capped:
             return ('bestvideo[vcodec^=avc1][height<=720][ext=mp4]+bestaudio[ext=m4a]/'
                     'bestvideo[vcodec^=avc1][height<=720]+bestaudio/'
-                    'best[height<=720][ext=mp4]/best[height<=720]/best')
+                    'bestvideo[height<=720]+bestaudio/best[height<=720][ext=mp4]/best[height<=720]/best')
         return ('bestvideo[vcodec^=avc1][height<=1080][ext=mp4]+bestaudio[ext=m4a]/'
                 'bestvideo[vcodec^=avc1][height<=1080]+bestaudio/'
-                'best[height<=1080][ext=mp4]/best[ext=mp4]/best')
+                'bestvideo[height<=1080]+bestaudio/best[height<=1080][ext=mp4]/best[ext=mp4]/best')
 
     def _base_opts(extractor_args, proxy, cookies=True):
         return {
             'quiet': False, 'verbose': True, 'no_warnings': False,
             'cookiefile': cookies_path if (cookies and cookies_path) else None,
             'proxy': proxy, 'socket_timeout': 30, 'retries': 10, 'fragment_retries': 10,
-            'nocheckcertificate': True, 'cachedir': False,
+            'cachedir': False,
             # A `watch?v=X&list=...` link is the one video the user was
             # watching, not the playlist: without this yt-dlp downloads every
             # entry of the list into the SAME outtmpl (the title is the
@@ -899,22 +900,9 @@ def download_youtube_video(url, output_dir="."):
     def _attempt(extractor_args, fmt, proxy, cookies=True):
         _dl_bytes["total"] = 0
         _dl_bytes["partial"] = 0
-        with yt_dlp.YoutubeDL(_base_opts(extractor_args, proxy, cookies)) as ydl:
-            info = ydl.extract_info(url, download=False)
-        sanitized = sanitize_filename(info.get('title', 'youtube_video'))
-        expected = os.path.join(output_dir, f'{sanitized}.mp4')
-        if os.path.exists(expected):
-            os.remove(expected)
-        dl_opts = {
-            **_base_opts(extractor_args, proxy, cookies),
-            'format': fmt,
-            'outtmpl': os.path.join(output_dir, f'{sanitized}.%(ext)s'),
-            'merge_output_format': 'mp4', 'overwrites': True,
-            'progress_hooks': [_progress_hook],
-        }
-        with yt_dlp.YoutubeDL(dl_opts) as ydl:
-            ydl.download([url])
-        return sanitized
+        from yt_clients import download_source
+        return download_source(url, output_dir, _base_opts(extractor_args, proxy, cookies),
+                               fmt, _progress_hook, sanitize_filename)
 
     # DIRECT_FIRST=1: try the server's own IP before spending proxy bandwidth.
     # Needs cookies + a PO-token provider — without both, YouTube flags the
@@ -989,7 +977,7 @@ def download_youtube_video(url, output_dir="."):
 ❌ FATAL ERROR: YOUTUBE DOWNLOAD FAILED (all strategies)
 ❌ ================================================================= ❌
 REASON: YouTube blocked the request or the download tooling is out of date.
-👇 SOLUTION FOR USER: download the video manually and use the 'Upload Video' tab.
+For a private workspace, use cli/import_youtube.py from your computer to submit this link through the SSH tunnel.
 Technical Details: {str(last_err)}
 """
         print(error_msg, file=sys.stdout)
@@ -1975,8 +1963,16 @@ if __name__ == '__main__':
         cap = cv2.VideoCapture(input_video)
         fps = cap.get(cv2.CAP_PROP_FPS)
         frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        duration = frame_count / fps
         cap.release()
+        if not fps or not frame_count:
+            probe = subprocess.check_output(
+                ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                 "-of", "csv=p=0", input_video], text=True, timeout=30)
+            duration = float(probe.strip())
+        else:
+            duration = frame_count / fps
+        if not math.isfinite(duration) or duration <= 0:
+            raise RuntimeError("Could not read the video duration.")
 
         # 3. Transcribe — unless the video has no audio, in which case fall back
         # to Gemini vision (picks clips from the imagery instead of the speech).
@@ -2003,7 +1999,16 @@ if __name__ == '__main__':
                       f"({len(transcript['segments'])} segments) — skipping transcription.")
         if transcript is None:
             try:
-                transcript = transcribe_video(input_video)
+                part_seconds = int(os.environ.get("ASR_PART_SECONDS", "0"))
+                if part_seconds >= 60 and duration >= 2 * part_seconds:
+                    from long_transcript import transcribe_parts
+                    from transcribe_backends import _has_audio_stream
+                    if not _has_audio_stream(input_video):
+                        raise NoAudioError("No audio stream in source.")
+                    transcript = transcribe_parts(input_video, duration, output_dir,
+                                                  part_seconds, transcribe_video)
+                else:
+                    transcript = transcribe_video(input_video)
                 save_transcript_checkpoint(output_dir, transcript, input_video, duration)
             except NoAudioError as e:
                 print(f"🔇 {e} — switching to visual analysis.")

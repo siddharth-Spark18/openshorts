@@ -94,3 +94,27 @@ def fallback_extractor_args(bgutil_http, bgutil_script):
     format, which is enough for a probe and better than no download."""
     return {**pot_provider_args(bgutil_http, bgutil_script),
             "youtube": {"player_client": list(HD_CLIENTS)}}
+
+
+def download_source(url, output_dir, options, fmt, progress_hook, sanitize):
+    """Extract once and atomically publish the MP4 after post-processing."""
+    import os
+    from pathlib import Path
+    import tempfile
+    import yt_dlp
+
+    with tempfile.TemporaryDirectory(dir=output_dir) as stage:
+        opts = {
+            **options, "format": fmt, "outtmpl": os.path.join(stage, "source.%(ext)s"),
+            "merge_output_format": "mp4",
+            "postprocessors": [{"key": "FFmpegVideoRemuxer", "preferedformat": "mp4"}],
+            "progress_hooks": [progress_hook],
+        }
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+        title = sanitize(info.get("title") or "video").strip(".") or "video"
+        result = Path(stage) / "source.mp4"
+        if not result.is_file() or not result.stat().st_size:
+            raise RuntimeError("Downloader did not produce an MP4.")
+        result.replace(Path(output_dir) / f"{title}.mp4")
+        return title

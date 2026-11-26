@@ -38,6 +38,10 @@ https://github.com/user-attachments/assets/b45fa983-16b4-48b5-ac5b-a267836b9ad9
 
 ---
 
+## Private single-owner deployment
+
+For a password-protected workspace on your own AWS host, follow the [private setup guide](docs/private-workspace.md). It includes persistent clip storage, downloads and deletion, and a YouTube import fallback.
+
 ## 3 Tools in 1 Platform
 
 ### 1. Clip Generator

@@ -28,6 +28,10 @@ export async function apiFetch(path, options = {}) {
 
   const res = await fetch(getApiUrl(path), { ...options, headers });
 
+  if (res.status === 401 && res.headers.get('X-OpenShorts-Login') === 'required') {
+    window.location.assign('/owner/login');
+  }
+
   if (res.status === 402) {
     let detail = {};
     try {

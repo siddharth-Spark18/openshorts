@@ -39,6 +39,8 @@ def main() -> int:
 
     result = {"max_height": 0, "mode": None, "cookies_invalid": False, "duration": 0}
     try:
+        from security_utils import assert_public_url
+        assert_public_url(args.url)
         import yt_dlp
 
         warnings = []
@@ -63,7 +65,7 @@ def main() -> int:
             'logger': _CollectLogger(),
             'socket_timeout': 20,
             'retries': 2,
-            'nocheckcertificate': True,
+            'noplaylist': True,
             'cachedir': False,
         }
         # yt-dlp's default player clients (tv_downgraded/web_safari with

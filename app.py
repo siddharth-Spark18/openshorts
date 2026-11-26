@@ -1016,6 +1016,10 @@ def _resume_interrupted_jobs() -> set:
                 env.pop("PROXY_URL", None)  # daily paid-proxy budget hit
         except Exception:
             pass
+        if not BILLING_ENABLED and owner_library:
+            stored_key = jobs_db.get_setting("gemini_key")
+            if stored_key:
+                env["GEMINI_API_KEY"] = stored_key
         if BILLING_ENABLED and user_id is not None:
             try:
                 env["GEMINI_API_KEY"] = managed_keys.gemini_key()
@@ -1070,6 +1074,14 @@ def _dir_size(path: str) -> int:
     return total
 
 
+def _protect_job_files(job_id):
+    job = jobs.get(job_id, {})
+    return (job.get("status") in {"queued", "processing", "pending"}
+            or job_id in _running_jobs
+            or os.path.isfile(_manifest_path(job_id))
+            or bool(job.get("library_save_pending")))
+
+
 def _enforce_uploads_size_cap():
     """Delete the oldest source uploads while UPLOAD_DIR is over UPLOADS_MAX_GB.
 
@@ -1085,7 +1097,7 @@ def _enforce_uploads_size_cap():
     files = []
     for name in os.listdir(UPLOAD_DIR):
         p = os.path.join(UPLOAD_DIR, name)
-        if os.path.isfile(p):
+        if os.path.isfile(p) and not _protect_job_files(name[:36]):
             try:
                 files.append((os.path.getmtime(p), p, os.path.getsize(p)))
             except OSError:
@@ -1114,7 +1126,7 @@ def _enforce_output_size_cap():
     thumbs = os.path.basename(THUMBNAILS_DIR)
     candidates = []
     for job_id in os.listdir(OUTPUT_DIR):
-        if job_id == thumbs:
+        if job_id == thumbs or _protect_job_files(job_id):
             continue
         p = os.path.join(OUTPUT_DIR, job_id)
         if os.path.isdir(p):
@@ -1145,7 +1157,7 @@ def _sweep_retained_sources(now=None):
         return
     now = time.time() if now is None else now
     for job_id in os.listdir(OUTPUT_DIR):
-        if job_id == os.path.basename(THUMBNAILS_DIR):
+        if job_id == os.path.basename(THUMBNAILS_DIR) or _protect_job_files(job_id):
             continue
         try:
             metas = glob.glob(os.path.join(OUTPUT_DIR, job_id, "*_metadata.json"))
@@ -1173,12 +1185,16 @@ async def cleanup_jobs():
             await asyncio.sleep(300) # Check every 5 minutes
             now = time.time()
             
+            if owner_library:
+                for job_id, job in list(jobs.items()):
+                    if job.get("library_save_pending"):
+                        await _save_owner_clips(job_id, job)
             # Simple directory cleanup based on modification time
             # Check OUTPUT_DIR
             for job_id in os.listdir(OUTPUT_DIR):
                 # Not a job: the thumbnails dir backs a StaticFiles mount, so
                 # deleting it would 500 every /thumbnails request until reboot.
-                if job_id == os.path.basename(THUMBNAILS_DIR):
+                if job_id == os.path.basename(THUMBNAILS_DIR) or _protect_job_files(job_id):
                     continue
                 job_path = os.path.join(OUTPUT_DIR, job_id)
                 if os.path.isdir(job_path):
@@ -1222,7 +1238,7 @@ async def cleanup_jobs():
             for filename in os.listdir(UPLOAD_DIR):
                 file_path = os.path.join(UPLOAD_DIR, filename)
                 try:
-                    if now - os.path.getmtime(file_path) > JOB_RETENTION_SECONDS:
+                    if not _protect_job_files(filename[:36]) and now - os.path.getmtime(file_path) > JOB_RETENTION_SECONDS:
                          os.remove(file_path)
                 except Exception: pass
 
@@ -1309,12 +1325,25 @@ async def _track_proxy_usage(job_id):
             print(f"⚠️ Proxy alert failed: {e}")
 
 
+async def _save_owner_clips(job_id, job):
+    try:
+        await asyncio.to_thread(owner_library.archive, job_id, job)
+        job.pop("library_save_pending", None)
+    except OSError as exc:
+        if not job.get("library_save_pending"):
+            job["logs"].append("Library save pending. Check free disk space.")
+        job["library_save_pending"] = True
+        print(f"Library save failed for {job_id}: {exc}")
+
+
 async def run_job_wrapper(job_id):
     """Wrapper to run job and release semaphore"""
     try:
         job = jobs.get(job_id)
         if job:
             await run_job(job_id, job)
+            if owner_library:
+                await _save_owner_clips(job_id, job)
     except Exception as e:
          print(f"❌ Job wrapper error {job_id}: {e}")
     finally:
@@ -1748,6 +1777,10 @@ async def lifespan(app: FastAPI):
     jobs_db.init_db()
     # Rehydrate finished jobs from disk before serving (survives restarts).
     _recover_jobs_from_disk()
+    if owner_library:
+        for job_id, job in list(jobs.items()):
+            if re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", job_id):
+                await _save_owner_clips(job_id, job)
     # Re-enqueue jobs that were mid-processing when we stopped (redeploy). Their
     # reservations must survive the orphan sweep so the resumed run can settle them.
     _resumed_reservation_ids = _resume_interrupted_jobs()
@@ -1774,6 +1807,14 @@ async def lifespan(app: FastAPI):
     # Cleanup (optional: cancel worker)
 
 app = FastAPI(lifespan=lifespan)
+owner_library = None
+if os.environ.get("OWNER_PASSWORD"):
+    if BILLING_ENABLED:
+        raise RuntimeError("Owner mode requires BILLING_ENABLED=false.")
+    import owner_workspace
+    owner_library = owner_workspace.ClipLibrary(os.environ.get("CLIP_LIBRARY_DIR", "library"))
+    owner_workspace.install(app, os.environ["OWNER_PASSWORD"], owner_library)
+
 
 # Cloud mode: attach middleware + routers at import time (before the app serves).
 if BILLING_ENABLED:
@@ -1788,7 +1829,7 @@ app.include_router(_mcp_server.router)
 # self-host keeps the permissive wildcard it has always used.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=cloud.settings.allowed_origins if BILLING_ENABLED else ["*"],
+    allow_origins=cloud.settings.allowed_origins if BILLING_ENABLED else ([] if owner_library else ["*"]),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -1945,6 +1986,7 @@ async def run_job(job_id, job_data):
         t_log.start()
         
         # Async wait for process with incremental updates
+        last_metadata_version = None
         start_wait = time.time()
         last_heartbeat = time.time()
         while process.poll() is None:
@@ -1962,9 +2004,12 @@ async def run_job(job_id, job_data):
                     # Read metadata (it might be being written to, so simple try/except or just read)
                     # Use a lock or just robust read? json.load might fail if file is partial.
                     # Usually main.py writes it once at start (based on my review).
-                    if os.path.getsize(target_json) > 0:
+                    stat = os.stat(target_json)
+                    version = (stat.st_mtime_ns, stat.st_size, len(jobs[job_id].get("ready_files") or {}))
+                    if stat.st_size and version != last_metadata_version:
                         with open(target_json, 'r') as f:
                             data = json.load(f)
+                        last_metadata_version = version
                             
                         base_name = os.path.basename(target_json).replace('_metadata.json', '')
                         clips = data.get('shorts', [])
@@ -2002,7 +2047,7 @@ async def run_job(job_id, job_data):
             
             # Self-host: silent AWS S3 backup. Cloud mode stores to R2 instead
             # (see _archive_managed_job), so skip the redundant/paid AWS upload.
-            if not BILLING_ENABLED:
+            if not BILLING_ENABLED and not owner_library:
                 loop = asyncio.get_event_loop()
                 loop.run_in_executor(None, upload_job_artifacts, output_dir, job_id)
             
@@ -2078,6 +2123,7 @@ async def get_config():
     # the key-entry prompt when keys are already persisted in the DB.
     _stored = jobs_db.get_all_settings() if not BILLING_ENABLED else {}
     return {
+        "ownerWorkspace": owner_library is not None,
         "youtubeUrlEnabled": not DISABLE_YOUTUBE_URL,
         "billingEnabled": BILLING_ENABLED,
         "googleAuthEnabled": bool(BILLING_ENABLED and cloud.settings.google_auth_enabled),
@@ -2407,6 +2453,12 @@ async def process_endpoint(
 
     if url and DISABLE_YOUTUBE_URL:
         raise HTTPException(status_code=403, detail="YouTube URL ingest is disabled on this deployment. Please upload a file you own.")
+
+    if url:
+        from yt_clients import youtube_non_video_reason
+        reason = youtube_non_video_reason(url)
+        if reason:
+            raise HTTPException(400, f"This link is {reason}.")
 
     # Pre-flight quality gate: probe the offered resolution BEFORE starting, so
     # the user can abort (refresh cookies / update yt-dlp) instead of burning
