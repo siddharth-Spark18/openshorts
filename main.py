@@ -806,7 +806,14 @@ def download_youtube_video(url, output_dir="."):
     from quality_probe import _find_cookies_path
     _cookies_candidate = _find_cookies_path()
     if _cookies_candidate:
-        cookies_path = _cookies_candidate
+        import tempfile
+        import shutil
+        import atexit
+        temp_cookie = tempfile.NamedTemporaryFile(prefix="openshorts-youtube-", delete=False)
+        temp_cookie.close()
+        shutil.copyfile(_cookies_candidate, temp_cookie.name)
+        cookies_path = temp_cookie.name
+        atexit.register(lambda: os.path.exists(cookies_path) and os.unlink(cookies_path))
         print(f"🍪 Found cookies file at {_cookies_candidate} ({os.path.getsize(_cookies_candidate)} bytes)")
     else:
         cookies_path = None
@@ -924,7 +931,7 @@ def download_youtube_video(url, output_dir="."):
          fallback_args if label.startswith('fallback') else hd_args,
          _hd_fmt_for(capped),
          proxy,
-         not (label.startswith('fallback') and hd_args))
+         bool(os.environ.get('YOUTUBE_COOKIES_PATH')) or not (label.startswith('fallback') and hd_args))
         for label, capped, proxy in plan_download_attempts(
             _direct_first, _statics, _proxy, bool(hd_args), youtube=is_youtube_url(url))
     ]

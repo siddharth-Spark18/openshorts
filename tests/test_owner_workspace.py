@@ -37,3 +37,21 @@ def test_private_workspace_lifecycle(tmp_path):
     assert ClipLibrary(library.root).clips() == []
     assert client.post("/owner/logout").status_code == 303
     assert client.get("/api/library").status_code == 401
+
+
+def test_youtube_cookies_are_private_persistent_and_removable(tmp_path, monkeypatch):
+    path = tmp_path / "youtube-cookies.txt"
+    monkeypatch.setenv("YOUTUBE_COOKIES_PATH", str(path))
+    app = FastAPI()
+    install(app, "password", ClipLibrary(tmp_path / "library"))
+    client = TestClient(app, follow_redirects=False)
+    contents = b"# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tSID\tvalue\n"
+    assert client.put("/api/youtube-cookies", files={"file": ("cookies.txt", contents)}).status_code == 401
+    client.post("/owner/login", data={"password": "password"})
+    assert client.put("/api/youtube-cookies", files={"file": ("bad.txt", b"bad")}).status_code == 400
+    assert client.put("/api/youtube-cookies", files={"file": ("cookies.txt", contents)}).status_code == 200
+    assert path.read_bytes() == contents
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert client.get("/api/youtube-cookies").json() == {"configured": True}
+    assert client.delete("/api/youtube-cookies").status_code == 204
+    assert not path.exists()

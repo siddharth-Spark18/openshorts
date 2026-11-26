@@ -30,6 +30,8 @@ The private defaults run one video job and one clip render at a time, keep downl
 
 ## YouTube links
 
+If YouTube asks the server to sign in, export YouTube cookies in Netscape format using the yt-dlp instructions, then upload the text file under **Settings → YouTube connection**. The file is stored in the persistent output volume with owner-only file permissions. Replace it if the login expires. Treat it like a password.
+
 In **Clip Generator**, select **Video URL**, paste a single-video link, confirm your rights, and submit. If YouTube refuses the AWS host, the local importer handles the download and upload in one command over the same SSH tunnel. On your computer it needs Python 3, curl, FFmpeg, and a current yt-dlp with its default dependencies and a supported JavaScript runtime such as Deno. Set the Gemini key on the server first.
 
 ```sh

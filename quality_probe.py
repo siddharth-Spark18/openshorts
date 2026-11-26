@@ -23,11 +23,12 @@ def _find_cookies_path():
     # Mirrors main.py's cookie discovery.
     script_dir = os.path.dirname(os.path.abspath(__file__))
     for candidate in [
+        os.environ.get('YOUTUBE_COOKIES_PATH', ''),
         os.path.join(script_dir, 'www.youtube.com_cookies.txt'),
         os.path.join(script_dir, 'cookies.txt'),
         '/app/cookies.txt',
     ]:
-        if os.path.exists(candidate):
+        if candidate and os.path.isfile(candidate):
             return candidate
     return None
 
@@ -36,6 +37,14 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Probe available YouTube quality for a URL.")
     parser.add_argument("--url", required=True)
     args = parser.parse_args()
+    import shutil
+    import tempfile
+    cookie_source = _find_cookies_path()
+    temp_cookies = None
+    if cookie_source:
+        temp_cookies = tempfile.NamedTemporaryFile(prefix="openshorts-youtube-", delete=False)
+        temp_cookies.close()
+        shutil.copyfile(cookie_source, temp_cookies.name)
 
     result = {"max_height": 0, "mode": None, "cookies_invalid": False, "duration": 0}
     try:
@@ -58,7 +67,7 @@ def main() -> int:
             def error(self, msg):
                 warnings.append(str(msg))
 
-        cookies_path = _find_cookies_path()
+        cookies_path = temp_cookies.name if temp_cookies else None
         base_opts = {
             'quiet': True,
             'no_warnings': False,
@@ -103,6 +112,8 @@ def main() -> int:
     except Exception:
         pass
 
+    if temp_cookies:
+        os.unlink(temp_cookies.name)
     print(json.dumps(result))
     return 0
 

@@ -1,5 +1,6 @@
 """Private single-owner session and persistent finished-clip library."""
 import hmac
+import os
 import json
 import secrets
 import shutil
@@ -8,7 +9,7 @@ import time
 from pathlib import Path
 from uuid import UUID
 
-from fastapi import Form, HTTPException, Request
+from fastapi import File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 
 COOKIE = "openshorts_owner"
@@ -106,6 +107,48 @@ def install(app, password, library):
         response = RedirectResponse("/owner/login", status_code=303)
         response.delete_cookie(COOKIE)
         return response
+
+    @app.get("/api/youtube-cookies")
+    def cookie_status():
+        path = os.environ.get("YOUTUBE_COOKIES_PATH")
+        return {"configured": bool(path and Path(path).is_file())}
+
+    @app.put("/api/youtube-cookies")
+    async def save_cookies(file: UploadFile = File(...)):
+        path = os.environ.get("YOUTUBE_COOKIES_PATH")
+        if not path:
+            raise HTTPException(503, "YouTube cookie storage is not configured.")
+        contents = await file.read(1024 * 1024 + 1)
+        if len(contents) > 1024 * 1024:
+            raise HTTPException(400, "Cookie file must be under 1 MB.")
+        try:
+            lines = contents.decode("utf-8-sig").splitlines()
+        except UnicodeDecodeError:
+            raise HTTPException(400, "Cookie file must be UTF-8 text.")
+        domains = [line.split("\t", 1)[0].removeprefix("#HttpOnly_").lstrip(".")
+                   for line in lines if "\t" in line]
+        if not lines or "Netscape HTTP Cookie File" not in lines[0] or not any(
+            domain == "youtube.com" or domain.endswith(".youtube.com") for domain in domains
+        ):
+            raise HTTPException(400, "Upload a Netscape-format cookie file containing YouTube cookies.")
+        destination = Path(path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(dir=destination.parent, delete=False) as temporary:
+            temporary.write(contents)
+            temp_path = Path(temporary.name)
+        try:
+            os.chmod(temp_path, 0o600)
+            os.replace(temp_path, destination)
+        finally:
+            temp_path.unlink(missing_ok=True)
+        return {"configured": True}
+
+    @app.delete("/api/youtube-cookies")
+    def delete_cookies():
+        path = os.environ.get("YOUTUBE_COOKIES_PATH")
+        if path:
+            Path(path).unlink(missing_ok=True)
+        return Response(status_code=204)
 
     @app.get("/api/library")
     def list_clips():
