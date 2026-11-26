@@ -2778,7 +2778,17 @@ async def get_status(job_id: str, request: Request):
 @app.get("/api/jobs")
 async def list_jobs_endpoint(limit: int = 100):
     """Return the most-recent jobs from persistent storage, newest first."""
-    return {"jobs": jobs_db.list_jobs(limit=min(limit, 500))}
+    rows = jobs_db.list_jobs(limit=max(1, min(limit, 500)))
+    if owner_library:
+        archived = {clip["job_id"] for clip in owner_library.clips()}
+        for row in rows:
+            job_id = row["job_id"]
+            current = jobs.get(job_id)
+            if current:
+                row["status"] = _presented_status(job_id, current)
+            row["available"] = current is not None or _job_view_from_disk(job_id) is not None
+            row["archived"] = job_id in archived
+    return {"jobs": rows}
 
 
 # --- Projects (Fix 3) -------------------------------------------------------
@@ -2858,7 +2868,11 @@ async def get_settings_endpoint():
     """Return all persisted settings."""
     if BILLING_ENABLED:
         raise HTTPException(status_code=403, detail="Settings are managed in cloud mode")
-    return {"settings": jobs_db.get_all_settings()}
+    try:
+        return {"settings": jobs_db.get_all_settings(strict=True)}
+    except Exception as exc:
+        print(f"Settings read failed: {type(exc).__name__}")
+        raise HTTPException(status_code=500, detail="Could not load settings.") from exc
 
 
 @app.patch("/api/settings")
@@ -2866,8 +2880,13 @@ async def update_settings_endpoint(body: _SettingsUpdate):
     """Update settings. Pass None to clear a setting."""
     if BILLING_ENABLED:
         raise HTTPException(status_code=403, detail="Settings are managed in cloud mode")
-    for key, value in body.settings.items():
-        jobs_db.set_setting(key, value)
+    try:
+        jobs_db.save_settings(body.settings)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        print(f"Settings persistence failed: {type(exc).__name__}")
+        raise HTTPException(status_code=500, detail="Could not save settings.") from exc
     return {"ok": True}
 
 

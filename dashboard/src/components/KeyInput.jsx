@@ -54,7 +54,7 @@ export default function KeyInput({ onKeySet, savedKey }) {
                 </button>
             </div>
             <p className="mt-3 text-xs text-muted">
-                Your key is stored locally in your browser for convenience.
+                Your key is saved with your workspace settings.
                 <br />
                 <a
                     href="https://aistudio.google.com/app/apikey"

@@ -22,6 +22,7 @@ import LoginModal from './components/LoginModal';
 import TrialGate from './components/TrialGate';
 import AdvancedBanner from './components/AdvancedBanner';
 import ManageClips from './components/ManageClips';
+import JobHistory from './components/JobHistory';
 import HistoryTab from './components/HistoryTab';
 import ProfileMenu from './components/ProfileMenu';
 import Modal from './components/ui/Modal';
@@ -251,7 +252,7 @@ const pollJob = async (jobId) => {
 
 function App() {
   // Cloud auth/billing session (inert when billing is disabled).
-  const { ownerWorkspace, hasServerGeminiKey, billingEnabled, isManaged, isSignedIn, me, plan, refreshMe, jobRetentionSeconds, localLlm } = useAuth();
+  const { loading: authLoading, ownerWorkspace, hasServerGeminiKey, billingEnabled, isManaged, isSignedIn, me, plan, refreshMe, jobRetentionSeconds, localLlm } = useAuth();
   const [showLogin, setShowLogin] = useState(false);
   const [showTopUp, setShowTopUp] = useState(false);
   const [showPlanChoice, setShowPlanChoice] = useState(false);
@@ -496,6 +497,20 @@ function App() {
     setActiveTab('dashboard');
   };
 
+  const openJob = async (id) => {
+    const data = await apiJson(`/api/status/${id}`);
+    flushClipState();
+    setJobId(id);
+    setResults(data.result || null);
+    setLogs(data.logs || []);
+    setProcessingMedia({ type: 'server', payload: `/api/source/${id}` });
+    setProjectState(null);
+    setNoSource(false);
+    setPartialJob(data.partial || null);
+    setStatus(data.status === 'completed' ? 'complete' : data.status === 'failed' ? 'error' : 'processing');
+    setActiveTab('dashboard');
+  };
+
   // Apply one subtitle style to every clip of the job, sequentially.
   const handleBulkSubtitles = async (options) => {
     const clips = results?.clips || [];
@@ -626,67 +641,70 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [jobId, status, results, activeTab, noSource, projectState]);
 
-  useEffect(() => {
-    // Encrypt Gemini Key too for consistency if desired, but user asked specifically about Social integration not saving well.
-    // For now keeping gemini plain for compatibility unless requested.
-    if (apiKey) {
-      localStorage.setItem('gemini_key', apiKey);
-      if (!billingEnabled) {
-        apiJson('/api/settings', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ settings: { gemini_key: apiKey } }) }).catch(console.error);
-      }
-    }
-  }, [apiKey, billingEnabled]);
+  const [settingsReady, setSettingsReady] = useState(false);
+  const [settingsError, setSettingsError] = useState('');
+  const [settingsRetry, setSettingsRetry] = useState(0);
+  const settingsQueue = useRef(Promise.resolve());
+  const settingsSnapshot = useRef(null);
 
   useEffect(() => {
-    if (uploadPostKey) {
-      localStorage.setItem('uploadPostKey_v3', encrypt(uploadPostKey));
-      if (!billingEnabled) {
-        apiJson('/api/settings', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ settings: { upload_post_key: uploadPostKey } }) }).catch(console.error);
-      }
-    }
-    if (uploadUserId) {
-      localStorage.setItem('uploadUserId', uploadUserId);
-      if (!billingEnabled) {
-        apiJson('/api/settings', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ settings: { upload_user_id: uploadUserId } }) }).catch(console.error);
-      }
-    }
-  }, [uploadPostKey, uploadUserId, billingEnabled]);
-
-  useEffect(() => {
-    if (elevenLabsKey) {
-      localStorage.setItem('elevenLabsKey_v1', encrypt(elevenLabsKey));
-      if (!billingEnabled) {
-        apiJson('/api/settings', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ settings: { elevenlabs_key: elevenLabsKey } }) }).catch(console.error);
-      }
-    }
-  }, [elevenLabsKey, billingEnabled]);
-
-  useEffect(() => {
-    if (falKey) {
-      localStorage.setItem('falKey_v1', encrypt(falKey));
-      if (!billingEnabled) {
-        apiJson('/api/settings', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ settings: { fal_key: falKey } }) }).catch(console.error);
-      }
-    }
-  }, [falKey, billingEnabled]);
-
-  // Initial load of server-side settings
-  useEffect(() => {
-    if (!billingEnabled) {
-      apiJson('/api/settings')
-        .then(data => {
-          if (data && data.settings) {
-            if (data.settings.gemini_key && !apiKey) setApiKey(data.settings.gemini_key);
-            if (data.settings.upload_post_key && !uploadPostKey) setUploadPostKey(data.settings.upload_post_key);
-            if (data.settings.upload_user_id && !uploadUserId) setUploadUserId(data.settings.upload_user_id);
-            if (data.settings.elevenlabs_key && !elevenLabsKey) setElevenLabsKey(data.settings.elevenlabs_key);
-            if (data.settings.fal_key && !falKey) setFalKey(data.settings.fal_key);
-          }
-        })
-        .catch(console.error);
-    }
+    if (authLoading) return;
+    if (billingEnabled) { setSettingsReady(true); return; }
+    let active = true;
+    apiJson('/api/settings').then(({ settings }) => {
+      if (!active) return;
+      const initial = {
+        gemini_key: settings.gemini_key || apiKey,
+        upload_post_key: settings.upload_post_key || uploadPostKey,
+        upload_user_id: settings.upload_user_id || uploadUserId,
+        elevenlabs_key: settings.elevenlabs_key || elevenLabsKey,
+        fal_key: settings.fal_key || falKey,
+      };
+      setApiKey(initial.gemini_key);
+      setUploadPostKey(initial.upload_post_key);
+      setUploadUserId(initial.upload_user_id);
+      setElevenLabsKey(initial.elevenlabs_key);
+      setFalKey(initial.fal_key);
+      // Migrate existing browser settings only when the server has no value.
+      settingsSnapshot.current = JSON.stringify(settings);
+      setSettingsReady(true);
+    }).catch(() => {
+      if (active) setSettingsError('Could not load saved settings. Reload to try again.');
+    });
+    return () => { active = false; };
+    // Load once after the server configuration is known.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [billingEnabled]);
+  }, [authLoading, billingEnabled]);
+
+  useEffect(() => {
+    if (!settingsReady) return;
+    if (apiKey) localStorage.setItem('gemini_key', apiKey);
+    else localStorage.removeItem('gemini_key');
+    if (uploadPostKey) localStorage.setItem('uploadPostKey_v3', encrypt(uploadPostKey));
+    else localStorage.removeItem('uploadPostKey_v3');
+    if (uploadUserId) localStorage.setItem('uploadUserId', uploadUserId);
+    else localStorage.removeItem('uploadUserId');
+    if (elevenLabsKey) localStorage.setItem('elevenLabsKey_v1', encrypt(elevenLabsKey));
+    else localStorage.removeItem('elevenLabsKey_v1');
+    if (falKey) localStorage.setItem('falKey_v1', encrypt(falKey));
+    else localStorage.removeItem('falKey_v1');
+    if (billingEnabled) return;
+
+    const settings = { gemini_key: apiKey, upload_post_key: uploadPostKey,
+      upload_user_id: uploadUserId, elevenlabs_key: elevenLabsKey, fal_key: falKey };
+    // Compare normalized values so loading an empty database does not write it.
+    const timer = setTimeout(() => {
+      settingsQueue.current = settingsQueue.current.catch(() => {}).then(async () => {
+        const old = JSON.parse(settingsSnapshot.current || '{}');
+        if (Object.keys(settings).every(key => (old[key] || '') === settings[key])) return;
+        await apiJson('/api/settings', { method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ settings }) });
+        settingsSnapshot.current = JSON.stringify(settings);
+        setSettingsError('');
+      }).catch(() => { setSettingsError('Could not save settings on the server. Check the connection and try again.'); });
+    }, 600);
+    return () => clearTimeout(timer);
+  }, [settingsReady, billingEnabled, apiKey, uploadPostKey, uploadUserId, elevenLabsKey, falKey, settingsRetry]);
 
   useEffect(() => {
     if ((uploadPostKey || isManaged) && userProfiles.length === 0) {
@@ -739,10 +757,12 @@ function App() {
 
   useEffect(() => {
     let interval;
+    let cancelled = false;
     if ((status === 'processing' || status === 'completed') && jobId) {
       interval = setInterval(async () => {
         try {
           const data = await pollJob(jobId);
+          if (cancelled) return;
           console.log("Job status:", data);
 
           // Update results if available (real-time)
@@ -771,7 +791,7 @@ function App() {
         }
       }, 2000);
     }
-    return () => clearInterval(interval);
+    return () => { cancelled = true; clearInterval(interval); };
   }, [status, jobId, refreshMe]);
 
 
@@ -1108,7 +1128,7 @@ function App() {
     { id: 'ugc-gallery', ord: '04', icon: LayoutGrid, label: 'UGC Gallery', short: 'gallery', primary: true },
     { id: 'thumbnails', ord: '05', icon: Image, label: 'YouTube Studio', short: 'studio', primary: true },
     ...(ownerWorkspace ? [{ id: 'library', icon: Download, label: 'Manage clips', short: 'library' }] : []),
-    ...(billingEnabled && isSignedIn ? [{ id: 'history', ord: '06', icon: History, label: 'History', short: 'history' }] : []),
+    ...((ownerWorkspace || (billingEnabled && isSignedIn)) ? [{ id: 'history', ord: '06', icon: History, label: 'History', short: 'history' }] : []),
     { id: 'settings', ord: '07', icon: Settings, label: 'Settings', short: 'settings' },
   ];
   const activeNav = navItems.find((n) => n.id === activeTab);
@@ -1462,7 +1482,7 @@ function App() {
                   <h1 className="font-display lowercase text-2xl text-ink">Settings</h1>
                 </div>
                 <div className="flex items-center gap-2 text-xs text-muted mt-1">
-                  <Shield size={12} className="text-ok shrink-0" /> Privacy: keys only live in your browser (sent to backend just to process)
+                  <Shield size={12} className="text-ok shrink-0" /> {ownerWorkspace ? 'Keys are saved on your server and protected by your workspace login.' : 'Keys are saved with your workspace settings.'}
                 </div>
               </div>
               {/* Self-hosted installs have no account page, so the agent
@@ -1513,6 +1533,8 @@ function App() {
                 </div>
               ) : (
                 <>
+              {settingsError && <div role="alert" className="text-danger mb-4">{settingsError}{settingsReady && <button className="btn-quiet ml-3" onClick={() => setSettingsRetry(n => n + 1)}>Retry</button>}</div>}
+              {!settingsReady && <p className="text-muted mb-4">Loading saved settings…</p>}
               <KeyInput onKeySet={setApiKey} savedKey={apiKey} />
 
               <div className="card p-4 sm:p-6 mt-8">
@@ -1821,7 +1843,7 @@ function App() {
           {activeTab === 'history' && (
             <div className="h-full overflow-y-auto custom-scrollbar animate-fade">
               <div className="max-w-6xl mx-auto p-4 sm:p-6 md:p-8">
-                <HistoryTab onReopenProject={restoreProject} />
+                {ownerWorkspace ? <JobHistory onOpen={openJob} /> : <HistoryTab onReopenProject={restoreProject} />}
               </div>
             </div>
           )}

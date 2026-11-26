@@ -314,12 +314,31 @@ def set_setting(key: str, value: Optional[str]) -> bool:
         return False
 
 
-def get_all_settings() -> dict:
+
+def save_settings(values: dict) -> None:
+    """Save all requested settings atomically, surfacing storage errors."""
+    if any(key not in ALLOWED_SETTINGS for key in values):
+        raise ValueError("Unknown setting")
+    with _conn() as con:
+        for key, value in values.items():
+            if value:
+                con.execute(
+                    "INSERT INTO settings (key, value) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (key, value),
+                )
+            else:
+                con.execute("DELETE FROM settings WHERE key=?", (key,))
+
+
+def get_all_settings(*, strict: bool = False) -> dict:
     """Return all stored settings as a plain dict."""
     try:
         with _conn() as con:
             rows = con.execute("SELECT key, value FROM settings").fetchall()
         return {r["key"]: r["value"] for r in rows if r["key"] in ALLOWED_SETTINGS}
     except Exception as e:
+        if strict:
+            raise
         print(f"⚠️ jobs_db: get_all_settings: {e}")
         return {}
