@@ -22,6 +22,7 @@ import LoginModal from './components/LoginModal';
 import TrialGate from './components/TrialGate';
 import AdvancedBanner from './components/AdvancedBanner';
 import ManageClips from './components/ManageClips';
+import SourceChannels from './components/SourceChannels';
 import YoutubeCookies from './components/YoutubeCookies';
 import DriveConnection from './components/DriveConnection';
 import JobHistory from './components/JobHistory';
@@ -1129,6 +1130,7 @@ function App() {
     { id: 'ai-agent', ord: '03', icon: Bot, label: 'AI Agent', short: 'agent', byok: true },
     { id: 'ugc-gallery', ord: '04', icon: LayoutGrid, label: 'UGC Gallery', short: 'gallery', primary: true },
     { id: 'thumbnails', ord: '05', icon: Image, label: 'YouTube Studio', short: 'studio', primary: true },
+    ...(ownerWorkspace ? [{ id: 'sources', icon: Youtube, label: 'Source channels', short: 'sources' }] : []),
     ...(ownerWorkspace ? [{ id: 'library', icon: Download, label: 'Manage clips', short: 'library' }] : []),
     ...((ownerWorkspace || (billingEnabled && isSignedIn)) ? [{ id: 'history', ord: '06', icon: History, label: 'History', short: 'history' }] : []),
     { id: 'settings', ord: '07', icon: Settings, label: 'Settings', short: 'settings' },
@@ -1475,6 +1477,7 @@ function App() {
         <div className="flex-1 overflow-hidden relative">
 
           {/* View: Settings */}
+          {ownerWorkspace && activeTab === 'sources' && <SourceChannels />}
           {ownerWorkspace && activeTab === 'library' && <ManageClips />}
           {activeTab === 'settings' && (
             <div className="h-full overflow-y-auto p-4 sm:p-8 max-w-2xl mx-auto animate-fade">

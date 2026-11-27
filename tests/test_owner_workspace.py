@@ -71,3 +71,23 @@ def test_drive_authorization_requires_login_and_checks_state(tmp_path, monkeypat
     assert "code_challenge=" in response.headers["location"]
     assert client.get("/api/drive/callback?state=invalid&code=invalid").status_code == 400
     assert client.get("/api/drive/status").json()["connected"] is False
+
+
+def test_owner_source_channels_persist_and_validate(tmp_path, monkeypatch):
+    import jobs_db
+    monkeypatch.setattr(jobs_db, "_DB_PATH", str(tmp_path / "jobs.db"))
+    jobs_db.init_db()
+    app = FastAPI()
+    install(app, "password", ClipLibrary(tmp_path / "library"))
+    client = TestClient(app, follow_redirects=False)
+    assert client.get("/api/source-channels").status_code == 401
+    client.post("/owner/login", data={"password": "password"})
+    response = client.post("/api/source-channels", json={"url": "https://youtube.com/@IShowSpeed/videos"})
+    assert response.status_code == 201
+    assert response.json()["url"] == "https://www.youtube.com/@IShowSpeed"
+    assert client.post("/api/source-channels", json={"url": "https://www.youtube.com/@IShowSpeed"}).status_code == 409
+    assert client.post("/api/source-channels", json={"url": "https://example.com/@channel"}).status_code == 400
+    channel_id = response.json()["id"]
+    assert len(client.get("/api/source-channels").json()["channels"]) == 1
+    assert client.delete(f"/api/source-channels/{channel_id}").status_code == 204
+    assert client.get("/api/source-channels").json()["channels"] == []

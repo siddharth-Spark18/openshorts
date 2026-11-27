@@ -80,6 +80,12 @@ def init_db() -> None:
                     project_id   TEXT REFERENCES projects(id)
                 );
 
+                CREATE TABLE IF NOT EXISTS source_channels (
+                    id TEXT PRIMARY KEY,
+                    url TEXT NOT NULL UNIQUE,
+                    created_at TEXT NOT NULL
+                );
+
                 -- Generic key-value store for persisted settings (API keys, etc.).
                 CREATE TABLE IF NOT EXISTS settings (
                     key   TEXT PRIMARY KEY,

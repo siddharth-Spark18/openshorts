@@ -7,7 +7,12 @@ import shutil
 import tempfile
 import time
 from pathlib import Path
-from uuid import UUID
+from uuid import UUID, uuid4
+from urllib.parse import urlsplit
+from pydantic import BaseModel
+import re
+import sqlite3
+import jobs_db
 
 from fastapi import File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
@@ -152,6 +157,55 @@ def install(app, password, library):
 
     import drive_connection
     drive_connection.install(app, library)
+
+    class SourceChannel(BaseModel):
+        url: str
+
+    @app.get("/api/source-channels")
+    def list_source_channels():
+        with jobs_db._conn() as con:
+            rows = con.execute(
+                "SELECT id, url, created_at FROM source_channels ORDER BY created_at DESC, rowid DESC"
+            ).fetchall()
+        return {"channels": [dict(row) for row in rows]}
+
+    @app.post("/api/source-channels", status_code=201)
+    def add_source_channel(channel: SourceChannel):
+        try:
+            parsed = urlsplit(channel.url.strip())
+            host = (parsed.hostname or "").lower()
+            parts = [part for part in parsed.path.split("/") if part]
+            if (parsed.scheme != "https" or host not in {"youtube.com", "www.youtube.com", "m.youtube.com"}
+                    or parsed.username or parsed.password or parsed.port
+                    or not parts):
+                raise ValueError()
+            if parts[0].startswith("@") and len(parts[0]) > 1:
+                path = parts[0]
+            elif len(parts) >= 2 and parts[0] in {"channel", "c", "user"}:
+                path = "/".join(parts[:2])
+            else:
+                raise ValueError()
+            if any(not re.fullmatch(r"[A-Za-z0-9_@.\-]+", part) for part in path.split("/")):
+                raise ValueError()
+            url = "https://www.youtube.com/" + path
+        except ValueError:
+            raise HTTPException(400, "Enter a YouTube channel URL, such as youtube.com/@channel.")
+        channel_id = str(uuid4())
+        try:
+            with jobs_db._conn() as con:
+                con.execute("INSERT INTO source_channels (id, url, created_at) VALUES (?, ?, ?)",
+                            (channel_id, url, jobs_db._utcnow()))
+        except sqlite3.IntegrityError:
+            raise HTTPException(409, "That channel is already in your list.")
+        return {"id": channel_id, "url": url}
+
+    @app.delete("/api/source-channels/{channel_id}", status_code=204)
+    def delete_source_channel(channel_id: UUID):
+        with jobs_db._conn() as con:
+            result = con.execute("DELETE FROM source_channels WHERE id=?", (str(channel_id),))
+        if not result.rowcount:
+            raise HTTPException(404, "Channel not found.")
+        return Response(status_code=204)
 
     @app.get("/api/library")
     def list_clips():
