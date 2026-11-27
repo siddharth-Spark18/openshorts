@@ -57,3 +57,31 @@ async def test_automatic_source_requests_shorter_gaming_clips(monkeypatch):
     assert result == {'job_id': 'test-job'}
     assert seen['layouts'] == ['gaming']
     assert (seen['clip_min_seconds'], seen['clip_max_seconds']) == (15, 35)
+
+
+def test_camera_detector_initializes_lazy_face_model(monkeypatch):
+    import sys
+    import types
+    import numpy as np
+    import cv2
+    import screencast_layout
+    fake_main = types.SimpleNamespace(face_detection=None)
+    def initialize(frame):
+        fake_main.face_detection = object()
+        return []
+    fake_main.detect_face_candidates = initialize
+    monkeypatch.setitem(sys.modules, 'main', fake_main)
+    monkeypatch.setattr(screencast_layout, 'detect_faces_full_res',
+                        lambda frame: [{'box': [100, 650, 100, 100], 'score': 10000}]
+                        if fake_main.face_detection else (_ for _ in ()).throw(AssertionError('not initialized')))
+    class Capture:
+        def __init__(self, path): pass
+        def isOpened(self): return True
+        def get(self, prop):
+            return {cv2.CAP_PROP_FRAME_COUNT: 100, cv2.CAP_PROP_FRAME_WIDTH: 1920,
+                    cv2.CAP_PROP_FRAME_HEIGHT: 1080}.get(prop, 0)
+        def set(self, prop, value): pass
+        def read(self): return True, np.zeros((1080, 1920, 3), dtype=np.uint8)
+        def release(self): pass
+    monkeypatch.setattr(cv2, 'VideoCapture', Capture)
+    assert len(gaming_layout.detect_cameras('unused')) == 1

@@ -21,6 +21,7 @@ def detect_cameras(path, samples=6):
     import cv2
     import numpy as np
     import screencast_layout
+    import main as processing
 
     cap = cv2.VideoCapture(path)
     try:
@@ -37,6 +38,10 @@ def detect_cameras(path, samples=6):
             ok, frame = cap.read()
             if not ok:
                 continue
+            # The full-resolution detector shares main's lazy MediaPipe instance.
+            # Gaming renders may run before any other face tracking has started.
+            if processing.face_detection is None:
+                processing.detect_face_candidates(frame)
             candidates = {'left': [], 'right': []}
             for face in screencast_layout.detect_faces_full_res(frame):
                 box = face['box']
