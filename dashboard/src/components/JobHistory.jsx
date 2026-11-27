@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { apiJson } from '../lib/api';
 
-export default function JobHistory({ onOpen }) {
+export default function JobHistory({ onOpen, onRetry }) {
   const [jobs, setJobs] = useState(null);
   const [error, setError] = useState('');
   const [opening, setOpening] = useState(null);
@@ -29,6 +29,16 @@ export default function JobHistory({ onOpen }) {
     finally { setOpening(null); }
   }
 
+  async function retry(jobId) {
+    setOpening(jobId);
+    setError('');
+    try {
+      await apiJson(`/api/jobs/${jobId}/retry`, { method: 'POST' });
+      await onRetry(jobId);
+    } catch (e) { setError(e.detail || 'Could not retry this project.'); }
+    finally { setOpening(null); }
+  }
+
   return <section className="max-w-4xl mx-auto space-y-5">
     <h1 className="font-display text-3xl text-ink">Project history</h1>
     <p className="text-sm text-muted">Start another video while your existing jobs continue processing.</p>
@@ -42,8 +52,11 @@ export default function JobHistory({ onOpen }) {
           <p className="text-sm text-muted mt-1">{job.status} · {new Date(job.created_at).toLocaleString()}
             {job.clip_count != null && ` · ${job.clip_count} clips`}
           </p>
-          {!job.available && <p className="text-sm text-muted mt-1">{job.archived ? 'Saved clips are in Manage clips.' : 'Working files have expired.'}</p>}
+          {!job.available && <p className="text-sm text-muted mt-1">{job.archived ? 'Saved clips are in Manage clips.' : job.status === 'failed' ? 'This job failed and its working files are unavailable.' : 'Working files are no longer available.'}</p>}
         </div>
+        {job.retryable && <button className="btn-primary px-4 py-2" disabled={!!opening} onClick={() => retry(job.job_id)}>
+          {opening === job.job_id ? 'Starting…' : 'Retry'}
+        </button>}
         {job.available && <button className="btn-ghost px-4 py-2" disabled={!!opening} onClick={() => open(job.job_id)}>
           {opening === job.job_id ? 'Opening…' : 'Open'}
         </button>}

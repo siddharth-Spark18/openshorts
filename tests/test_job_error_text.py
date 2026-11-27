@@ -62,3 +62,15 @@ def test_keeps_only_the_most_recent_errors():
     out = app._job_error_text(logs)
     assert "❌ error 11" in out
     assert "❌ error 0" not in out
+
+
+def test_download_expired_cookies_are_reported():
+    logs = ["WARNING: The provided YouTube account cookies are no longer valid.",
+            "ERROR: Sign in to confirm you’re not a bot."]
+    assert "cookies have expired" in app._worker_failure_message(1, logs)
+
+
+def test_old_download_warning_is_not_blamed_after_success():
+    logs = ["WARNING: The provided YouTube account cookies are no longer valid.",
+            "Download succeeded (fallback)", "Error: later stage failed"]
+    assert app._worker_failure_message(1, logs) == "Process failed with exit code 1"

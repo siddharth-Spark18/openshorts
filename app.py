@@ -686,6 +686,13 @@ def _recover_jobs_from_disk():
         json_files = glob.glob(os.path.join(job_path, "*_metadata.json"))
         if not json_files:
             continue
+        manifest = _read_manifest(job_id)
+        if manifest and manifest.get("retry"):
+            continue
+        if owner_library:
+            record = jobs_db.get_job(job_id)
+            if record and record.get("status") == "failed":
+                continue
         try:
             with open(json_files[0], 'r') as f:
                 data = json.load(f)
@@ -977,15 +984,15 @@ def _resume_interrupted_jobs() -> set:
         manifest_path = os.path.join(job_path, _RESUME_FILE)
         if not os.path.isfile(manifest_path):
             continue
-        if glob.glob(os.path.join(job_path, "*_metadata.json")):
-            # Finished after all — recovered as completed already.
-            _clear_resume_manifest(job_id)
-            continue
         try:
             with open(manifest_path) as f:
                 m = json.load(f)
         except Exception as e:
             print(f"⚠️ Bad resume manifest for {job_id}: {e}")
+            continue
+
+        if glob.glob(os.path.join(job_path, "*_metadata.json")) and not m.get("retry"):
+            _clear_resume_manifest(job_id)
             continue
 
         if m.get("reservation_id"):
@@ -1025,6 +1032,8 @@ def _resume_interrupted_jobs() -> set:
                 env["GEMINI_API_KEY"] = managed_keys.gemini_key()
             except Exception:
                 pass
+        if m.get("retry"):
+            env.update(m.get("retry_env") or {})
         if m.get("watermark"):
             env["WATERMARK"] = "1"
         else:
@@ -1508,6 +1517,19 @@ def _job_error_text(logs) -> str:
     if not hits:
         return " ".join(logs[-10:])  # nothing recognisable — fall back to the tail
     return " ".join(hits[-6:])
+
+
+
+def _worker_failure_message(returncode, logs):
+    if returncode == -signal.SIGKILL:
+        return "The video worker was killed by the system. Check server memory and system logs."
+    output = "\n".join(logs).lower()
+    if "download succeeded" not in output:
+        if "cookies are no longer valid" in output:
+            return "YouTube cookies have expired. Replace them in Settings → YouTube connection, then submit the video again."
+        if "confirm you’re not a bot" in output or "confirm you're not a bot" in output:
+            return "YouTube requested sign-in. Update the YouTube cookies in Settings, then submit the video again."
+    return f"Process failed with exit code {returncode}"
 
 
 async def _record_job_alert(job_id):
@@ -2040,7 +2062,10 @@ async def run_job(job_id, job_data):
                 pass
 
         returncode = process.returncode
-        
+        # Drain the log reader before publishing the terminal status. Otherwise
+        # the final error may reach the dashboard after polling has stopped.
+        await asyncio.to_thread(t_log.join)
+
         if returncode == 0:
             jobs[job_id]['status'] = 'completed'
             jobs[job_id]['logs'].append("Process finished successfully.")
@@ -2089,11 +2114,8 @@ async def run_job(job_id, job_data):
         else:
             jobs[job_id]['status'] = 'failed'
             jobs_db.record_job_finished(job_id, 'failed')
-            if returncode == -signal.SIGKILL:
-                jobs[job_id]['logs'].append(
-                    "The video worker was killed by the system. Check server memory and system logs.")
-            else:
-                jobs[job_id]['logs'].append(_scrub_secrets(f"Process failed with exit code {returncode}"))
+            jobs[job_id]['logs'].append(_scrub_secrets(
+                _worker_failure_message(returncode, jobs[job_id]['logs'])))
             
     except Exception as e:
         jobs[job_id]['status'] = 'failed'
@@ -2717,6 +2739,18 @@ async def process_endpoint(
                            webhook_url=webhook_url, webhook_secret=webhook_secret,
                            base_url=api_base, partial=partial)
 
+    if owner_library:
+        retry_keys = ("AUTO_LAYOUT", "SPLIT_LAYOUT", "SCREENCAST_LAYOUT", "SPEAKER_CUT",
+                      "PUNCH_IN", "SPEAKER_SIGNAL", "AUTO_HOOK", "AUTO_HOOK_STYLE",
+                      "AUTO_CAPTIONS", "CLIP_TARGET_MIN", "CLIP_TARGET_MAX",
+                      "CLIP_MIN_SECONDS", "CLIP_MAX_SECONDS")
+        retry_spec = {"cmd": cmd, "env": {key: env[key] for key in retry_keys if key in env}}
+        try:
+            with open(os.path.join(job_output_dir, ".retry.json"), "w") as file:
+                json.dump(retry_spec, file)
+        except OSError as exc:
+            print(f"Could not save retry details for {job_id}: {exc}")
+
     _enqueue_job(job_id, priority)
 
     return {"job_id": job_id, "status": "queued", "partial": partial}
@@ -2732,10 +2766,10 @@ def _job_view_from_disk(job_id):
     job_path = os.path.join(OUTPUT_DIR, job_id)
     if not os.path.isdir(job_path):
         return None
-    if glob.glob(os.path.join(job_path, "*_metadata.json")):
+    m = _read_manifest(job_id)
+    if glob.glob(os.path.join(job_path, "*_metadata.json")) and not (m and m.get("retry")):
         _recover_jobs_from_disk()
         return jobs.get(job_id)
-    m = _read_manifest(job_id)
     if m is None:
         return None
     alive = time.time() - float(m.get("heartbeat") or 0) < HEARTBEAT_STALE_AFTER
@@ -2777,6 +2811,100 @@ async def get_status(job_id: str, request: Request):
     }
 
 
+def _retry_source(job_id):
+    source = _locate_source(job_id)
+    if source:
+        return source
+    directory = os.path.join(OUTPUT_DIR, job_id)
+    candidates = [path for path in glob.glob(os.path.join(directory, "*.mp4"))
+                  if "_clip_" not in os.path.basename(path)
+                  and not os.path.basename(path).startswith(("temp_", "subtitled_", "hooked_", "recut_"))]
+    return candidates[0] if len(candidates) == 1 else None
+
+
+@app.post("/api/jobs/{job_id}/retry")
+async def retry_job(job_id: uuid.UUID, request: Request):
+    if not owner_library:
+        raise HTTPException(404, "Retry is only available in the private workspace.")
+    job_id = str(job_id)
+    api_key = await resolve_gemini(request)
+    if not api_key and not llm_backend.active():
+        raise gemini_missing_error()
+    record = jobs_db.get_job(job_id)
+    if not record:
+        raise HTTPException(404, "Job not found.")
+    job = jobs.get(job_id)
+    if (job and job.get("status") != "failed") or job_id in _running_jobs:
+        raise HTTPException(409, "This job is already active or has completed.")
+    if record["status"] != "failed":
+        raise HTTPException(409, "Only failed jobs can be retried.")
+    output_dir = os.path.join(OUTPUT_DIR, job_id)
+    if not os.path.isdir(output_dir):
+        raise HTTPException(410, "The working files have expired. Submit the video again.")
+    source = _retry_source(job_id)
+    source_url = record.get("input_source") or ""
+    spec_path = os.path.join(output_dir, ".retry.json")
+    try:
+        with open(spec_path) as file:
+            spec = json.load(file)
+    except (OSError, ValueError):
+        spec = {}
+    cmd = list(spec.get("cmd") or [])
+    if not cmd:
+        if source:
+            cmd = [sys.executable, "-u", "main.py", "-i", source, "-o", output_dir, "--format", "vertical"]
+        elif source_url.startswith(("https://", "http://")):
+            cmd = [sys.executable, "-u", "main.py", "-u", source_url, "--keep-original",
+                   "-o", output_dir, "--format", "vertical"]
+        else:
+            raise HTTPException(410, "The original upload has expired. Upload the video again.")
+    elif source and "-u" in cmd[cmd.index("main.py") + 1:]:
+        index = cmd.index("-u", cmd.index("main.py") + 1)
+        cmd[index:index + 2] = ["-i", source]
+    elif "-i" in cmd and not os.path.isfile(cmd[cmd.index("-i") + 1]):
+        if source:
+            cmd[cmd.index("-i") + 1] = source
+        else:
+            raise HTTPException(410, "The original upload has expired. Upload the video again.")
+
+    # Keep any partial outputs from a failed render out of the next result.
+    # They remain on disk in a hidden folder, while checkpoints stay in place.
+    previous = (glob.glob(os.path.join(output_dir, "*_metadata.json"))
+                + [path for path in glob.glob(os.path.join(output_dir, "*.mp4"))
+                   if os.path.realpath(path) != os.path.realpath(source or "")])
+    if previous:
+        backup = os.path.join(output_dir, ".previous-retry-" + uuid.uuid4().hex)
+        os.makedirs(backup)
+        for path in previous:
+            os.replace(path, os.path.join(backup, os.path.basename(path)))
+
+    retry_env = spec.get("env") or {}
+    env = os.environ.copy()
+    env.update(retry_env)
+    if api_key:
+        env["GEMINI_API_KEY"] = api_key
+    manifest = {"cmd": cmd, "priority": 2, "user_id": None, "reservation_id": None,
+                "watermark": False, "attempts": 0, "retry": True, "retry_env": retry_env}
+    manifest_path = _manifest_path(job_id)
+    temp_path = manifest_path + ".tmp"
+    try:
+        with open(temp_path, "w") as file:
+            json.dump(manifest, file)
+        os.replace(temp_path, manifest_path)
+        jobs_db.record_job_requeued(job_id)
+    except Exception as exc:
+        try:
+            os.unlink(manifest_path)
+        except FileNotFoundError:
+            pass
+        raise HTTPException(500, "Could not save retry state.") from exc
+    jobs[job_id] = {"status": "queued", "logs": ["Retry queued."], "cmd": cmd,
+                    "env": env, "output_dir": output_dir, "user_id": None,
+                    "reservation_id": None, "watermark": False}
+    _enqueue_job(job_id)
+    return {"job_id": job_id, "status": "queued"}
+
+
 # --- Job history (Fix 2) ---------------------------------------------------
 
 @app.get("/api/jobs")
@@ -2792,6 +2920,7 @@ async def list_jobs_endpoint(limit: int = 100):
                 row["status"] = _presented_status(job_id, current)
             row["available"] = current is not None or _job_view_from_disk(job_id) is not None
             row["archived"] = job_id in archived
+            row["retryable"] = row["status"] == "failed" and os.path.isdir(os.path.join(OUTPUT_DIR, job_id))
     return {"jobs": rows}
 
 

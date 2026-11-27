@@ -114,6 +114,13 @@ def record_job_created(job_id: str, input_source: str = "") -> None:
         print(f"⚠️ jobs_db: record_job_created({job_id}): {e}")
 
 
+
+def record_job_requeued(job_id: str) -> None:
+    with _conn() as con:
+        con.execute("UPDATE jobs SET status='queued', started_at=NULL, finished_at=NULL, clip_count=NULL WHERE job_id=?",
+                    (job_id,))
+
+
 def record_job_started(job_id: str) -> None:
     try:
         with _conn() as con:
