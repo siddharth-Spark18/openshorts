@@ -1804,11 +1804,77 @@ def _purge_local_jobs_for_user(user_id) -> int:
     return removed
 
 
+async def _auto_submit_source(video_id, job_id):
+    """Use the regular processing endpoint with a stable internal job ID."""
+    payload = json.dumps({"url": f"https://www.youtube.com/watch?v={video_id}",
+                          "acknowledged": True, "output_format": "vertical",
+                          "auto_hook": True}).encode()
+
+    async def receive():
+        return {"type": "http.request", "body": payload, "more_body": False}
+
+    scope = {"type": "http", "method": "POST", "path": "/api/process",
+             "query_string": b"", "headers": [(b"content-type", b"application/json")],
+             "scheme": "http", "server": ("localhost", 8000),
+             "client": ("127.0.0.1", 0), "root_path": ""}
+    request = Request(scope, receive)
+    request.state._source_job_id = job_id
+    return await process_endpoint(request, file=None, url=None, acknowledged=None,
+                                  output_format=None, layouts=None, force_low_quality=None,
+                                  webhook_url=None, webhook_secret=None, target_clips=None,
+                                  clip_min_seconds=None, clip_max_seconds=None, auto_hook=None,
+                                  auto_hook_style=None, thumbnail_session_id=None, captions=None,
+                                  upload_id=None, max_minutes=None)
+
+
+async def process_one_discovered_source():
+    from source_automation import claim_candidate, enabled, finish_claim
+    if _draining or _deployment_paused() or not enabled():
+        return
+    claim = await asyncio.to_thread(claim_candidate)
+    if not claim:
+        return
+    video_id, job_id, lease_owner = claim["video_id"], claim["job_id"], claim["lease_owner"]
+    record = jobs_db.get_job(job_id)
+    if record and (record["status"] in ("completed", "failed") or job_id in jobs
+                   or os.path.isfile(_manifest_path(job_id))):
+        await asyncio.to_thread(finish_claim, video_id, "submitted", lease_owner)
+        return
+    # Do not start another heavy job while any job is active, including
+    # work owned by a previous instance during a deployment handover.
+    with jobs_db._conn() as con:
+        active = con.execute(
+            "SELECT 1 FROM jobs WHERE status IN ('queued','processing') AND job_id != ? LIMIT 1",
+            (job_id,)).fetchone()
+    if active or _running_jobs:
+        await asyncio.to_thread(finish_claim, video_id, "pending", lease_owner)
+        return
+    try:
+        result = await _auto_submit_source(video_id, job_id)
+        if isinstance(result, JSONResponse):
+            data = json.loads(result.body)
+            if data.get("needs_confirmation"):
+                await asyncio.to_thread(finish_claim, video_id, "skipped", lease_owner,
+                                        "Only low-resolution video was available.")
+                return
+            raise RuntimeError("Unexpected processing response.")
+        await asyncio.to_thread(finish_claim, video_id, "submitted", lease_owner)
+    except HTTPException as exc:
+        print(f"Automatic source submission deferred: HTTP {exc.status_code}")
+        await asyncio.to_thread(finish_claim, video_id, "pending", lease_owner,
+                                "Could not start processing; will retry.")
+    except Exception as exc:
+        print(f"Automatic source submission deferred: {type(exc).__name__}")
+        await asyncio.to_thread(finish_claim, video_id, "pending", lease_owner,
+                                "Could not start processing; will retry.")
+
+
 async def discover_owner_sources():
     from source_discovery import scan_all
     while True:
         try:
             await asyncio.to_thread(scan_all)
+            await process_one_discovered_source()
         except Exception as exc:
             print(f"Source discovery failed: {type(exc).__name__}")
         await asyncio.sleep(900)
@@ -2571,7 +2637,9 @@ async def process_endpoint(
                    else "url" if url else "file"),
     }
 
-    job_id = str(uuid.uuid4())
+    # Only in-process automation can set this request state. A stable ID
+    # lets it resume safely if the server exits during submission.
+    job_id = getattr(request.state, "_source_job_id", None) or str(uuid.uuid4())
     job_output_dir = os.path.join(OUTPUT_DIR, job_id)
     os.makedirs(job_output_dir, exist_ok=True)
 

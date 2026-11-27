@@ -110,6 +110,16 @@ def init_db() -> None:
                     checked_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS source_auto_jobs (
+                    video_id TEXT PRIMARY KEY,
+                    job_id TEXT NOT NULL UNIQUE,
+                    state TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    message TEXT,
+                    lease_owner TEXT,
+                    lease_until REAL
+                );
+
                 -- Generic key-value store for persisted settings (API keys, etc.).
                 CREATE TABLE IF NOT EXISTS settings (
                     key   TEXT PRIMARY KEY,
@@ -314,6 +324,7 @@ ALLOWED_SETTINGS = {
     "elevenlabs_key",
     "fal_key",
     "source_topics",
+    "source_auto_enabled",
 }
 
 

@@ -236,14 +236,29 @@ def install(app, password, library):
         jobs_db.save_settings({"source_topics": topics})
         return {"topics": topics}
 
+    class SourceAutomation(BaseModel):
+        enabled: bool
+
+    @app.get("/api/source-automation")
+    def source_automation_status():
+        from source_automation import enabled
+        return {"enabled": enabled()}
+
+    @app.put("/api/source-automation")
+    def update_source_automation(body: SourceAutomation):
+        jobs_db.save_settings({"source_auto_enabled": "1" if body.enabled else "0"})
+        return {"enabled": body.enabled}
+
     @app.get("/api/source-videos")
     def list_source_videos():
         from source_discovery import title_matches_topics
         with jobs_db._conn() as con:
             rows = con.execute(
-                "SELECT v.video_id, v.title, v.published_at, c.url AS channel_url, s.views, s.likes "
+                "SELECT v.video_id, v.title, v.published_at, c.url AS channel_url, s.views, s.likes, "
+                "a.state AS auto_state, a.message AS auto_message, a.job_id AS auto_job_id "
                 "FROM source_videos v JOIN source_channels c ON c.id=v.channel_id "
                 "LEFT JOIN source_video_stats s ON s.video_id=v.video_id "
+                "LEFT JOIN source_auto_jobs a ON a.video_id=v.video_id "
                 "ORDER BY v.published_at DESC LIMIT 100"
             ).fetchall()
         topics = jobs_db.get_setting("source_topics") or ""

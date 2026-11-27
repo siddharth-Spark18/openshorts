@@ -3,6 +3,7 @@ import { apiFetch, apiJson } from '../lib/api';
 
 export default function SourceChannels() {
   const [channels, setChannels] = useState(null);
+  const [automatic, setAutomatic] = useState(null);
   const [url, setUrl] = useState('');
   const [videos, setVideos] = useState([]);
   const [statisticsConfigured, setStatisticsConfigured] = useState(false);
@@ -12,9 +13,10 @@ export default function SourceChannels() {
   const [busy, setBusy] = useState(false);
 
   async function refresh() {
-    const [data, discovered] = await Promise.all([
-      apiJson('/api/source-channels'), apiJson('/api/source-videos')
+    const [data, discovered, automation] = await Promise.all([
+      apiJson('/api/source-channels'), apiJson('/api/source-videos'), apiJson('/api/source-automation')
     ]);
+    setAutomatic(automation.enabled);
     setChannels(data.channels);
     setVideos(discovered.videos);
     setStatisticsConfigured(discovered.statistics_configured);
@@ -47,6 +49,17 @@ export default function SourceChannels() {
     return () => { active = false; clearInterval(timer); };
   }, []);
 
+  async function toggleAutomatic() {
+    setBusy(true);
+    try {
+      const result = await apiJson('/api/source-automation', { method: 'PUT',
+        headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: !automatic }) });
+      setAutomatic(result.enabled);
+      setError('');
+    } catch { setError('Could not update automatic processing.'); }
+    finally { setBusy(false); }
+  }
+
   async function add(event) {
     event.preventDefault();
     setBusy(true);
@@ -74,7 +87,12 @@ export default function SourceChannels() {
 
   return <section className="max-w-4xl mx-auto p-4 sm:p-6 space-y-5">
     <h1 className="font-display text-3xl text-ink">Source channels</h1>
-    <p className="text-sm text-muted">Recent uploads are checked automatically. Discovering a video does not start processing or publishing it.</p>
+    <p className="text-sm text-muted">Recent uploads are checked automatically. Matching videos can be processed automatically; publishing is not connected yet.</p>
+    <div className="card p-4 flex flex-wrap items-center gap-3">
+      <div className="flex-1"><p className="text-ink">Automatic processing: {automatic === null ? 'loading' : automatic ? 'on' : 'paused'}</p>
+        <p className="text-sm text-muted">Up to one matching video per day, when the processing queue is clear.</p></div>
+      <button type="button" className="btn-ghost px-4 py-2" disabled={busy || automatic === null} onClick={toggleAutomatic}>{automatic ? 'Pause' : 'Turn on'}</button>
+    </div>
     <form onSubmit={saveTopics} className="card p-4 space-y-3">
       <label htmlFor="source-topics" className="block text-sm text-ink">Topics to prioritize</label>
       <div className="flex flex-wrap gap-2">
@@ -112,6 +130,7 @@ export default function SourceChannels() {
       <article key={video.video_id} className="card p-4">
         <a href={`https://www.youtube.com/watch?v=${video.video_id}`} target="_blank" rel="noreferrer" className="text-ink">{video.title || 'Video'}</a>
         {video.topic_match && <span className="text-xs text-brass ml-2">Topic match</span>}
+        {video.auto_state && <p className="text-sm text-muted">Automatic processing: {video.auto_state}{video.auto_message && ` — ${video.auto_message}`}</p>}
         <p className="text-sm text-muted mt-1">{video.channel_url} · {video.published_at ? new Date(video.published_at).toLocaleDateString() : 'Date unavailable'}{video.views_per_day != null && ` · ${video.views_per_day.toLocaleString()} views/day`}</p>
       </article>)}</div>
   </section>;

@@ -147,3 +147,17 @@ def test_discovered_videos_prioritize_topic_and_include_view_rate(tmp_path, monk
     assert result["videos"][0]["title"] == "GTA VI updates"
     assert result["videos"][0]["topic_match"] is True
     assert result["videos"][0]["views_per_day"] is not None
+
+
+def test_source_automation_can_be_paused_by_owner(tmp_path, monkeypatch):
+    import jobs_db
+    monkeypatch.setattr(jobs_db, '_DB_PATH', str(tmp_path / 'jobs.db'))
+    jobs_db.init_db()
+    app = FastAPI()
+    install(app, 'password', ClipLibrary(tmp_path / 'library'))
+    client = TestClient(app, follow_redirects=False)
+    assert client.put('/api/source-automation', json={'enabled': False}).status_code == 401
+    client.post('/owner/login', data={'password': 'password'})
+    assert client.get('/api/source-automation').json() == {'enabled': True}
+    assert client.put('/api/source-automation', json={'enabled': False}).json() == {'enabled': False}
+    assert client.get('/api/source-automation').json() == {'enabled': False}
