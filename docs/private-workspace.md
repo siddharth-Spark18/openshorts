@@ -44,11 +44,11 @@ The importer prompts for the workspace password and prints the submitted job ID.
 
 The GitHub Actions workflow deploys pushes to `dev` after you configure the repository. On EC2, keep a clean checkout of `dev`, configure the private `.env`, and ensure the SSH user can run Git and Docker Compose. The server must be able to fetch the repository.
 
-In GitHub repository settings, add the Actions secrets `EC2_HOST`, `EC2_USER`, `EC2_SSH_KEY` (the private key for that user), and `EC2_KNOWN_HOSTS` (the verified SSH host key line). Add the Actions variable `EC2_DIRECTORY` with the absolute path to the checkout. Set the variable `EC2_DEPLOY_ENABLED` to `true` when ready. The workflow also supports manual runs from the Actions tab. It fetches `dev`, requires a fast-forward update, then rebuilds and starts the private Compose stack. GitHub's runner must be able to reach the instance's SSH port.
+In GitHub repository settings, add the Actions secrets `EC2_HOST`, `EC2_USER`, `EC2_SSH_KEY` (the private key for that user), and `EC2_KNOWN_HOSTS` (the verified SSH host key line). Add the Actions variable `EC2_DIRECTORY` with the absolute path to the checkout. Set the variable `EC2_DEPLOY_ENABLED` to `true` when ready. The workflow also supports manual runs from the Actions tab. It fetches `dev`, requires a fast-forward update, pauses new jobs, and waits for active jobs before rebuilding and starting the private Compose stack. Jobs queued during deployment resume afterward. GitHub's runner must be able to reach the instance's SSH port.
 
 ## Google Drive folder connection
 
-The Settings page can connect a Google account and select a folder with Google Picker. This connection setup does not yet upload clips to Drive.
+The Settings page can connect a Google account and select a folder with Google Picker. Finished clips in the local library are copied to the selected Drive folder in the background and retried if an upload fails. Local copies are retained. If a local clip is missing, Manage clips can download its verified Drive copy while the connection remains active. Deleting a clip from the app library does not delete the Drive copy. Source videos are not archived to Drive.
 
 In Google Cloud, enable the Google Drive API and Google Picker API. Configure an OAuth web client with this authorized JavaScript origin:
 
@@ -71,3 +71,7 @@ DRIVE_PICKER_API_KEY='your-picker-api-key'
 ```
 
 Recreate the backend with Docker Compose, sign out and back into OpenShorts, then use **Settings → Google Drive** to authorize and choose the folder. The refresh token is stored with owner-only permissions in the persistent library volume. Disconnect removes the local token. You can also revoke access in your Google account.
+
+## Source video statistics
+
+To rank discovered videos by average views per day, enable the YouTube Data API v3 in Google Cloud and set `YOUTUBE_DATA_API_KEY` in the server `.env`. Use an API key restricted to the YouTube Data API. Discovery and topic matching continue without this key.

@@ -15,7 +15,7 @@ export default function ManageClips() {
   }, []);
 
   async function remove(clip, url) {
-    if (!window.confirm(`Delete “${clip.title}” from your saved clip library?`)) return;
+    if (!window.confirm(`Delete “${clip.title}” from the app library? Any Google Drive backup will remain in Drive.`)) return;
     setRemoving(true);
     setError('');
     try {

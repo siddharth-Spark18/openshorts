@@ -1477,7 +1477,7 @@ function App() {
         <div className="flex-1 overflow-hidden relative">
 
           {/* View: Settings */}
-          {ownerWorkspace && activeTab === 'sources' && <SourceChannels />}
+          {ownerWorkspace && activeTab === 'sources' && <div className="h-full overflow-y-auto"><SourceChannels /></div>}
           {ownerWorkspace && activeTab === 'library' && <ManageClips />}
           {activeTab === 'settings' && (
             <div className="h-full overflow-y-auto p-4 sm:p-8 max-w-2xl mx-auto animate-fade">

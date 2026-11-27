@@ -19,6 +19,21 @@ CALLBACK = "https://openshorts-dev.duckdns.org/api/drive/callback"
 TOKEN_URL = "https://oauth2.googleapis.com/token"
 
 
+async def refresh_access_token(data):
+    client = os.getenv("DRIVE_CLIENT_ID", "").strip()
+    secret = os.getenv("DRIVE_CLIENT_SECRET", "").strip()
+    if not data.get("refresh_token") or not client or not secret:
+        raise HTTPException(409, "Connect Google Drive first.")
+    async with httpx.AsyncClient(timeout=20) as http:
+        response = await http.post(TOKEN_URL, data={
+            "client_id": client, "client_secret": secret,
+            "refresh_token": data["refresh_token"], "grant_type": "refresh_token",
+        })
+    if response.status_code != 200:
+        raise HTTPException(502, "Google authorization expired. Connect Google Drive again.")
+    return response.json()["access_token"]
+
+
 class FolderSelection(BaseModel):
     id: str
 
@@ -49,25 +64,14 @@ def install(app, library):
         finally:
             temporary.unlink(missing_ok=True)
 
-    async def access_token(data):
-        client, secret, _ = config()
-        if not data.get("refresh_token") or not client or not secret:
-            raise HTTPException(409, "Connect Google Drive first.")
-        async with httpx.AsyncClient(timeout=20) as http:
-            response = await http.post(TOKEN_URL, data={
-                "client_id": client, "client_secret": secret,
-                "refresh_token": data["refresh_token"], "grant_type": "refresh_token",
-            })
-        if response.status_code != 200:
-            raise HTTPException(502, "Google authorization expired. Connect Google Drive again.")
-        return response.json()["access_token"]
 
     @app.get("/api/drive/status")
     def status():
         client, secret, picker = config()
         data = read()
         return {"available": bool(client and secret and picker), "connected": bool(data.get("refresh_token")),
-                "folder_name": data.get("folder_name"), "folder_id": data.get("folder_id")}
+                "folder_name": data.get("folder_name"), "folder_id": data.get("folder_id"),
+                "archive_status": getattr(library, "drive_status", "pending")}
 
     @app.get("/api/drive/connect")
     def connect(request: Request):
@@ -104,14 +108,14 @@ def install(app, library):
     @app.get("/api/drive/picker")
     async def picker():
         client, _, api_key = config()
-        return {"token": await access_token(read()), "api_key": api_key, "app_id": client.split("-")[0]}
+        return {"token": await refresh_access_token(read()), "api_key": api_key, "app_id": client.split("-")[0]}
 
     @app.put("/api/drive/folder")
     async def select_folder(selection: FolderSelection):
         if not selection.id or len(selection.id) > 200:
             raise HTTPException(400, "Invalid folder.")
         data = read()
-        token = await access_token(data)
+        token = await refresh_access_token(data)
         async with httpx.AsyncClient(timeout=20) as http:
             response = await http.get(
                 "https://www.googleapis.com/drive/v3/files/" + selection.id,

@@ -1254,6 +1254,15 @@ async def cleanup_jobs():
         except Exception as e:
             print(f"⚠️ Cleanup error: {e}")
 
+def _deployment_paused():
+    """A deployment can briefly pause dispatch while active jobs finish."""
+    marker = os.path.join(OUTPUT_DIR, ".deploy-pause")
+    try:
+        return time.time() - os.path.getmtime(marker) < 7200
+    except FileNotFoundError:
+        return False
+
+
 async def process_queue():
     """Background worker to process jobs from the queue with concurrency limit."""
     print(f"🚀 Job Queue Worker started with {MAX_CONCURRENT_JOBS} concurrent slots.")
@@ -1270,6 +1279,8 @@ async def process_queue():
 
             # Acquire semaphore slot (waits if max jobs are running)
             await concurrency_semaphore.acquire()
+            while _deployment_paused() and not _draining:
+                await asyncio.sleep(1)
             if _draining:
                 concurrency_semaphore.release()
                 job_queue.task_done()
@@ -1793,6 +1804,30 @@ def _purge_local_jobs_for_user(user_id) -> int:
     return removed
 
 
+async def discover_owner_sources():
+    from source_discovery import scan_all
+    while True:
+        try:
+            await asyncio.to_thread(scan_all)
+        except Exception as exc:
+            print(f"Source discovery failed: {type(exc).__name__}")
+        await asyncio.sleep(900)
+
+
+async def sync_owner_drive():
+    """Periodically retry the Drive archive without blocking the job queue."""
+    from drive_archive import DriveArchive
+    archive = DriveArchive(owner_library.root)
+    while True:
+        try:
+            connected = await asyncio.to_thread(archive.sync)
+            owner_library.drive_status = "synced" if connected else "not_connected"
+        except Exception as exc:
+            owner_library.drive_status = "error"
+            print(f"Google Drive archive failed: {type(exc).__name__}")
+        await asyncio.sleep(300)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Initialise persistent SQLite store (Fix 2 & 3).
@@ -1814,6 +1849,9 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(_handover_watch())
     asyncio.create_task(_resume_scan())
     # Start worker and cleanup
+    if owner_library:
+        asyncio.create_task(sync_owner_drive())
+        asyncio.create_task(discover_owner_sources())
     worker_task = asyncio.create_task(process_queue())
     cleanup_task = asyncio.create_task(cleanup_jobs())
     if BILLING_ENABLED:
@@ -2142,6 +2180,13 @@ async def health_ready():
     if _stopping:
         return JSONResponse({"status": "stopping"}, status_code=503)
     return {"status": "ready"}
+
+@app.get("/health/deployment")
+async def deployment_status(request: Request):
+    if not request.client or request.client.host not in ("127.0.0.1", "::1"):
+        raise HTTPException(403, "Local access only.")
+    return {"running_jobs": len(_running_jobs), "paused": _deployment_paused()}
+
 
 @app.get("/api/config")
 async def get_config():

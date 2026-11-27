@@ -86,6 +86,30 @@ def init_db() -> None:
                     created_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS source_channel_state (
+                    channel_id TEXT PRIMARY KEY,
+                    youtube_id TEXT,
+                    checked_at TEXT,
+                    error TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS source_videos (
+                    video_id TEXT PRIMARY KEY,
+                    channel_id TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    published_at TEXT,
+                    discovered_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS source_videos_channel_idx
+                    ON source_videos(channel_id, published_at DESC);
+
+                CREATE TABLE IF NOT EXISTS source_video_stats (
+                    video_id TEXT PRIMARY KEY,
+                    views INTEGER,
+                    likes INTEGER,
+                    checked_at TEXT NOT NULL
+                );
+
                 -- Generic key-value store for persisted settings (API keys, etc.).
                 CREATE TABLE IF NOT EXISTS settings (
                     key   TEXT PRIMARY KEY,
@@ -289,6 +313,7 @@ ALLOWED_SETTINGS = {
     "upload_user_id",
     "elevenlabs_key",
     "fal_key",
+    "source_topics",
 }
 
 

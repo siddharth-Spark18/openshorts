@@ -235,3 +235,47 @@ class TestStatusFromDisk:
         app_module.jobs["j1"] = {"status": "queued", "logs": ["Job queued"]}
         app_module._begin_drain("test")
         assert app_module._presented_status("j1", app_module.jobs["j1"]) == "processing"
+
+
+def test_deployment_pause_marker_expires(tmp_path, monkeypatch):
+    import time
+    monkeypatch.setattr(app_module, "OUTPUT_DIR", str(tmp_path))
+    marker = tmp_path / ".deploy-pause"
+    assert not app_module._deployment_paused()
+    marker.touch()
+    assert app_module._deployment_paused()
+    import os
+    old = time.time() - 7201
+    os.utime(marker, (old, old))
+    assert not app_module._deployment_paused()
+
+
+def test_dispatch_waits_while_deployment_is_paused(monkeypatch):
+    import asyncio
+
+    async def exercise():
+        paused = {"value": True}
+        started = asyncio.Event()
+        monkeypatch.setattr(app_module, "job_queue", asyncio.PriorityQueue())
+        monkeypatch.setattr(app_module, "concurrency_semaphore", asyncio.Semaphore(1))
+        monkeypatch.setattr(app_module, "_running_jobs", set())
+        monkeypatch.setattr(app_module, "_draining", False)
+        monkeypatch.setattr(app_module, "_deployment_paused", lambda: paused["value"])
+        monkeypatch.setattr(app_module, "_touch_manifest", lambda _: None)
+
+        async def run(_):
+            started.set()
+        monkeypatch.setattr(app_module, "run_job_wrapper", run)
+        await app_module.job_queue.put((2, 0, "job"))
+        task = asyncio.create_task(app_module.process_queue())
+        await asyncio.sleep(0.05)
+        assert not started.is_set()
+        paused["value"] = False
+        await asyncio.wait_for(started.wait(), timeout=2)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(exercise())

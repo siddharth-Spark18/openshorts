@@ -38,4 +38,4 @@ jobs:
             *[!a-zA-Z0-9_./-]*) echo "Invalid EC2_DIRECTORY." >&2; exit 1 ;;
           esac
           ssh -o BatchMode=yes -o StrictHostKeyChecking=yes "$EC2_USER@$EC2_HOST" \
-            "cd '$EC2_DIRECTORY' && git fetch origin dev && git merge --ff-only origin/dev && docker compose -f docker-compose.private.yml up --build -d"
+            "cd '$EC2_DIRECTORY' && git fetch origin dev && git merge --ff-only origin/dev && sh ops/deploy-private.sh"

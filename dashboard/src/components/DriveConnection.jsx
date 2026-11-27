@@ -66,7 +66,10 @@ export default function DriveConnection() {
           {status.connected && <button className="btn-ghost px-4 py-2" disabled={busy} onClick={chooseFolder}>Choose folder</button>}
           {status.connected && <button className="btn-quiet px-4 py-2" disabled={busy} onClick={disconnect}>Disconnect</button>}
         </div>
-        <p className="text-sm text-muted">The connection selects a folder. Clip uploads to Drive are not yet enabled.</p>
+        <p className="text-sm text-muted">Finished clips are copied to this folder in the background. The local library remains available.</p>
+        {status.folder_id && <p className="text-sm" role="status">{status.archive_status === 'error'
+          ? 'Drive backup failed. Check your connection and try reconnecting.'
+          : status.archive_status === 'synced' ? 'The last Drive backup check succeeded.' : 'Drive backup is waiting for its next check.'}</p>}
       </>}
     {message && <p role="status" className="text-sm">{message}</p>}
   </section>;
