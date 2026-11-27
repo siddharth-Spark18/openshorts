@@ -1061,7 +1061,9 @@ def auto_caption_clip(clip_path, transcript, clip_start, clip_end, split_ranges=
         return None  # silent video: nothing to caption
     try:
         import subtitles as _subs
-        style = _subs.AUTO_CAPTION_STYLE
+        style = dict(_subs.AUTO_CAPTION_STYLE)
+        if os.environ.get("GAMING_LAYOUT") == "1":
+            style.update(font_size=32, max_chars=22, effect="none")
         output_dir = os.path.dirname(clip_path)
         stem = os.path.basename(clip_path)
         generation_id = int(time.time())
@@ -1167,6 +1169,12 @@ def render_clip(input_video, final_output_video, output_format="auto",
     ``force_strategy`` for the scenes it names."""
     if output_format == "horizontal":
         return finalize_clip_passthrough(input_video, final_output_video)
+    if (os.environ.get("GAMING_LAYOUT") == "1" and output_format != "square"
+            and not force_strategy and not crop_overrides):
+        import gaming_layout
+        if gaming_layout.is_landscape(input_video):
+            return gaming_layout.render(input_video, final_output_video)
+        print("   🎮 Source is already vertical; keeping its existing framing.")
     aspect = 1.0 if output_format == "square" else ASPECT_RATIO
     return process_video_to_vertical(input_video, final_output_video, aspect_ratio=aspect,
                                      force_strategy=force_strategy,
@@ -2095,9 +2103,16 @@ if __name__ == '__main__':
                     # The hook was written from the transcript alone. When the
                     # render put this clip's meaning on the screen, rewrite hook
                     # and title from three of its frames BEFORE burning them.
+                    gaming = (os.environ.get("GAMING_LAYOUT") == "1"
+                              and output_format not in ("square", "horizontal"))
+                    grounded = None
                     if success and hook_grounding.wanted(clip['layout_ranges'], end - start):
-                        hook_grounding.reground(clip_final_path, clip, transcript, start, end)
-                    if success and os.environ.get("AUTO_HOOK") == "1":
+                        grounded = hook_grounding.reground(
+                            clip_temp_path if gaming else clip_final_path, clip, transcript, start, end)
+                    if gaming and not grounded:
+                        clip['review_warning'] = 'Hook and title could not be checked against the source frames.'
+                        print('   ⚠️ Gaming hook not visually verified; skipping automatic hook.')
+                    if success and os.environ.get("AUTO_HOOK") == "1" and (not gaming or grounded):
                         hooked = auto_hook_clip(clip_final_path, clip)
                         if hooked:
                             deliver_path, clip['auto_hook'] = hooked
@@ -2135,7 +2150,7 @@ if __name__ == '__main__':
 
             # Persist per-clip render results added by the workers (auto_hook)
             # so the editor can see what is already burned into each clip.
-            if any('auto_hook' in c or 'hook_grounding' in c for c in shorts):
+            if any('auto_hook' in c or 'hook_grounding' in c or 'review_warning' in c for c in shorts):
                 with open(metadata_file, 'w') as f:
                     json.dump(clips_data, f, indent=2)
 

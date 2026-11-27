@@ -34,7 +34,9 @@ export default function ManageClips() {
     {clips?.map(clip => {
       const url = `/api/library/${clip.job_id}/${clip.index}`;
       return <article key={url} className="card p-4 flex flex-wrap items-center gap-3">
-        <h2 className="flex-1 min-w-40 break-words text-ink">{clip.title}</h2>
+        <div className="flex-1 min-w-40"><h2 className="break-words text-ink">{clip.title}</h2>
+          {clip.review_warning && <p className="text-sm text-danger">{clip.review_warning} Review the title before publishing.</p>}
+        </div>
         <a href={getApiUrl(url)} download className="btn-ghost inline-flex items-center gap-2 px-3 py-2"><Download size={16}/>Download</a>
         <button disabled={removing} onClick={() => remove(clip, url)} className="btn-quiet inline-flex items-center gap-2 px-3 py-2"><Trash2 size={16}/>Delete</button>
       </article>;

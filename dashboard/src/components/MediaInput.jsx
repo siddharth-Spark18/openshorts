@@ -304,6 +304,7 @@ export default function MediaInput({ onProcess, isProcessing }) {
                                     aria-label="vertical layout"
                                 >
                                     <option value="auto">Auto (AI picks per video)</option>
+                                    <option value="gaming">Gaming: full screen and cameras</option>
                                     <option value="split">Two speakers stacked</option>
                                     <option value="screencast">Screen over presenter</option>
                                     <option value="none">Single crop only</option>

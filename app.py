@@ -1808,7 +1808,8 @@ async def _auto_submit_source(video_id, job_id):
     """Use the regular processing endpoint with a stable internal job ID."""
     payload = json.dumps({"url": f"https://www.youtube.com/watch?v={video_id}",
                           "acknowledged": True, "output_format": "vertical",
-                          "auto_hook": True}).encode()
+                          "auto_hook": True, "layouts": ["gaming"],
+                          "clip_min_seconds": 15, "clip_max_seconds": 35}).encode()
 
     async def receive():
         return {"type": "http.request", "body": payload, "more_body": False}
@@ -2323,6 +2324,7 @@ def _reject_short_source(duration: float):
 # does — its "applicable auto layout" panel lets the user pick which layouts the
 # AI may apply.
 LAYOUT_ENV = {
+    "gaming": "GAMING_LAYOUT",     # preserve game and corner camera context
     "split": "SPLIT_LAYOUT",          # two speakers stacked
     "screencast": "SCREENCAST_LAYOUT",  # slides/screen share over the speaker
     "speaker_cut": "SPEAKER_CUT",     # hard cuts to whoever is talking
@@ -2853,7 +2855,7 @@ async def process_endpoint(
                            base_url=api_base, partial=partial)
 
     if owner_library:
-        retry_keys = ("AUTO_LAYOUT", "SPLIT_LAYOUT", "SCREENCAST_LAYOUT", "SPEAKER_CUT",
+        retry_keys = ("GAMING_LAYOUT", "AUTO_LAYOUT", "SPLIT_LAYOUT", "SCREENCAST_LAYOUT", "SPEAKER_CUT",
                       "PUNCH_IN", "SPEAKER_SIGNAL", "AUTO_HOOK", "AUTO_HOOK_STYLE",
                       "AUTO_CAPTIONS", "CLIP_TARGET_MIN", "CLIP_TARGET_MAX",
                       "CLIP_MIN_SECONDS", "CLIP_MAX_SECONDS")

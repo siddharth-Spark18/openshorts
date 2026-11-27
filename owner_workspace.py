@@ -56,7 +56,8 @@ class ClipLibrary:
                 index = len(entries)
                 shutil.copyfile(path, stage / f"{index}.mp4")
                 entries.append({"index": index, "title": clip.get("video_title_for_youtube_short")
-                                or clip.get("title") or name, "filename": name})
+                                or clip.get("title") or name, "filename": name,
+                                "review_warning": clip.get("review_warning")})
             if entries:
                 (stage / "index.json").write_text(json.dumps(entries))
                 stage.rename(destination)

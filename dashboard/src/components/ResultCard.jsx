@@ -816,6 +816,7 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                     <h3 className="text-base font-medium text-ink leading-tight line-clamp-2 mb-2 break-words" title={clip.video_title_for_youtube_short}>
                         {clip.video_title_for_youtube_short || "Viral Clip Generated"}
                     </h3>
+                    {clip.review_warning && <p role="status" className="text-sm text-danger mb-2">{clip.review_warning} Review the title before publishing.</p>}
                     <div className="flex flex-wrap gap-1.5">
                         {durationReadout && <span className="readout bg-paper3 px-2 py-0.5 rounded-full shrink-0">{durationReadout}</span>}
                         {resolution && <span className="readout bg-paper3 px-2 py-0.5 rounded-full shrink-0">{resolution}</span>}
