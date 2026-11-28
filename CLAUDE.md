@@ -4,527 +4,127 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-OpenShorts is an AI-powered vertical video generator that transforms long YouTube videos or local uploads into viral-ready short clips (9:16 format) for TikTok, Instagram Reels, and YouTube Shorts. Uses Google Gemini 3.1 Flash-Lite (`gemini-3.1-flash-lite`, overridable with `GEMINI_MODEL`) for viral moment detection and title generation.
+OpenShorts is an AI-powered vertical video generator that turns long YouTube videos or local uploads into short 9:16 clips for TikTok, Instagram Reels and YouTube Shorts. Google Gemini 3.1 Flash-Lite (`gemini-3.1-flash-lite`, overridable with `GEMINI_MODEL`) picks the viral moments and writes the titles. It ships as self-host (BYOK) and as a Cloud edition (`BILLING_ENABLED`, code under `cloud/`).
 
 ## Development Commands
 
-### Local Development (Docker)
 ```bash
-docker compose up --build   # Build and run full stack
-```
-- Backend: http://localhost:8000 (FastAPI/Uvicorn)
-- Frontend: http://localhost:5175 (Vite proxies API calls to backend)
+docker compose up --build        # full stack: backend :8000 (FastAPI), frontend :5175 (Vite proxies the API)
 
-### Frontend Only (Dashboard)
-```bash
-cd dashboard
-npm install
-npm run dev       # Dev server with HMR (port 5173)
-npm run build     # Production build
-npm run lint      # ESLint (strict, --max-warnings 0)
-```
+cd dashboard && npm install
+npm run dev                      # dev server with HMR (:5173)
+npm run build                    # production build (CI runs this)
+npm run lint                     # ESLint, --max-warnings 0
 
-### Backend Only
-```bash
 pip install -r requirements.txt
 uvicorn app:app --host 0.0.0.0 --port 8000
+pytest tests/ -v                 # CI runs this without the heavy ML stack
 ```
 
-## Architecture
+## Pipeline
 
-### Core Processing Pipeline
-1. **Ingest** - YouTube download (yt-dlp) or local upload
-2. **Transcription** - faster-whisper with word-level timestamps
-3. **Scene Detection** - PySceneDetect for segment boundaries
-4. **AI Analysis** - Gemini identifies 3-15 viral moments (15-60 sec each)
-5. **FFmpeg Extraction** - Precise clip cutting
-6. **AI Cropping** - Vertical reframing with subject tracking
-7. **Effects/Subtitles** - Optional AI-generated FFmpeg filters
-8. **Hook Overlay** - Text overlays with styled fonts
-9. **Voice Dubbing** - Optional ElevenLabs AI translation (30+ languages)
-10. **S3 Backup** - Silent background upload
-11. **Social Distribution** - Upload-Post API (async upload)
+Ingest (yt-dlp or upload) → transcription (word timestamps) → scene detection → Gemini picks moments (15-60 s) → FFmpeg cut → vertical reframing → effects/subtitles → hook overlay → optional ElevenLabs dubbing → S3/R2 backup → optional social posting via Upload-Post.
 
-### Key Files
-| File | Purpose |
-|------|---------|
-| `main.py` | Core video processing: transcription, scene detection, clip extraction, vertical reframing |
-| `app.py` | FastAPI server with async job queue and REST endpoints |
-| `editor.py` | Gemini AI integration for dynamic video effects (FFmpeg filter generation) |
-| `hooks.py` | Hook text overlay generation with font rendering |
-| `s3_uploader.py` | AWS S3 upload with caching |
-| `subtitles.py` | SRT generation, FFmpeg subtitle burning, and dubbed video transcription |
-| `translate.py` | ElevenLabs dubbing API for AI voice translation |
-| `dashboard/src/App.jsx` | Main React component with state management |
-| `dashboard/src/components/TranslateModal.jsx` | Voice dubbing UI with language selection |
-| `dashboard/vite-plugin-seo.js` | Build-time SEO surface: injects crawler-visible homepage content, emits static pages, sitemap.xml and llms.txt |
-| `dashboard/seo/data.js` | Single source of truth for pricing, pipeline and competitor facts used by every generated page |
+## Key Files
 
-### SEO / AI-crawler surface
+- `main.py`: core processing (transcription, scene detection, clip extraction, reframing). Runs as a child process per job.
+- `app.py`: FastAPI server, job queue, REST endpoints, deploy handover/drain.
+- `clip_selection.py`, `layout_picker.py`, `reframe_v2.py`, `split_layout.py`, `screencast_layout.py`, `camera_inset.py`: moment picking and layouts.
+- `editor.py` (Gemini FFmpeg effects), `pro_mode.py` (talking-head re-edit), `hooks.py` (hook overlays), `subtitles.py` (SRT/ASS, burning), `translate.py` (ElevenLabs dubbing), `thumbnail.py`.
+- `mcp_server.py`, `mcp_stdio.py`: MCP over HTTP and stdio.
+- `cloud/`: auth, API keys, metering, billing, lifecycle emails, account erasure, autopilot, proxy ledger, alerts, queue watch.
+- `dashboard/src/App.jsx`: main React component. `dashboard/vite-plugin-seo.js` + `dashboard/seo/`: build-time SEO pages, sitemap, llms.txt. `dashboard/seo/data.js`: single source of truth for pricing/pipeline/competitor facts.
 
-The dashboard is a client-rendered SPA with hash routing, so the HTML served for
-`/` used to contain an empty `<div id="root">`. Googlebot renders JavaScript and
-saw the real page; GPTBot, ClaudeBot and PerplexityBot do not and measured the
-homepage as zero characters of text. `vite-plugin-seo.js` fixes that at build time:
+## Subsystem reference (read before touching)
 
-- Injects the content of `seo/landing-fallback.js` into `#root`. React's
-  `createRoot().render()` replaces it on mount, so users get the app and
-  non-executing clients get the copy. **Keep it in sync with `Landing.jsx`.**
-- Emits the standalone pages (the `/alternatives` cluster, the clip-generator,
-  open-source, use-case and automation pages, and `/mcp`; the full list is
-  `buildPages()` in `seo/pages.js`) as flat `.html` files.
-  nginx resolves the clean URL through `try_files $uri $uri.html`; serving them as
-  directories instead makes nginx 301 to a trailing slash and every canonical
-  would then point at a redirect.
-- Generates `sitemap.xml` and `llms.txt` from the same page list, so they cannot
-  drift. Do not add a static `public/sitemap.xml` back.
+- SEO pages, free tools, attribution → `docs/architecture/seo-and-tools.md`
+- Layout picker, reframing modes, hook grounding → `docs/architecture/layouts-and-reframing.md`
+- Clip count, silent-footage fallback, local LLM → `docs/architecture/clip-selection.md`
+- Thumbnail Studio → `docs/architecture/thumbnails.md`
+- Pro mode (talking-head re-edit, per-clip switch) → `docs/architecture/pro-mode.md`
+- API endpoints, API keys, MCP, OAuth, webhooks → `docs/architecture/agent-access.md`
+- Autopilot → `docs/architecture/autopilot.md`
+- Free-plan watermark (served `wm_` copy, unmark on upgrade) → `docs/architecture/watermark.md`
+- Quota wall, free overflow, lifecycle emails, cancel flow, survey, GDPR erasure, paid-source archive, support-ops API → `docs/architecture/billing-and-account.md`
+- Concurrency/VRAM, auto-retry, deploy handover and drain → `docs/architecture/jobs-and-deploys.md`
+- Download routing, yt-dlp clients, paid proxy ledger → `docs/architecture/proxy-routing.md`
+- Remote CPU worker (second host renders free jobs) → `docs/architecture/remote-worker.md`
+- Multiprocess API (engine + front processes, status snapshots, shared cache epoch) → `docs/architecture/multiprocess-api.md`
 
-When editing pricing anywhere, edit `seo/data.js` too. Nothing on the site should
-say "OpenShorts is free" without naming the Cloud price in the same breath: both
-are true of different editions and quoting only the first one is what makes AI
-answers describe the paid product as free.
+## Hard rules
 
-### Cómo se elige el layout
+**SEO / site**
+- Keep `seo/landing-fallback.js` in sync with `Landing.jsx`. Never add a static `public/sitemap.xml` back: `vite-plugin-seo.js` generates it.
+- Standalone pages are emitted as flat `.html` files (directories make nginx 301 and break canonicals).
+- When editing pricing anywhere, edit `seo/data.js` too. Never say "OpenShorts is free" without the Cloud price next to it.
+- `/gta-5-clips`, `/gta-6-clips` and `/platforms/twitch` state the silent-footage thresholds and stretch sizes: change their copy if that behaviour changes.
 
-`POST /api/process` acepta `layouts`: una lista (JSON) o cadena separada por
-comas con `auto`, `split`, `screencast`, `speaker_cut`, `punch_in` y `none`.
-Cada nombre enciende su variable de entorno para **ese** trabajo
-(`app.py:layout_env`); `none` apaga el picker aunque prod corra con
-`AUTO_LAYOUT=1` (recorte simple y nada más). Sin `layouts` manda el env del
-despliegue, que desde el 25-ago-2026 es `AUTO_LAYOUT=1`. El dashboard lo expone
-en opciones avanzadas ("vertical layout": auto / split / screencast / none,
-`MediaInput.jsx`, recordado en `localStorage.os_layout`).
+**Free tools**
+- The youtube-transcript tool uses `STATIC_PROXY_URLS` (or direct) only, **never** `PROXY_URL`. A static route returning zero formats and zero captions is degraded, not "no captions".
 
-`auto` activa `layout_picker.py`: **una** llamada a Gemini por vídeo de origen
-(no por clip) que elige entre `none` / `screencast` / `split`. Medido sobre el
-corpus de 48 contra etiquetas revisadas a mano: 94% / 92% / 96% en tres pasadas,
-con 0-1 falsos positivos sobre los 28 clips que no deben tocarse, y solo 2 clips
-que cambian de respuesta entre pasadas.
+**Layouts and rendering**
+- `layout_picker` sends 12 frames at 1024px and asks for a closed choice, never the video and never a measurement.
+- `layout_picker.apply()` only adds options: an explicit user choice is never turned off by the model.
+- A source that is already vertical skips the picker and classifier and renders TRACK.
+- SPLIT captions need ASS with `{\an5}` per word event on the seam; SRT cannot do per-stretch alignment. Preserve `layout_ranges` through recut (`layout_ranges.remap`).
+- Mouth activity is normalised per speaker before comparing (`normalise_activity`).
+- The reframe render runs in one GPU pass (`gpu_render` + `osrender/`) built from the scenes' own filtergraphs: a layout graph that `gpu_render.layers_from_graph` cannot read silently renders through ffmpeg, so keep new layouts to crop/scale/gblur/overlay/vstack/pad and run `tests/test_gpu_render_equivalence.py` on a GPU. After editing `osrender/src/kernels.cu`, regenerate `kernels.ptx` (see `osrender/README.md`).
+- The hook + captions (+ `wm_`) burn runs on the card (`gpu_burn` + `osrender burn`) and its pictures must stay byte-identical to the ffmpeg graph it replaces: a change to the hook overlay, the `ass` caption filter, `main.watermark_filter` or the burn kernels runs `tests/test_gpu_burn_equivalence.py` on a GPU. A filter `gpu_burn` cannot read burns with ffmpeg.
+- Pro mode (`pro_mode.py`) renders frame by frame on the CPU: always through `pro_mode.run` (own process, host slot), never inside the API or a job thread, and `PRO_MODE=auto` stays opt-in. The pro file is a `recut_` with its `recipe`; never a new filename prefix.
+- Canonical files are always clean; the free-plan mark exists only on the served `wm_` copy (`main.mark_delivery` / `app._deliver`). While a job has `.marked`, `/videos` refuses its clean deliverables. On this host's free jobs the clean captioned twin may be only a recipe (`clean_twin.py`): code that opens a free clip's clean twin calls `clean_twin.materialize` first.
 
-**Manda 12 fotogramas a 1024px, no el vídeo.** Gemini factura vídeo a ~300
-tokens por segundo: una hora de fuente son ~1,08M de tokens (no cabe en una
-ventana de 1M) y una subida de 1-2 GB para recibir una palabra. Doce fotogramas
-cuestan ~3k tokens **dure lo que dure la fuente**, que es lo que hace viable
-esto con los podcasts de una hora que entran de verdad. La resolución importa y
-el número de fotogramas no: a 640px detecta 15 de 20 (una hoja de cálculo es
-ilegible), a 1024px sube a 17, y pasar a 24 fotogramas lo empeora. A 1024px la
-diferencia con mandar el vídeo entero cae dentro de la varianza que ya tiene el
-propio modo vídeo, a 2,2 s por clip en vez de ~15 s.
+**Clip selection**
+- The scoring pass ranks every window (global top N), never "choose up to K per batch". The `min_clips` floor is enforced in code.
+- `get_visual_clips` is the only stage that sends Gemini the video; past `VISION_SEGMENT_SECONDS` it watches near-equal stretches (`vision_segments`), never one upload of the whole source.
 
-Lo que hace que funcione, y que conviene no deshacer: se le pide una **decisión
-entre opciones cerradas**, no una medida. Los cuatro intentos anteriores (Canny,
-MSER, cobertura temporal, anchura) le pedían un número y ninguno separó una hoja
-de cálculo de un marcador de esquina. La varianza que este repo atribuía a
-Gemini era de las medidas continuas, no del modelo.
+**Jobs, GPU, deploys**
+- Call `transcribe_backends.release_models()` after any ASR (job processes and in-API transcriptions alike). Size `MAX_CONCURRENT_JOBS` by free VRAM first.
+- `DRAIN_TIMEOUT_SECONDS` must stay below the deployment's (Coolify) stop grace period. The image must ship `curl` for the platform health check.
+- With `API_FRONT_WORKERS` > 0 the API is one engine (`app.py`, the only process with jobs/queue in memory) plus N front processes (`front.py`). A front serves only `front_proxy.serves_locally` routes, which must reach none of `app.py`'s module-level state (a test walks them); everything else is proxied to the engine. A per-process cache that a forget must clear calls `owner_cache.bump` (shared `CACHE_EPOCH_FILE`). Boot-time schema steps never take a table lock when the change is already there.
+- Admin alerts go through `alerts.send_admin_alert` / `alerts.notify`, never `send_telegram` directly: `urgent=True` only for what needs someone now (route down, cookies, bulk failures, paid jobs late, the AI provider refusing the account: `alerts._looks_like_ai_account_error`); the rest is held for the daily digest. Never an email address or video title in an alert (`alerts.user_ref`).
+- A drain-cancelled job keeps its manifest and reservation and is resumed, never marked failed or completed.
+- The disk sweeps and size caps delete only what `_job_is_active` / `_upload_is_live` call dead: a submission counts as live from its `_begin_job_dir` (source still streaming in) and an agent upload slot until it expires.
+- The remote worker gets job options, the source and the transcript and scene probabilities this host prepared for it (`PREPARE_TRANSCRIPT`, `PREPARE_SCENES`), never a credential, and writes only plain non-dot output files into its job's directory (`remote_worker.job_options`, `safe_relpath`); a hook recipe travels under a plain name and the API writes the dotfiles itself after reading it as numbers (`remote_worker.adopt_recipe`). A remote job holds no GPU slot (`_local_running`); new per-job state it needs lives as files in the job dir, not in memory.
+- A worker that says it downloads (`WORKER_DOWNLOADS`, its operator's own `YOUTUBE_COOKIES`..) is given the link instead of the source, only for a site of `remote_worker.safe_link`, and sends what it fetched back with the clips; a link it cannot fetch comes back as `no_source` and runs here, never counted by the breaker. It offers to fetch per claim, for `WORKER_DOWNLOAD_SLOTS` jobs at a time, never one per slot. An account is configured on one host only.
+- Whatever is read back from a job directory (recipes, metadata, sidecars, subtitles, log lines) is data from possibly another machine: numbers as numbers, text as text, never pasted into an ffmpeg filter graph, a path or markup. A filter string that is not a plain chain of `editor._ALLOWED_FILTERS` is not run.
 
-`layout_picker.apply()` sólo **añade**: una elección explícita del usuario nunca
-se desactiva porque el modelo diga `none`.
+**Download proxies**
+- Route order is direct → static → paid (per-GB `PROXY_URL`). Never use the paid proxy for non-YouTube URLs, nor for failures another IP cannot fix (`static_failure_warrants_paid`).
+- A non-YouTube link stops at the first static that reaches the site; only a static that refuses the tunnel (`main.exit_refused`) passes it to the next one, and that refusal is never a credits alert.
+- The probe also carries `YOUTUBE_COOKIES`, like the download does; first attempt with cookies, second anonymous, on probe and download alike.
+- Keep the explicit `yt_clients.py` client list; never put `player_skip: webpage` back. `noplaylist` always; non-video URLs refused by an allowlist.
+- Every yt-dlp extraction that sends `YOUTUBE_COOKIES` takes its cookie file from a `yt_account.Session` (one of the configured accounts, `YOUTUBE_COOKIES_2`.. add more) and runs inside its `request()`, and none is sent while `yt_account.cooling_down()`: each account's budget is shared by every probe and download. A failure that is only the account limit is retried after the cooldown (`YT_ACCOUNT_LIMITED`), never reported as a broken video. An age-restricted refusal moves the video to another account (`Session.age_gated`), never to the paid proxy; so does "DRM protected" said to an account (`Session.drm_refused`), which also counts against it.
+- An account's requests start on its own exit (`yt_account.home_exit`), never a random one, and with every account resting a job's download waits (`wait_for_awake`, `YT_ACCOUNT_REST_WAIT`) instead of asking a resting one; a download inside the API never waits.
+- A probe's extraction is kept until its media links expire and the download starts from it (`source_cache.info_put`, `main._stored_extraction`): only through the same exit (`route_key`, never the proxy URL on disk) and client list, never the per-GB proxy, and a failed one falls back to the usual attempts.
+- A ranged fetch (source far longer than the paid minutes) is never resumed (`-reconnect`) and always runs under `main.RangedFetchGuard` (time and speed limit, ffmpeg interrupted, the part kept and billed as such): one that crawls holds a slot here and the worker waiting for its source.
+- A YouTube video is fetched once per `SOURCE_CACHE_HOURS` (`source_cache.py`: source, transcript and probe by video id). Only whole sources over a free route go in (never ranged, never the per-GB proxy's 720p); a new dot entry of `output/` that holds data stays out of `app._output_jobs_size`.
+- `DOWNLOAD_SKIP_STATICS` only when the probe saw every static bot-checked. `PAID_PROXY_DAILY_MB` is the hard daily ceiling. Never keep `PROXY_URL` in a local `.env`.
 
-### Hook grounding for on-screen clips (`hook_grounding.py`)
+**Agent access**
+- MCP stdio: swap `sys.stdout` for stderr **before importing `app`**, and enter the app lifespan.
+- Webhook URLs go through `security_utils.assert_public_url` at submit AND at delivery.
+- API-key auth can never manage keys, consent to OAuth, touch billing or delete the account (`get_session_user_required`). OAuth tokens are ordinary `osk_` keys that carry their scope (`cloud/scopes.py`): a new MCP tool endpoint joins `_MCP_ROUTES`.
+- Cloud `/videos` and `/thumbnails` answer only to a signature, the owner's media token or the owner's credentials (`app._authorize_media`). A `/videos` request is sent to storage (`cloud/media_redirect.py`) only for the owner's own browser and only for a file a `user_videos` row names: never a free job's clean twin, never in exchange for a signed link alone; an edit that rewrites a file calls `hold` before and `forget` after its archive. Any media URL handed outside the dashboard (MCP, webhook, API) goes through `_signed_media_url` / `media_auth.sign_absolute_url`; a new job-like directory writes `.owner`.
+- The Google callback redirects with a single-use code bound to the dashboard's `cc` challenge, never the session JWT (`/api/auth/exchange`).
+- yt-dlp and server-side scrapes run inside `ssrf_guard.guarded()`: redirects and DNS answers are checked at connect time, not only the submitted URL.
 
-The hook and title come from the detail pass, which only reads the
-transcript, so on a clip whose meaning is on the screen (a settings dialog,
-a spreadsheet) they summarise the video's topic instead of naming what is
-shown. After the render, if the `<clip>.layout.json` sidecar says at least
-25% of the clip is `screencast` / `wide` / `inset` (plus `general` when the
-layout picker called the video a screencast: a face-less scene there is a
-slide or a dialog, not a group shot), three frames from those
-stretches at 1024px plus the clip's own words go to Gemini
-(`GroundedHook`) and `viral_hook_text` / `video_title_for_youtube_short`
-are rewritten in place before `auto_hook_clip` burns them; the originals
-stay under `hook_grounding.before`. Gemini-only (frames): with just a local
-LLM it logs one line and keeps the transcript hook. `HOOK_GROUNDING=0`
-disables it. The detail prompt itself now carries the rule "about this
-moment, not the video", which is the cheap half of the same fix.
+**Billing, account, privacy**
+- GDPR erasure order is fixed: Stripe cancel (abort on failure) → R2 purge → one DB transaction over `USER_OWNED_TABLES`. Never via API key. Every new table referencing `users.id` joins `USER_OWNED_TABLES` (a test enforces it).
+- A paid job's source goes to R2 only under `users/<uid>/<job>/source/` with a random name (`cloud/source_archive.py`): never restored with the project, deleted after `SOURCE_ARCHIVE_DAYS` by the daily sweep, and read back only through `_archived_source` / `_locate_or_fetch_source` after the owner check. A change to its retention changes `docs/compliance/retencion.md` and the privacy policy in the same commit.
+- Coupon ids and promotion codes live only in env / Stripe, never in this repo.
+- Cancel and churn alerts carry the reason and rating, never the user's free text. Deletion reasons are a closed list.
+- `reserve_process_minutes` never reserves more than the balance, whatever the client asks; the source cut travels in the resume manifest.
+- Posting to socials is part of the paid plans, and so is connecting them: `/api/social/connect` answers a free account with a 402 `connect_requires_plan` (`social_profiles.require_paid_plan_to_connect`; bought minutes count as paid), and a free account that connected before that gets `FREE_SOCIAL_POSTS` posts in total (`app._claim_free_post`, ledger rows that survive restarts), then a 402 `post_requires_plan`. Both open the plans modal. Every endpoint that posts through the managed Upload-Post account claims a post, and every one that opens its connect page checks the plan.
+- Lifecycle/commercial emails go through `emails.send_commercial_email` (opt-out + unsubscribe headers), once per account per kind.
+- The support-ops API (`cloud/support_ops.py`, `/api/support-ops/v1`) is 404 unless its keys are set, never emails the customer, never calls Stripe and writes only the account in the path; every write is a dry run unless `dry_run: false` + ticket, and returns a `before` that `restore` can write back. A banned account (`users.ban_reason`) authenticates as nobody.
 
-### The quota wall offers the first N minutes (`app.partial_offer`)
-
-The wall (`TopUpModal`, context `wall`) opens on a 402 from `/api/process`.
-Measured on 16-sep-2026, 93 of 99 walls were shown to accounts with their
-20 free minutes **untouched** that had pasted a 21-90 min video: the user was
-asked for $12 before seeing one clip, and 41 of the 68 subscriptions Stripe
-created in 30 days expired unpaid, none of them a card decline. So the 402
-now carries `partial_minutes` (the floored balance, when it is at least
-`PARTIAL_MIN_MINUTES` and shorter than the source), the wall shows "clip the
-first N min" next to the plans, and the dashboard resubmits the same job with
-`max_minutes=N`. `reserve_process_minutes` then reserves N (never more than
-the balance, whatever the client asks) and sets `MAX_SOURCE_MINUTES` for
-`main.py`, whose `cap_source_duration` cuts the downloaded/uploaded file **in
-place** before anything reads it, so transcription, the layout picker, the
-editor and `/api/source` all see a short video. The cut travels in the
-resume manifest: a resumed job downloads the source again and would
-otherwise process 45 minutes on a 20-minute reservation. `/api/status` and
-the process response carry `partial`, and the results view says which part
-of the video the clips came from, with the upsell for the rest.
-
-### Silent footage: the vision fallback (`main.get_visual_clips`)
-
-The moment picker reads the transcript, so a video with nothing said in it
-would score nothing. `main.py` switches paths by itself instead, and the
-switch is the part worth knowing because it is not only "no audio track":
-`transcribe_video` raising `NoAudioError`, **and** `speech_is_sparse()`
-coming back true, both set `transcript = None` and route to
-`get_visual_clips`. Sparse means under `MIN_SPEECH_WORDS` (8) in total or
-under `MIN_SPEECH_WORDS_PER_MIN` (5). Music-only footage and a session
-recorded with the mic muted transcribe to a handful of stray words, which
-is worse than silence: without that second test the picker scores those
-words and cuts around them.
-
-The vision pass uploads the video, Gemini watches it and returns the same
-`{"shorts"}` shape (`gemini_worker.VisualResponse`) in the same 15-60s
-band, so every stage after it is byte-identical: layouts, inset detection,
-hooks. `CLIP_TARGET_MIN`/`MAX` apply directly here rather than being
-derived from scoring windows, because there are none. The transcript is
-stored as `{"language": "none", "segments": []}`, so the clips come out
-with no subtitles, which is correct and not a bug.
-
-**This is the one stage that sends Gemini the video instead of frames, and
-that is deliberate** — 12 frames can say what kind of video this is (which
-is all the layout picker needs), they cannot say which 40 seconds to cut.
-The cost is the ceiling: Gemini bills video at ~300 tokens/second, so an
-hour is ~1.08M tokens, past a 1M window, and **nothing guards the length**.
-A silent multi-hour source fails at the model rather than politely. If that
-needs fixing, the answer is a guard or segmenting the source, not porting
-the frame trick over from the layout picker. Gemini-only either way: a
-text-only `LLM_BASE_URL` server cannot see footage, and with no
-`GEMINI_API_KEY` the function logs one line and returns None, which fails
-the job outright.
-
-The public `/gta-5-clips` page states these thresholds and this ceiling to
-users; if the behaviour changes, change `dashboard/seo/pages.js` too.
-
-### Local LLM for the moment picker (`llm_backend.py`)
-
-`LLM_BASE_URL` (+ `LLM_MODEL`, `LLM_API_KEY`) routes the two transcript
-passes of `get_viral_clips` to any OpenAI-compatible `/chat/completions`
-instead of Gemini; the response is validated with the same pydantic schemas
-Gemini enforces server-side, so `main.py` sees one shape. `main.score_batch_size`
-drops to 3 windows per call there (local contexts are 4-8k; a truncated
-prompt scores garbage silently). Self-host `/api/process` then accepts a
-request without `X-Gemini-Key` and `/api/config.localLlm` tells the dashboard
-not to demand one. Frame-based stages (`layout_picker`, `screencast_layout`,
-`get_visual_clips`) stay on Gemini and degrade as they always did without a
-key. Never wired in cloud mode: `BILLING_ENABLED` ignores it.
-
-### Thumbnail Studio (`thumbnail.py`, `/api/thumbnail/*`)
-
-Titles come from the transcript plus 10 frames at 1024px, never the whole
-video (same reasoning as the layout picker: an hour of video is ~1M tokens for
-a text task). Two calls: a 25-title brainstorm across fixed styles, then a
-critic that scores, dedupes by angle and returns 10, each paired with a 1-4
-word `thumbnail_text` that complements the title rather than repeating it.
-Rules baked in: payoff inside 50 characters (phones cut there), keyword in the
-first 3 words, same language as the transcript. Text model is
-`GEMINI_MODEL_THUMBNAIL` (default `gemini-3.7-flash`), deliberately not
-`GEMINI_MODEL`: flash-lite is fine for a closed-choice layout pick and visibly
-worse at creative titles. Image model is `GEMINI_IMAGE_MODEL` (default
-`gemini-3.1-flash-image`).
-
-Thumbnails are `count` **different concepts**, not one prompt repeated: a text
-call designs each (hook text, side for the text, palette, scene prompt), then
-one image call per concept in parallel. By default (`burn_text=true`) the
-image model is told to leave that side as negative space and PIL sets the text
-in Anton with a black stroke, so accents and spelling are never wrong; the
-`AI painted` toggle lets the model render the text itself. Every output is
-cover-cropped to 1280x720 and saved under YouTube's 2 MB limit.
-`GET /api/thumbnail/frames/{session}` scores sampled frames by face area and
-sharpness (MediaPipe + Laplacian), keeps them spread across the runtime, and
-the dashboard offers them as the person reference so the thumbnail shows the
-creator instead of a stranger; an uploaded face photo still wins.
-
-### Video Reframing Modes
-
-**A source already shot vertical is passed through untouched.**
-`reframe_v2.source_already_fits()` gates it: every layout below reorganises the
-frame to buy back width the crop threw away, and on a 9:16 upload there is none
-to buy. GENERAL was the visible failure — its 0.42 height ratio, which buys
-presence on a landscape source by overflowing the sides, scaled a 1080x1920
-source down to a 453px sliver floating over a blurred copy of itself, and the
-scene classifier routes every face-less shot (a slide, a screen recording) there.
-So the picker is skipped (one Gemini call saved per upload), the classifier is
-skipped, and every scene renders TRACK, whose crop is the whole frame.
-`general_filtergraph` additionally floors the foreground at the height where the
-source fills the output width, so the editor's explicit GENERAL override on a
-portrait clip cannot reproduce the shrink either.
-
-- **TRACK Mode** (single subject): MediaPipe face detection + YOLOv8 fallback with "Heavy Tripod" stabilization
-- **GENERAL Mode** (groups/landscapes): Blurred background layout preserving full width
-- **SPLIT Mode** (two-shot conversation, `split_layout.py`): both speakers stacked
-  in half-frames. Off by default (`SPLIT_LAYOUT=1`); v2 engine only, so a
-  fallback to the v1 loop silently renders GENERAL instead. It upgrades scenes
-  the classifier already sent to GENERAL, never TRACK ones, and needs both faces
-  visible **in the same frame** for at least half the sampled frames — that is
-  what separates a real two-shot from a plano/contraplano, where stacking would
-  show the same person twice. `SPLIT_TIGHTNESS` (default 0.8) trades a little
-  upscale for keeping the other speaker out of each half. Captions on a SPLIT
-  stretch sit on the seam between the halves (`{\an5}` per word event in
-  `subtitles.generate_ass`), the one place they cover nobody; the render
-  records which stretches are stacked in a `<clip>.layout.json` sidecar
-  (`layout_ranges.py`) and every metadata writer copies it into the clip's
-  `layout_ranges`, so `/api/subtitle` finds it after a restyle too. The fast
-  rerender (cut without reframe) carries the canonical clip's ranges through
-  the new cut (`layout_ranges.remap`, in `recut.perform_recut`). Only the
-  ASS path can do this; SRT burns keep one alignment for the whole file.
-- **SCREENCAST / WIDE Modes** (`screencast_layout.py`, `SCREENCAST_LAYOUT=1`):
-  for scenes whose meaning lives outside the centre. Gemini reports each range's
-  **width_fraction**, and that is the gate — coverage was tried before and did
-  not separate a spreadsheet from a corner ticker, while width does (a bug spans
-  ~15% and survives any crop, a spreadsheet spans ~100% and cannot). Content
-  narrower than 0.5 moves nothing. Between 0.5 and 0.85 there is room beside the
-  content, so SCREENCAST stacks it over the presenter. Above 0.85 the presenter
-  is composited **on top of** the content and stacking would show it twice, so
-  those scenes get WIDE: the GENERAL layout with side-cropping disabled.
-- **INSET Mode** (`camera_inset.py`): pantalla a ancho completo arriba, el
-  recuadro de la webcam ampliado abajo. Para el caso de una sola fuente con la
-  cámara compuesta en una esquina (OBS, VOD de stream). Se encadena detrás de
-  la decisión `screencast`, **no** se le pregunta a Gemini: ofrecido como cuarta
-  opción respondió `screencast` en los 5 clips que tienen recuadro, en dos
-  pasadas, y la exactitud global cayó de 92% a 83-85%. El detector geométrico
-  encuentra esos 5 sin falsos positivos. Los tres filtros que hacen falta, cada
-  uno pagado con una iteración: sujeto **pequeño**, **descentrado en
-  horizontal** (una cara de talking head está centrada aunque esté alta), y
-  **quieto entre muestras** (3-11px frente a 316px de una persona real).
-- **ALTERNATE Mode** (`active_speaker.py`, `SPEAKER_SIGNAL=1` + `SPEAKER_CUT=1`):
-  hard cuts to whoever is talking, rendered through the TRACK path as a
-  trajectory with jumps. `SPEAKER_SIGNAL=1` alone just gates SPLIT on both people
-  actually speaking. Mouth activity **must** be normalised per speaker before
-  comparing (`normalise_activity`): raw frame-difference magnitude scales with
-  local contrast and lighting, and on a real two-shot it handed one speaker
-  90-100% of the scene.
-- **Punch-in** (`punch_in.py`, `PUNCH_IN=1`): not a layout. A ~12% push on the
-  clip's beats, riding the TRACK path by widening its per-frame crop command
-  from x-only to w/h/x/y. Beats currently come from the audio envelope;
-  `emphasis_times` is a plain list of seconds so the transcript's hook words can
-  replace it without touching the module.
-
-### Key Classes
-- `SmoothedCameraman` - Stabilized camera movement with safe zone logic (prevents jitter)
-- `SpeakerTracker` - Prevents rapid speaker switching, handles temporary occlusions
-
-### API Endpoints
-| Method | Route | Purpose |
-|--------|-------|---------|
-| POST | `/api/process` | Submit video for processing |
-| GET | `/api/status/{job_id}` | Poll job status and logs |
-| POST | `/api/edit` | Apply AI video effects |
-| POST | `/api/subtitle` | Generate and apply subtitles (auto-transcribes dubbed videos) |
-| POST | `/api/hook` | Add text hook overlays |
-| POST | `/api/translate` | AI voice dubbing via ElevenLabs |
-| GET | `/api/translate/languages` | List supported dubbing languages |
-| POST | `/api/social/post` | Post to social media (async upload) |
-| POST | `/mcp` | MCP server (JSON-RPC): the pipeline as agent tools |
-| POST/GET/DELETE | `/api/keys` | User API keys (cloud mode, session JWT only) |
-| DELETE | `/api/account` | Erase the account and everything in it (GDPR art. 17) |
-
-### Agent access (MCP, API keys, webhooks)
-
-- **API keys** (`cloud/api_keys.py`): `osk_...` tokens, sha256-stored, created in
-  the dashboard account page. `cloud/auth.get_current_user_optional` accepts
-  them (`Bearer osk_...` or `X-API-Key`) and resolves the owner, so metering,
-  entitlement, plan priority and job ownership apply to agents with zero
-  endpoint changes. Key management itself refuses API-key auth: a leaked key
-  cannot mint replacements.
-- **MCP server** (`mcp_server.py`, mounted always): stateless Streamable-HTTP
-  JSON-RPC at `/mcp` — no SDK dependency, ~3 methods + 8 tools. Each tool calls
-  back into this same app in-process (`httpx.ASGITransport`) forwarding the
-  caller's auth headers, so it can never drift from the REST behavior. Cloud
-  mode 401s without a resolvable user; self-host stays BYOK-open.
-- **stdio transport** (`mcp_stdio.py`): the same `handle_message` / `call_tool`
-  as a subprocess, for hosts that only launch MCP servers as a command (Glama's
-  Dockerfile deployments wrap one; a local client can skip the web server).
-  Two invariants: `sys.stdout` is swapped for stderr **before `app` is
-  imported**, because the pipeline prints everywhere and one stray line
-  corrupts the JSON-RPC stream; and the app's lifespan is entered
-  (`router.lifespan_context`), which `ASGITransport` does not do on its own.
-- **OAuth for MCP clients** (`cloud/mcp_oauth.py`, cloud mode only): claude.ai
-  and ChatGPT connect by URL, so the server publishes RFC 9728/8414 metadata
-  under `/.well-known/`, accepts dynamic client registration (`POST
-  /oauth/register`, public clients, PKCE S256 mandatory) and bounces
-  `GET /oauth/authorize` to the dashboard consent screen (`#/oauth/authorize`),
-  because the session JWT lives in localStorage on the frontend host and a
-  bare API GET cannot see it. `POST /api/oauth/authorize` (session auth) mints
-  the code; `POST /oauth/token` redeems it by **minting an ordinary `osk_`
-  key** named after the client and returning it as the access token. No new
-  auth path, no refresh tokens: the key shows up in Account → API keys and
-  revoking it disconnects the app. The `/mcp` 401 carries
-  `WWW-Authenticate: Bearer resource_metadata=...` so clients find the flow.
-  `oauth_codes` is in `USER_OWNED_TABLES`; `oauth_clients` deliberately not.
-- **Webhooks**: `POST /api/process` takes `webhook_url` + optional
-  `webhook_secret` (HMAC-SHA256, `X-OpenShorts-Signature`). Validated with
-  `security_utils.assert_public_url` at submit AND at delivery (DNS rebinding).
-  Fired once per job from `run_job_wrapper` after the R2 archive so the payload
-  can carry durable download links; survives redeploys via the resume manifest.
-  `PUBLIC_API_URL` env sets the absolute-URL base when behind a proxy.
-
-### Account erasure (GDPR art. 17)
-
-`DELETE /api/account` (`cloud/account.py`, dashboard: Account → Delete account)
-is immediate and irreversible: there is no recovery window because after the
-delete there is nothing left to authenticate a recovery request against. It
-refuses API-key auth (a leaked `osk_` must not destroy its own account) and
-requires the caller to retype the account email.
-
-The order of the steps is the design, and each one is a failure mode:
-**Stripe cancel first**, aborting the whole thing if it fails, so we never erase
-a user we are still billing; **R2 before the database**, because those rows are
-the only index of which objects are theirs and dropping them first turns a
-failed purge into permanent orphans; the DB delete is **one transaction** over
-an explicit table list (`USER_OWNED_TABLES`) rather than the declared ON DELETE
-CASCADEs, since `create_all` never ALTERs an existing table and a constraint
-added after a table shipped exists in the models but not in production.
-`tests/test_account_erasure.py` fails if a new table references `users.id`
-without joining that list.
-
-`app.py` registers a callback for the local working files, which record
-ownership three different ways: the `.owner` file clip jobs write (so jobs
-recovered from disk after a restart count too), `saas_jobs`, and
-`thumbnail_sessions`. That last one is the only thing that ever deletes
-generated thumbnails: the hourly sweep skips their directory and they are
-served publicly at `/thumbnails/`.
-
-What deliberately survives: the Stripe customer and its invoices (6-year
-retention, Spanish commercial law) and one `account_deletions` row holding a
-sha256 of the email as proof the erasure happened, itself purged after 5 years.
-The "why are you leaving" answer is a closed list (`DELETION_REASONS`), never
-free text — anything the user could type would land in a row designed to
-outlive them. Deleting users also made one webhook path reachable that never
-was before: `_apply_topup` reads the user id from Stripe metadata, so it now
-confirms the row still exists before inserting, or the FK violation makes
-Stripe retry the same doomed event for three days.
-
-### Concurrency Model
-Async job queue with semaphore-based concurrency control. Configure via `MAX_CONCURRENT_JOBS` env var (default: 5). Jobs auto-cleanup after 1 hour.
-
-The real limit on the GPU box is VRAM, not CPU: each `main.py` job holds
-Parakeet (onnxruntime CUDA), TransNetV2 (torch, ~2 GB at peak) and an
-NVENC session, and when the card is full a cut fails as "Generic error in
-an external library" / exit 187 with 0 bytes, TransNetV2 as CUDA OOM, and
-the reframe writer as a broken pipe. The retry in `ffmpeg_utils.cut_clip`
-waits for a **busy** GPU; it cannot help with a **full** one. The API
-process itself was the biggest tenant (7.7 GB idle on 17-sep-2026): the
-thumbnail studio and `/api/subtitle` on a dubbed clip transcribe
-in-process and the ASR singletons then lived in uvicorn for good, so both
-now call `transcribe_backends.release_models()` when they are done. Size
-`MAX_CONCURRENT_JOBS` against the free VRAM, not the core count.
-
-### Paid proxy accounting (`cloud/proxy_ledger.py`)
-
-Downloads go direct → static ISP proxies (flat rate) → DataImpulse (per GB),
-and the duration probe (`cloud/metering.probe_url_minutes`) follows the same
-order, with one extra free step before any per-GB attempt: the fallback
-clients through a static (`fallback-static`). **The client list is explicit
-and shared** (`yt_clients.py`: `default,mweb` + the bgutil PO token
-provider): with account cookies yt-dlp's own defaults are `tv_downgraded` +
-`web`, and on a share of videos both come back UNPLAYABLE / SABR-only, which
-yt-dlp reports as "Video unavailable". That was mistaken for an IP ban for a
-week (it happened on every static IP too) and fed ~26 downloads a week to
-the per-GB proxy, which then fetched 360p through the same dead list.
-Measured in the prod container on 6-sep-2026, same static, same video:
-cookies + defaults → unavailable; cookies + `default,mweb` → 1080p; no
-cookies → 1080p. `mweb` needs the PO token, and the token needs the
-webpage: never put `player_skip: webpage` back. A fallback attempt runs
-anonymously when an HD attempt already failed with the cookies on that
-route, and every attempt asks for the 1080p format spec (the old
-`best[ext=mp4]` fallback spec was itself the 360p progressive file).
-Two rules keep the per-GB proxy at zero on a normal day: the probe
-reaches it **only** when a static route failed for a reason another IP can
-fix (`static_failure_warrants_paid`: bot-check, 403/429, proxy/network
-errors), never for a private/removed/members-only video, an uploader's
-country block (the residential pool failed identically in 5 of 6 paid
-probes, 3-5 sep) or a live stream
-with no duration (those failed the same on every IP and used to cost ~1.7 MB
-× 2 extractors each), and **never for a non-YouTube URL** (the download
-plan already excluded those; Twitch, Kick, Rumble and product pages were
-reaching it through the probe). The probe also carries `YOUTUBE_COOKIES`,
-like the download does: an anonymous probe from the static IPs gets "Sign in
-to confirm you're not a bot" in bursts (4-sep-2026: ~10 probes in one hour,
-1.8 MB each on the per-GB proxy) because a datacenter IP's anonymous rate
-limit is low and we make ~400 YouTube hits a day from three of them, while
-the authenticated download sails through the same IPs. But the **first**
-attempt on a route carries them and the second drops them, on the probe as
-on the download: with the cookies attached YouTube answers UNPLAYABLE for
-every client (`web_embedded`, `tv_downgraded`, `web` **and** `mweb`) on a
-share of videos, which yt-dlp reports as "Video unavailable" (9-sep-2026,
-same video on all three statics; anonymous on the same IP → 1080p 137+140).
-Without that anonymous second attempt the probe read a cookie problem as an
-IP problem and escalated to the per-GB proxy, which carries the same cookies
-and fails identically, while the download recovered for free on the same
-static. `main.py` prints `PROXY_ROUTE=<json>` after
-every download (winner, paid bytes across all attempts including failed
-paid ones, each free attempt's error); `app.py` persists it as a
-`proxy_usage` row at job end and pages Telegram when the paid proxy carried
-bytes, folding a burst into one message per 5 min. The in-memory monthly
-counter and the container log (rotates within the hour) cannot answer "what
-cost $14 on the 28th"; the table can. Both the probe and the download pass `noplaylist`: a
-`watch?v=X&list=...` or mix link is the one video the user was watching,
-and without it yt-dlp walks the whole list, dies on its first private /
-age-gated / bot-checked entry (a video nobody pasted), the probe reads
-that as an IP problem and pays the proxy to walk the same list again, and
-the user gets a 400 for a valid link (26 of the 37 paid probes between
-7 and 17-sep-2026). And the probe keeps **every** attempt's error per
-static route, not the last one: the anonymous retry ends in a bot-check
-by design, and a "confirm your age" from the cookie attempt is the
-verdict, so it must not be overwritten into an escalation. A search,
-playlist or channel URL is refused by path before any request
-(`yt_clients.youtube_non_video_reason`): `noplaylist` does nothing for
-those and yt-dlp walks them entry by entry (one search URL held the
-probe thread for 37 min in the prod container).
-`PAID_PROXY_DAILY_MB` (default
-500) is the hard ceiling: past it the paid proxy is dropped from the probe
-and from every new job's env until UTC midnight. The watcher probes the
-static pool against a real YouTube watch page (playable markers), not
-google.com — the 28th happened because YouTube refused the static IPs while
-google kept answering 204. On the dev Mac, do not keep
-`PROXY_URL` in `.env`: every local `main.py` run then bills DataImpulse.
-
-### Deploys and running jobs (handover + drain)
-
-Every push to `main` redeploys the API container. Coolify starts the NEW
-container before stopping the old one (rolling update) and both share
-`output/`, so `app.py` coordinates them instead of relying on a fast swap:
-
-- Each instance writes its id to `output/.instance` at startup. An instance
-  that sees another id there is the old one and **drains**: it finishes the
-  jobs it is running, starts none, and leaves queued manifests on disk.
-- A running job heartbeats its `.resume.json` every 10 s. The resume scan
-  (startup + every 30 s) re-enqueues only manifests nobody heartbeated for
-  60 s, so no job runs twice and none is lost. Max 2 resume attempts.
-- SIGTERM (`docker stop`) drains too, up to `DRAIN_TIMEOUT_SECONDS` (840),
-  then hands the signal to uvicorn. The app's Coolify stop grace period is
-  900 s (`application_settings.stop_grace_period`); keep the timeout below it.
-  After the drain hands the signal to uvicorn, `--timeout-graceful-shutdown 15`
-  (Dockerfile) caps the wait for in-flight connections: uvicorn's default is
-  unbounded, and one open range download kept a drained container alive for
-  the full grace period while Traefik still routed half the traffic to its
-  closed port.
-- `/health/ready` + the Dockerfile `HEALTHCHECK` are what keep Traefik off a
-  dying container: its docker provider only routes to `healthy` containers,
-  so an instance answers 503 from the moment it gets SIGTERM (out of rotation
-  within ~10 s, socket still open) and a booting one gets no traffic until it
-  answers. Only SIGTERM flips it, not the marker drain: at that point the new
-  container is still booting and nobody else would be routable. The Coolify
-  app has its health check enabled on that path so it waits for the new
-  container to be `healthy` before stopping the old one. With that option on,
-  Coolify replaces the Dockerfile HEALTHCHECK with its own curl/wget command
-  AND its own interval/retries (5 s × 3), so the image must ship `curl` or
-  every deploy rolls back as unhealthy, and a stopping container takes 15 s
-  to turn `unhealthy`. That is why the drain keeps serving for
-  `PROXY_DRAIN_SECONDS` (20) after the jobs are done before it hands the
-  signal to uvicorn: closing the socket earlier is 502s until Traefik
-  notices (measured ~60 s per deploy with retries=12 and no grace). And
-  `HARD_EXIT_SECONDS` (30) after that the process is ended outright: uvicorn
-  finishing does not end the interpreter while an executor thread hangs in
-  a network probe, and that kept a drained container alive for the full 900 s.
-  `/health` stays a plain liveness probe for the external watcher.
-- `/api/status` answers from disk for a job this instance never held, so a
-  poll landing on either container during the handover is fine.
-- `main.py` leaves `.transcript_checkpoint.json` in the job dir so a job that
-  does get re-run skips the paid transcription (download and Gemini repeat).
-
-Before pushing, still batch small commits (tests, docs) with the next real
-change: every deploy is a ~5 min build plus a handover.
+**Public repo**
+- This repository is public: no hosts, IPs, server paths, production metrics, business figures or customer data in code, comments, docs or commit messages.
+- The free slow lane's countries (`FREE_SLOW_LANE_COUNTRIES`) live only in the deployment env: tests and docs use user-assigned codes (`XA`, `XB`), and no user-facing text names a country or region (`cloud/queue_mode.py`).
 
 ## CI: a green pipeline closes the task, not the push
-- After every `git push`, wait for the commit's workflow and confirm it is green: `ci-wait` (Victor's Mac) or `gh run watch $(gh run list -c $(git rev-parse HEAD) -L1 --json databaseId -q ".[0].databaseId") --exit-status`.
+
+- Before pushing, run locally what CI runs: `pytest tests/ -v` and `npm run build` (+ `npm run lint`) in `dashboard/`.
+- After every `git push`, wait for the commit's workflow and confirm it is green: `ci-wait` if available, or `gh run watch $(gh run list -c $(git rev-parse HEAD) -L1 --json databaseId -q ".[0].databaseId") --exit-status`.
 - If it is red: fix, push, check again. Never report the task as done with a red CI.
-- Before pushing, run locally what the CI runs (lint + tests of this repo).
+- Every push to `main` redeploys the API; the dashboard app redeploys only when the push changes `dashboard/`. Batch small commits (tests, docs) with the next real change when possible.

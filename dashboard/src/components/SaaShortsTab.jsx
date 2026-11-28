@@ -1,7 +1,8 @@
 import { useState, useEffect } from 'react';
 import { Globe, Sparkles, Download, Copy, Check, ChevronRight, ChevronLeft, Loader2, AlertCircle, Volume2, User, Film, Terminal, ChevronDown, RefreshCw, Share2, Calendar, Upload } from 'lucide-react';
 import { getApiUrl } from '../config';
-import { apiFetch } from '../lib/api';
+import { apiFetch, QuotaError, openQuotaWall } from '../lib/api';
+import { SOCIAL_PLATFORMS, defaultPlatformFlags, flagsFromList } from '../lib/socialPlatforms';
 import StepIndicator from './ui/StepIndicator';
 import SegmentedControl from './ui/SegmentedControl';
 import StarBanner from './StarBanner';
@@ -92,7 +93,7 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
   // Publish
   const [publishing, setPublishing] = useState(false);
   const [publishResult, setPublishResult] = useState(null);
-  const [publishPlatforms, setPublishPlatforms] = useState({ tiktok: true, instagram: true, youtube: true });
+  const [publishPlatforms, setPublishPlatforms] = useState(defaultPlatformFlags);
   const [isScheduling, setIsScheduling] = useState(false);
   const [scheduleDate, setScheduleDate] = useState('');
 
@@ -113,7 +114,7 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
   // Fetch actor gallery on mount
   useEffect(() => {
     setLoadingGallery(true);
-    fetch(getApiUrl('/api/saasshorts/actor-gallery'))
+    apiFetch('/api/saasshorts/actor-gallery')
       .then(res => res.ok ? res.json() : { images: [] })
       .then(data => setActorGallery(data.images || []))
       .catch(() => {})
@@ -400,7 +401,7 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
         {/* Header */}
         <div className="flex items-end justify-between mb-2">
           <div>
-            <p className="eyebrow mb-2">02 · AI SHORTS</p>
+            <p className="eyebrow mb-2">03 · AI SHORTS</p>
             <h1 className="font-display lowercase text-2xl text-ink">AI Shorts</h1>
           </div>
           {step > 0 && (
@@ -1028,7 +1029,7 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
                         const data = await res.json();
                         setActorOptions(data.images || []);
                         // Refresh gallery to include newly uploaded actors
-                        const galRes = await fetch(getApiUrl('/api/saasshorts/actor-gallery'));
+                        const galRes = await apiFetch('/api/saasshorts/actor-gallery');
                         if (galRes.ok) {
                           const galData = await galRes.json();
                           setActorGallery(galData.images || []);
@@ -1387,17 +1388,9 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
                         <SegmentedControl
                           multi
                           size="sm"
-                          options={[
-                            { value: 'tiktok', label: 'TikTok' },
-                            { value: 'instagram', label: 'Instagram' },
-                            { value: 'youtube', label: 'YouTube' },
-                          ]}
+                          options={SOCIAL_PLATFORMS.map(({ value, label }) => ({ value, label }))}
                           value={Object.keys(publishPlatforms).filter((k) => publishPlatforms[k])}
-                          onChange={(arr) => setPublishPlatforms({
-                            tiktok: arr.includes('tiktok'),
-                            instagram: arr.includes('instagram'),
-                            youtube: arr.includes('youtube'),
-                          })}
+                          onChange={(arr) => setPublishPlatforms(flagsFromList(arr))}
                         />
 
                         {/* Same notice as ResultCard: TikTok lands as a draft,
@@ -1464,6 +1457,7 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
                               }
                               setPublishResult({ ok: true, msg: isScheduling ? 'Scheduled!' : 'Published!' });
                             } catch (e) {
+                              if (e instanceof QuotaError) { openQuotaWall(e, 'saasshorts_post'); return; }
                               setPublishResult({ ok: false, msg: e.message });
                             } finally {
                               setPublishing(false);

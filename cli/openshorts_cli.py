@@ -73,7 +73,8 @@ def _print_clips(result):
     for i, clip in enumerate(clips):
         title = clip.get("title") or clip.get("video_title_for_youtube_short") or f"clip {i}"
         print(f"[{i}] {title}")
-        print(f"    {_absolutize(clip.get('video_url') or '')}")
+        # Cloud: download_url is signed and opens without the API key.
+        print(f"    {clip.get('download_url') or _absolutize(clip.get('video_url') or '')}")
 
 
 def cmd_process(args):
@@ -93,7 +94,7 @@ def cmd_process(args):
     if args.json and not args.wait:
         print(json.dumps(payload))
         return
-    print(f"job queued: {job_id}")
+    print(f"job queued: {job_id}", file=sys.stderr if args.json else sys.stdout)
     if args.wait:
         _watch(job_id, as_json=args.json)
     else:
@@ -108,7 +109,7 @@ def _watch(job_id, as_json=False):
             _die(status, payload)
         logs = payload.get("logs") or []
         for line in logs[seen_logs:]:
-            print(f"  {line}")
+            print(f"  {line}", file=sys.stderr if as_json else sys.stdout)
         seen_logs = len(logs)
         state = payload.get("status")
         if state == "completed":
@@ -220,7 +221,7 @@ def main(argv=None):
     p = sub.add_parser("publish", help="post or schedule one clip to social platforms")
     p.add_argument("job_id")
     p.add_argument("clip_index", type=int)
-    p.add_argument("--platforms", required=True, help="comma list: tiktok,instagram,youtube")
+    p.add_argument("--platforms", required=True, help="comma list: tiktok,instagram,youtube,facebook,linkedin,threads,bluesky")
     p.add_argument("--title")
     p.add_argument("--schedule", help="ISO datetime for scheduled posting")
     p.add_argument("--timezone", help="IANA timezone for --schedule")

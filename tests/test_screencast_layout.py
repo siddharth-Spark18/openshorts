@@ -1,33 +1,31 @@
 import screencast_layout
 from screencast_layout import (
-    content_bands,
+    content_side,
     overlapping_width,
     screencast_filtergraph,
     speaker_crop,
 )
 
 
-class TestContentBands:
-    def test_bands_fill_the_output_exactly(self):
-        content_h, speaker_h = content_bands(1920, 1080, 1080, 1920)
-        assert content_h + speaker_h == 1920
+class TestContentSide:
+    def test_content_is_the_side_away_from_the_presenter(self):
+        # Presenter on the right (body 1200-1700): the chart is on the left,
+        # stopping short of the body.
+        x, w = content_side(1920, 1200, 1700)
+        assert x == 0 and w < 1200
 
-    def test_sixteen_by_nine_content_keeps_its_full_width(self):
-        # 1080 wide at 16:9 is 608 tall. Anything else means the sides were cut,
-        # which is the one thing this layout exists to prevent.
-        content_h, _ = content_bands(1920, 1080, 1080, 1920)
-        assert content_h == 608
+    def test_presenter_on_the_left_leaves_the_right(self):
+        x, w = content_side(1920, 100, 700)
+        assert x > 700 and x + w == 1920
 
-    def test_bands_are_even(self):
-        for src_h in (1080, 1000, 817):
-            content_h, speaker_h = content_bands(1920, src_h, 1080, 1920)
-            assert content_h % 2 == 0 and speaker_h % 2 == 0
+    def test_no_room_beside_the_presenter_means_no_stack(self):
+        # A person filling the middle of the frame: neither side is wide
+        # enough, so the scene stays with the face classifier.
+        assert content_side(1920, 500, 1500) is None
 
-    def test_tall_source_still_leaves_room_for_the_speaker(self):
-        # A portrait source would want more height than the frame has.
-        content_h, speaker_h = content_bands(1080, 1920, 1080, 1920)
-        assert speaker_h >= 2
-        assert content_h + speaker_h == 1920
+    def test_columns_are_even(self):
+        x, w = content_side(1919, 101, 703)
+        assert x % 2 == 0 and w % 2 == 0
 
 
 class TestSpeakerCrop:
@@ -75,32 +73,80 @@ class TestOverlappingWidth:
 
 
 class TestScreencastFiltergraph:
-    def test_content_band_is_scaled_never_cropped(self):
-        graph = screencast_filtergraph(1920, 1080, 1080, 1920, (1748, 832))
-        # [-1]: the first "[ca]" is the split= output label, not the filter.
+    CONTENT = (0, 1100)   # the chart left of a presenter at x~1748
+
+    def test_top_band_is_only_the_content_columns(self):
+        # The whole frame up there showed the presenter twice (17-oct-2026).
+        graph = screencast_filtergraph(1920, 1080, 1080, 1920, (1748, 832),
+                                       self.CONTENT)
         content = graph.split("[ca]")[-1].split("[content]")[0]
-        assert "crop" not in content
-        assert "scale=1080:608" in content
+        assert "crop=w=1100:h=1080:x=0:y=0" in content
 
-    def test_graph_stacks_and_pads_to_the_output(self):
-        graph = screencast_filtergraph(1920, 1080, 1080, 1920, (1748, 832))
-        assert "vstack=inputs=2" in graph
-        assert "pad=1080:1920" in graph
-        assert graph.endswith("[v]")
+    def test_content_fits_without_distortion(self):
+        graph = screencast_filtergraph(1920, 1080, 1080, 1920, (1748, 832),
+                                       self.CONTENT)
+        content = graph.split("[ca]")[-1].split("[content]")[0]
+        sw, sh = map(int, content.split("scale=")[1].split(":"))
+        assert abs(sw / sh - 1100 / 1080) < 0.02
+        assert sh <= 1920 * 0.55
 
-    def test_speaker_band_is_cropped_around_the_face(self):
-        graph = screencast_filtergraph(1920, 1080, 1080, 1920, (1748, 832))
+    def test_speaker_takes_the_rest_of_the_height(self):
+        graph = screencast_filtergraph(1920, 1080, 1080, 1920, (1748, 832),
+                                       self.CONTENT)
+        content = graph.split("[ca]")[-1].split("[content]")[0]
+        sh = int(content.split("scale=")[1].split(":")[1])
         speaker = graph.split("[sa]")[-1].split("[speaker]")[0]
         assert "crop=" in speaker
-        assert "scale=1080:1312" in speaker
+        assert f"scale=1080:{1920 - sh}" in speaker
+        assert f"overlay=x=0:y={sh}" in graph
+        assert graph.endswith("[v]")
 
 
 class TestGating:
     def test_disabled_module_detects_nothing(self, monkeypatch):
         monkeypatch.setattr(screencast_layout, "ENABLED", False)
-        assert screencast_layout.detect_content_ranges("x.mp4", 10) == []
+        assert screencast_layout.detect_content_ranges("x.mp4", [], 30.0) == []
 
     def test_no_ranges_means_no_scenes_touched(self, monkeypatch):
         monkeypatch.setattr(screencast_layout, "ENABLED", True)
         assert screencast_layout.detect_screencast_scenes(
             "x.mp4", [], [], []) == {}
+
+
+class TestFilmedPerson:
+    """A presenter standing at a whiteboard was called "screen" by the shot
+    check (17-oct-2026); a full-height person means a filmed room."""
+
+    class _Cap:
+        def __init__(self, h):
+            self.h = h
+
+        def get(self, prop):
+            return self.h
+
+        def set(self, *_):
+            pass
+
+        def read(self):
+            return True, object()
+
+    class _Main:
+        def __init__(self, box):
+            self.box = box
+
+        def detect_person_yolo(self, frame):
+            return self.box
+
+    def test_full_height_person_is_a_filmed_room(self):
+        # YOLO box of a person standing in a 1080p shot, top 40% kept.
+        m = self._Main([900, 100, 500, int(900 * 0.4)])
+        assert screencast_layout._filmed_person(self._Cap(1080), m, 0, 100)
+
+    def test_webcam_over_a_screen_is_not(self):
+        # Measured: a corner webcam's YOLO box on a 720p walkthrough.
+        m = self._Main([991, 502, 246, 86])
+        assert not screencast_layout._filmed_person(self._Cap(720), m, 0, 100)
+
+    def test_no_person_is_not(self):
+        assert not screencast_layout._filmed_person(
+            self._Cap(1080), self._Main(None), 0, 100)

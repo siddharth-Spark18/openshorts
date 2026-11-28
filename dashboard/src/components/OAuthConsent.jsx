@@ -11,6 +11,15 @@ import LoginModal from './LoginModal';
 // the browser back to the client; the access token it then receives is an
 // ordinary API key, listed (and revocable) in the account page.
 
+// Only ever navigate to a web URL the API built: a javascript: or data: URL
+// here would run in the dashboard's origin, next to the session.
+function goTo(url) {
+  let u;
+  try { u = new URL(url); } catch { throw new Error('bad redirect'); }
+  if (u.protocol !== 'https:' && u.protocol !== 'http:') throw new Error('bad redirect');
+  window.location.replace(u.toString());
+}
+
 function readParams() {
   const hash = window.location.hash || '';
   const q = hash.includes('?') ? hash.slice(hash.indexOf('?') + 1) : '';
@@ -41,10 +50,17 @@ export default function OAuthConsent() {
     setBusy(true);
     try {
       if (!allow) {
-        const u = new URL(params.redirect_uri);
-        u.searchParams.set('error', 'access_denied');
-        if (params.state) u.searchParams.set('state', params.state);
-        window.location.replace(u.toString());
+        // The API checks redirect_uri against the client's registered ones;
+        // this page's own URL is whatever the link it came from said.
+        const d = await apiJson('/api/oauth/deny', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            client_id: params.client_id,
+            redirect_uri: params.redirect_uri,
+            state: params.state || null,
+          }),
+        });
+        goTo(d.redirect);
         return;
       }
       const d = await apiJson('/api/oauth/authorize', {
@@ -59,7 +75,7 @@ export default function OAuthConsent() {
           response_type: params.response_type || 'code',
         }),
       });
-      window.location.replace(d.redirect);
+      goTo(d.redirect);
     } catch (e) {
       setError(e?.detail || 'Could not complete the connection. Try again from the app.');
       setBusy(false);
@@ -67,6 +83,7 @@ export default function OAuthConsent() {
   };
 
   const name = client?.client_name || 'an app';
+  const hosts = client?.redirect_hosts || [];
 
   return (
     <div className="min-h-screen flex items-center justify-center bg-background px-4">
@@ -85,6 +102,12 @@ export default function OAuthConsent() {
               It will use your plan&apos;s minutes and you can disconnect it any time from
               Account → API keys.
             </p>
+            {hosts.length > 0 && (
+              <p className="text-xs text-ink2 mb-4">
+                Access goes to <b className="text-ink break-all">{hosts.join(', ')}</b>.
+                Only allow it if that is the app you started from.
+              </p>
+            )}
             <ul className="text-left text-xs text-ink2 space-y-1.5 mb-6">
               <li className="flex gap-2"><ShieldCheck size={14} className="text-ok shrink-0 mt-0.5" /> Process videos and read the resulting clips</li>
               <li className="flex gap-2"><ShieldCheck size={14} className="text-ok shrink-0 mt-0.5" /> Add subtitles, recut and publish clips you own</li>

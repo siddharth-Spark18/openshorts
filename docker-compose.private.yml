@@ -4,7 +4,7 @@ services:
     build:
       context: .
       args:
-        CPU_ONLY: "1"
+        GPU: "0"
     restart: unless-stopped
     environment:
       OWNER_PASSWORD: ${OWNER_PASSWORD:?Set OWNER_PASSWORD for the private workspace}

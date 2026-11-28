@@ -42,7 +42,7 @@ class TestResolvePostProfileInCloud:
         # The whole point: no server profile must NOT mean "use theirs".
         with pytest.raises(HTTPException) as exc:
             app_module.resolve_post_profile(None, OTHER_TENANT)
-        assert exc.value.status_code == 503
+        assert exc.value.status_code == 409  # "connect a social account first"
 
     @pytest.mark.parametrize("empty", [None, ""])
     def test_empty_server_profile_is_also_refused(self, empty):
@@ -86,3 +86,28 @@ class TestScheduledPostsAreFilteredByProfile:
 
         assert [r["job_id"] for r in rows] == ["mine-1", "mine-2"]
         assert all(r.get("profile_username") == "os_mine" for r in rows)
+
+
+class TestImpressionsWithoutAProfile:
+    """The profile is only created on "connect socials", so most cloud users
+    have none: the account page's views card must get an empty answer, not a
+    409, and the vendor must not be called."""
+
+    def test_returns_the_empty_card(self, monkeypatch):
+        monkeypatch.setattr(app_module, "BILLING_ENABLED", True)
+
+        async def no_profile(request, body_key=None):
+            return "managed-key", None
+
+        async def vendor_must_not_be_called(*args, **kwargs):
+            raise AssertionError("vendor called without a profile")
+
+        monkeypatch.setattr(app_module, "resolve_upload_post", no_profile)
+        monkeypatch.setattr(app_module, "_upload_post_get", vendor_must_not_be_called)
+        body = asyncio.run(app_module.social_total_impressions(
+            request=None, period="last_month", start_date=None, end_date=None,
+            platform=None, breakdown=None, user=OTHER_TENANT))
+
+        assert body["profile_username"] is None
+        assert not body["posts_count"]
+        assert body["refreshing"] is False

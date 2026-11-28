@@ -22,6 +22,8 @@ from yt_clients import NotASingleVideo, youtube_non_video_reason
     "https://www.youtube.com/shorts/abc123",
     "https://www.youtube.com/live/abc123",
     "https://www.youtube.com/embed/abc123",
+    "https://www.youtube.com/clip/UgkxAbc",
+    "https://music.youtube.com/watch?v=abc",
     "https://vimeo.com/12345",
     "https://cdn.example.com/video.mp4",
 ])
@@ -41,6 +43,12 @@ def test_single_videos_and_foreign_hosts_pass(url):
     ("https://www.youtube.com/", "no video"),
     ("https://www.youtube.com/watch", "without a video id"),
     ("https://youtu.be/", "without a video id"),
+    # 20-sep-2026: a browse yt-dlp titled "viralshorts" walked to page 23 on
+    # the static pool and then paid the per-GB proxy to walk it again. The
+    # guard was a list of bad paths; these two are the shapes it let through.
+    ("https://www.youtube.com/hashtag/viralshorts", "hashtag"),
+    ("https://www.youtube.com/viralshorts", "not one video"),
+    ("https://www.youtube.com/shorts", "without a video id"),
 ])
 def test_pages_that_are_not_one_video_are_named(url, word):
     assert word in youtube_non_video_reason(url)

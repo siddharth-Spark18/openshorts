@@ -44,6 +44,33 @@ MEDIA_URL_TTL_SECONDS = int(os.environ.get("MEDIA_URL_TTL_SECONDS", "86400"))
 # session JWT (30 days): it travels in URLs, so it must die quickly.
 MEDIA_TOKEN_TTL_SECONDS = int(os.environ.get("MEDIA_TOKEN_TTL_SECONDS", "43200"))
 
+# The dashboard also gets the per-user token as an HttpOnly cookie on the API
+# host, for the media loads that are plain elements (<video>, <img>, a download
+# link) and so keep working even before the page has fetched its token.
+MEDIA_COOKIE_NAME = "os_media"
+
+# Links handed out before signing existed (webhook payloads, MCP answers, old
+# dashboard tabs) carried bare /videos paths. Jobs created before
+# MEDIA_LEGACY_CUTOFF keep answering those until MEDIA_LEGACY_UNTIL; anything
+# newer, or anything after that date, needs a signature or the owner.
+MEDIA_LEGACY_CUTOFF = os.environ.get("MEDIA_LEGACY_CUTOFF", "2026-10-29T00:00:00+00:00")
+MEDIA_LEGACY_UNTIL = os.environ.get("MEDIA_LEGACY_UNTIL", "2026-11-12T00:00:00+00:00")
+
+
+def parse_instant(value: str) -> Optional[float]:
+    """ISO-8601 to epoch seconds, or None when unset/unparseable."""
+    if not value:
+        return None
+    from datetime import datetime, timezone
+    try:
+        dt = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
+
+
 # Nothing outside this list is a deliverable: the working directories also hold
 # transcripts, metadata JSON, resume manifests and ownership sidecars, and an
 # allowlist is the only version of this rule that stays correct when the
@@ -124,6 +151,17 @@ def sign_media_url(url_path: str, secret: str, ttl: Optional[int] = None) -> str
     except MediaPathError:
         return url_path
     return f"{url_path}?exp={exp}&sig={sig}"
+
+
+def sign_absolute_url(base: str, url_path: str, secret: str,
+                      ttl: Optional[int] = None) -> str:
+    """``base`` + the signed ``url_path`` for a consumer outside the dashboard
+    (MCP answers, webhook payloads, the API's ``download_url``). A path that
+    is not one of ours, or an already absolute URL, comes back as it was."""
+    if not url_path or not url_path.startswith("/"):
+        return url_path
+    signed = sign_media_url(url_path, secret, ttl)
+    return f"{(base or '').rstrip('/')}{signed}" if base else signed
 
 
 def verify_path_signature(rel_path: str, exp, sig: str, secret: str) -> bool:

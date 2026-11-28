@@ -18,6 +18,8 @@ import os
 
 import numpy as np
 
+import frame_sampler
+
 ENABLED = os.environ.get("SPLIT_LAYOUT", "0") == "1"
 
 # Fraction of sampled frames that must show BOTH faces at once.
@@ -236,6 +238,7 @@ def detect_split_scenes(video_path, scenes, strategies, samples=None):
     # presence bar: measured 4 of 12 samples lost on a 22s scene.
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
     found = {}
+    plan = []
 
     try:
         for i, (start, end) in enumerate(scenes):
@@ -255,11 +258,17 @@ def detect_split_scenes(video_path, scenes, strategies, samples=None):
             if last_f < s_f:
                 continue
 
+            plan.append((i, n, [int(round(f)) for f in np.linspace(s_f, last_f, n)]))
+
+        # One forward pass for every scene's samples (frame_sampler): the same
+        # frames, detected in the same order as a seek per sample.
+        flat = [f_idx for _i, _n, idxs in plan for f_idx in idxs]
+        frames = frame_sampler.read_at_path(video_path, cap, flat)
+        for i, n, idxs in plan:
             sampled = []
-            for f_idx in np.linspace(s_f, last_f, n):
-                cap.set(cv2.CAP_PROP_POS_FRAMES, int(round(f_idx)))
-                ok, frame = cap.read()
-                if not ok:
+            for _f_idx in idxs:
+                frame = next(frames)
+                if frame is None:
                     continue
                 if frame.mean() < 16:  # fade to black, same as the classifier
                     continue

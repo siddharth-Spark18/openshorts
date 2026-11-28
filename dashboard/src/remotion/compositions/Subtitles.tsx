@@ -9,11 +9,16 @@ import {
 } from "remotion";
 import type { SubtitleConfig } from "../lib/types";
 import { groupCaptionsIntoBlocks, getActiveWordIndex } from "../lib/captions";
-import { getFontStack } from "../lib/fonts";
+import { getFontStack, antonFontFace, montserratFontFace } from "../lib/fonts";
 
 interface SubtitlesProps {
   config: SubtitleConfig;
 }
+
+// Hebrew, Arabic, Syriac, Thaana, NKo and their presentation forms. A block in
+// one of these scripts sets direction: rtl so the words run right to left
+// (github issue #89).
+const RTL_CHARS = /[\u0590-\u08FF\uFB1D-\uFDFF\uFE70-\uFEFF]/;
 
 const POSITION_MAP: Record<string, React.CSSProperties> = {
   top: { top: "12%", bottom: "auto" },
@@ -23,10 +28,15 @@ const POSITION_MAP: Record<string, React.CSSProperties> = {
 
 export const Subtitles: React.FC<SubtitlesProps> = ({ config }) => {
   const { fps } = useVideoConfig();
-  const blocks = groupCaptionsIntoBlocks(config.captions);
+  const blocks = groupCaptionsIntoBlocks(
+    config.captions,
+    config.maxChars ?? 20,
+    config.maxDurationMs ?? 2000
+  );
 
   return (
     <AbsoluteFill>
+      <style>{antonFontFace + montserratFontFace}</style>
       {blocks.map((block, i) => {
         const startFrame = Math.round((block.startMs / 1000) * fps);
         const durationFrames = Math.max(
@@ -98,29 +108,38 @@ const SubtitleBlock: React.FC<SubtitleBlockProps> = ({
         ...positionStyle,
       }}
     >
+      {/* Words are joined with a real space in the caption font, as the burn
+          does (subtitles.generate_ass joins them with " "). A fixed flex gap
+          was 8px at a ~144px font, so the preview read "KNEWMELIKE" where the
+          clip says "KNEW ME LIKE". The container carries the font so that
+          space has the right width. */}
       <div
         style={{
-          display: "flex",
-          flexWrap: "wrap",
-          justifyContent: "center",
-          gap: "6px 8px",
+          textAlign: "center",
+          direction: block.words.some((w) => RTL_CHARS.test(w.text)) ? "rtl" : "ltr",
+          fontFamily: fontStack,
+          fontSize: style.fontSize,
+          fontWeight: 700,
           maxWidth: "85%",
           ...bgStyle,
         }}
       >
         {block.words.map((word, i) => (
-          <WordSpan
-            key={i}
-            word={word.text}
-            isActive={i === activeIndex}
-            style={style}
-            fontStack={fontStack}
-            animation={style.animation}
-            frame={frame}
-            fps={fps}
-            wordStartMs={word.startMs}
-            blockStartMs={blockStartMs}
-          />
+          <React.Fragment key={i}>
+            {i > 0 && " "}
+            <WordSpan
+              word={word.text}
+              isActive={i === activeIndex}
+              hidden={!!style.reveal && activeIndex >= 0 && i > activeIndex}
+              style={style}
+              fontStack={fontStack}
+              animation={style.animation}
+              frame={frame}
+              fps={fps}
+              wordStartMs={word.startMs}
+              blockStartMs={blockStartMs}
+            />
+          </React.Fragment>
         ))}
       </div>
     </div>
@@ -130,6 +149,7 @@ const SubtitleBlock: React.FC<SubtitleBlockProps> = ({
 interface WordSpanProps {
   word: string;
   isActive: boolean;
+  hidden: boolean;
   style: SubtitleConfig["style"];
   fontStack: string;
   animation: SubtitleConfig["style"]["animation"];
@@ -142,6 +162,7 @@ interface WordSpanProps {
 const WordSpan: React.FC<WordSpanProps> = ({
   word,
   isActive,
+  hidden,
   style,
   fontStack,
   animation,
@@ -182,16 +203,19 @@ const WordSpan: React.FC<WordSpanProps> = ({
           config: { mass: 0.5, stiffness: 300, damping: 12 },
           durationInFrames: 10,
         });
-        const scaleValue = interpolate(scale, [0, 1], [1, 1.25]);
+        // Same range as the burned pop (\fscx90 -> \fscx108). A transform
+        // takes no layout space, so the old 1.25 spilled over the space on
+        // both sides and glued the active word to its neighbours.
+        const scaleValue = interpolate(scale, [0, 1], [0.9, 1.08]);
         transform = `scale(${scaleValue})`;
         break;
       }
       case "karaoke": {
         extraStyle = {
           backgroundColor: style.highlightColor,
-          color: style.bgColor || "#000000",
+          color: style.highlightTextColor || style.bgColor || "#000000",
           borderRadius: 4,
-          padding: "2px 6px",
+          padding: "2px 10px",
         };
         break;
       }
@@ -216,6 +240,11 @@ const WordSpan: React.FC<WordSpanProps> = ({
           `0 -${style.borderWidth}px 0 ${style.borderColor}`,
         ].join(", ")
       : "none";
+  // Burn units -> preview px, same scale as the font size (3.85 * 0.85).
+  const dropShadow = style.shadow
+    ? `${style.shadow * 3}px ${style.shadow * 3}px ${style.shadow * 2}px rgba(0,0,0,0.55)`
+    : "";
+  const outline = strokeShadow === "none" ? "" : strokeShadow;
 
   return (
     <span
@@ -225,9 +254,10 @@ const WordSpan: React.FC<WordSpanProps> = ({
         fontWeight: 700,
         color: animation === "karaoke" && isActive ? undefined : color,
         textShadow:
-          animation !== "karaoke"
-            ? [strokeShadow, extraStyle.textShadow].filter(Boolean).join(", ")
-            : strokeShadow,
+          [outline, dropShadow, animation !== "karaoke" ? extraStyle.textShadow : ""]
+            .filter(Boolean)
+            .join(", ") || "none",
+        visibility: hidden ? "hidden" : "visible",
         transform,
         display: "inline-block",
         transition: "none",

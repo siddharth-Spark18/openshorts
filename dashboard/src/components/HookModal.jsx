@@ -13,6 +13,7 @@ const ENTRANCE_OPTIONS = [
 
 // Must mirror hooks.py HOOK_STYLES.
 const HOOK_STYLES = [
+    { value: 'pill', label: 'Pills', box: 'rgba(255,255,255,0.98)', text: '#000', sans: true },
     { value: 'classic', label: 'Classic', box: 'rgba(255,255,255,0.94)', text: '#000' },
     { value: 'dark', label: 'Dark', box: 'rgba(18,18,20,0.92)', text: '#fff' },
     { value: 'yellow', label: 'Yellow', box: 'rgba(255,214,0,0.96)', text: '#000' },
@@ -21,7 +22,24 @@ const HOOK_STYLES = [
     { value: 'outline_yellow', label: 'Outline+', box: 'transparent', text: '#FFD600', outline: true },
 ];
 
+// Must mirror hooks.py HOOK_FONTS (all bundled: /fonts/*.ttf).
+const FONT_OPTIONS = [
+    { value: 'montserrat', label: 'Montserrat' },
+    { value: 'anton', label: 'Anton' },
+    { value: 'serif', label: 'Serif' },
+];
+const FONT_CSS = {
+    montserrat: { fontFamily: "'Montserrat-ExtraBold', 'Montserrat', sans-serif", fontWeight: 800 },
+    anton: { fontFamily: "'Anton-Regular', Impact, sans-serif", fontWeight: 400 },
+    serif: { fontFamily: "'Noto Serif', Georgia, serif", fontWeight: 700 },
+};
+// The style's own typeface when none is picked (what hooks.py renders).
+const styleFont = (st) => (st === 'pill' ? 'montserrat' : 'serif');
+
+// auto: the server keeps the hook off the speaker's face and the captions
+// (hook_placement.py). The preview cannot see faces and draws it at the top.
 const POSITION_OPTIONS = [
+    { value: 'auto', label: 'auto' },
     { value: 'top', label: 'top' },
     { value: 'center', label: 'center' },
     { value: 'bottom', label: 'bottom' },
@@ -42,9 +60,14 @@ function loadHookPrefs() {
 export default function HookModal({ isOpen, onClose, onGenerate, onRemove, isProcessing, videoUrl, initialText, durationInSeconds, existingSubtitles, hasCaptions, serverRender, burnedHook }) {
     const prefs = loadHookPrefs();
     const [text, setText] = useState(initialText || 'POV: You are using the viral hook feature');
-    const [position, setPosition] = useState(prefs.position || 'top');
+    // Stored as `pos`, not `position`: before 'auto' existed every save wrote
+    // 'top' whether or not the user ever touched the control.
+    const [position, setPosition] = useState(prefs.pos || 'auto');
     const [size, setSize] = useState(prefs.size || 'M');
-    const [style, setStyle] = useState(prefs.style || 'classic');
+    const [style, setStyle] = useState(prefs.style || 'pill');
+    // null = follow the style's own typeface.
+    const [font, setFont] = useState(prefs.font || null);
+    const effectiveFont = font || styleFont(style);
     const [entranceAnimation, setEntranceAnimation] = useState(prefs.entranceAnimation || 'spring');
     const [displayDuration, setDisplayDuration] = useState(5);
 
@@ -56,6 +79,7 @@ export default function HookModal({ isOpen, onClose, onGenerate, onRemove, isPro
         position,
         size,
         style,
+        font: effectiveFont,
         entranceAnimation,
         displayDurationSec: displayDuration,
     };
@@ -79,11 +103,15 @@ export default function HookModal({ isOpen, onClose, onGenerate, onRemove, isPro
         }
     };
 
+    const pillFontFace = "@font-face{font-family:'Montserrat-ExtraBold';src:url('/fonts/Montserrat-ExtraBold.ttf') format('truetype');font-weight:800;}"
+        + "@font-face{font-family:'Anton-Regular';src:url('/fonts/Anton-Regular.ttf') format('truetype');font-weight:400;}";
+
     return (
-        <Modal isOpen={isOpen} onClose={onClose} size="lg" eyebrow="EDITOR · HOOK" title="viral hook">
+        <Modal isOpen={isOpen} onClose={onClose} size="lg" eyebrow="EDITOR · HOOK" title="edit hook">
+            <style>{pillFontFace}</style>
             <div className="flex flex-col md:flex-row gap-6">
                 {/* Left: Preview */}
-                <div className="flex-1 flex flex-col items-center justify-center bg-black rounded-card border border-rule overflow-hidden relative aspect-[9/16] max-h-[600px]">
+                <div className="w-full max-w-[300px] mx-auto md:mx-0 md:w-[300px] shrink-0 self-start flex flex-col items-center justify-center bg-black rounded-card border border-rule overflow-hidden relative aspect-[9/16]">
                     {useRemotionPreview ? (
                         <RemotionPreview
                             videoUrl={videoUrl}
@@ -100,7 +128,7 @@ export default function HookModal({ isOpen, onClose, onGenerate, onRemove, isPro
                                     style={{
                                         ...getSizeStyle(),
                                         backgroundColor: 'rgba(255, 255, 255, 0.82)',
-                                        fontFamily: 'Noto Serif, serif',
+                                        ...FONT_CSS[effectiveFont],
                                         boxShadow: '0 4px 15px rgba(0,0,0,0.5)',
                                         paddingTop: '10px',
                                         paddingBottom: '10px',
@@ -125,8 +153,7 @@ export default function HookModal({ isOpen, onClose, onGenerate, onRemove, isPro
                                 value={text}
                                 onChange={(e) => setText(e.target.value)}
                                 rows={4}
-                                className="input-field resize-none font-serif"
-                                style={{ fontFamily: 'Noto Serif, serif' }}
+                                className="input-field resize-none"
                                 placeholder="Enter text that will stop the scroll..."
                             />
                         </div>
@@ -143,15 +170,41 @@ export default function HookModal({ isOpen, onClose, onGenerate, onRemove, isPro
                                             ${style === s.value ? 'border-[color:var(--color-accent)]' : 'border-rule2 hover:border-[color:var(--color-accent)]'}`}
                                         title={s.label}
                                     >
-                                        <span
-                                            className="block rounded px-1 py-1 font-bold"
-                                            style={{
-                                                backgroundColor: s.box,
-                                                color: s.text,
-                                                textShadow: s.outline ? '-1px -1px 0 #000, 1px -1px 0 #000, -1px 1px 0 #000, 1px 1px 0 #000' : 'none',
-                                            }}
-                                        >Aa</span>
+                                        {s.value === 'pill' ? (
+                                            <span className="flex flex-col items-center gap-0.5 py-0.5" style={FONT_CSS[font || styleFont(s.value)]}>
+                                                <span className="rounded-md px-1.5 text-[13px] leading-5 bg-white text-black">Aa Bb</span>
+                                                <span className="rounded-md px-1.5 text-[13px] leading-5 bg-white text-black">Cc</span>
+                                            </span>
+                                        ) : (
+                                            <span
+                                                className="block rounded-md px-1 py-1.5 text-[15px] leading-5"
+                                                style={{
+                                                    ...FONT_CSS[font || styleFont(s.value)],
+                                                    backgroundColor: s.box,
+                                                    color: s.text,
+                                                    textShadow: s.outline ? '-1px -1px 0 #000, 1px -1px 0 #000, -1px 1px 0 #000, 1px 1px 0 #000' : 'none',
+                                                }}
+                                            >Aa</span>
+                                        )}
                                         <span className="block mt-1 text-muted">{s.label}</span>
+                                    </button>
+                                ))}
+                            </div>
+                        </div>
+
+                        {/* Typeface */}
+                        <div>
+                            <p className="eyebrow mb-2">Font</p>
+                            <div className="grid grid-cols-3 gap-1.5">
+                                {FONT_OPTIONS.map((f) => (
+                                    <button
+                                        key={f.value}
+                                        onClick={() => setFont(f.value)}
+                                        className={`px-1 py-2 rounded-input border text-[15px] text-ink transition-colors
+                                            ${effectiveFont === f.value ? 'border-[color:var(--color-accent)]' : 'border-rule2 hover:border-[color:var(--color-accent)]'}`}
+                                        style={FONT_CSS[f.value]}
+                                    >
+                                        {f.label}
                                     </button>
                                 ))}
                             </div>
@@ -166,6 +219,12 @@ export default function HookModal({ isOpen, onClose, onGenerate, onRemove, isPro
                                 onChange={setPosition}
                                 size="sm"
                             />
+                            {position === 'auto' && (
+                                <p className="text-[11px] text-muted mt-1.5 leading-relaxed">
+                                    Placed where it covers no face and no captions.
+                                    The preview shows it at the top.
+                                </p>
+                            )}
                             {position === 'bottom' && hasCaptions && (
                                 <p className="text-[11px] text-warn mt-1.5 leading-relaxed">
                                     This clip has captions near the bottom — the hook may
@@ -186,7 +245,8 @@ export default function HookModal({ isOpen, onClose, onGenerate, onRemove, isPro
                         </div>
 
                         {/* Entrance Animation (new) */}
-                        <div className={serverRender ? 'opacity-50' : ''}>
+                        {!serverRender && (
+                        <div>
                             <p className="eyebrow mb-2">Entrance</p>
                             <SegmentedControl
                                 options={ENTRANCE_OPTIONS}
@@ -195,13 +255,8 @@ export default function HookModal({ isOpen, onClose, onGenerate, onRemove, isPro
                                 columns={2}
                                 size="sm"
                             />
-                            {serverRender && (
-                                <p className="text-[11px] text-muted mt-1.5 leading-relaxed">
-                                    This clip re-renders on the server, where the hook is
-                                    static — the entrance animation won't apply.
-                                </p>
-                            )}
                         </div>
+                        )}
 
                         {/* Display Duration (new) */}
                         <div>
@@ -254,11 +309,11 @@ export default function HookModal({ isOpen, onClose, onGenerate, onRemove, isPro
                             onClick={() => {
                                 try {
                                     localStorage.setItem('os_hook_prefs', JSON.stringify({
-                                        style, position, size, entranceAnimation,
+                                        style, font, pos: position, size, entranceAnimation,
                                     }));
                                 } catch { /* ignore */ }
                                 onGenerate({
-                                    text, position, size, style,
+                                    text, position, size, style, font: effectiveFont,
                                     // Remotion data
                                     remotion: hookConfig,
                                 });
@@ -267,7 +322,7 @@ export default function HookModal({ isOpen, onClose, onGenerate, onRemove, isPro
                             className="btn-primary flex-1"
                         >
                             {isProcessing && <Loader2 size={16} className="animate-spin text-brassink" />}
-                            {isProcessing ? 'generating...' : 'add hook'}
+                            {isProcessing ? 'saving...' : (burnedHook ? 'update hook' : 'add hook')}
                         </button>
                     </div>
                 </div>

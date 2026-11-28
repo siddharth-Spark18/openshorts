@@ -24,7 +24,8 @@ export const renderJobs = new Map<string, RenderJob>();
 // --- Request validation schema ---
 
 const renderRequestSchema = z.object({
-  jobId: z.string().min(1),
+  // Becomes a directory under OUTPUT_DIR: an id, never a path.
+  jobId: z.string().regex(/^[A-Za-z0-9-]{1,64}$/),
   clipIndex: z.number().int().min(0),
   props: z.object({
     videoUrl: z.string(),

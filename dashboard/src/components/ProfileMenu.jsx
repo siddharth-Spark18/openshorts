@@ -4,8 +4,10 @@ import { useAuth } from '../contexts/AuthContext';
 
 // Header avatar + dropdown for signed-in cloud users: shows the email and gives
 // access to Account & billing (manage subscription, top-ups) and Sign out.
-export default function ProfileMenu() {
-  const { user, isManaged, logout } = useAuth();
+// onUpgrade: opens the in-app plan picker for free users; without it the
+// entry goes to the pricing page.
+export default function ProfileMenu({ onUpgrade = null }) {
+  const { user, isManaged, plan, logout } = useAuth();
   const [open, setOpen] = useState(false);
   const ref = useRef(null);
 
@@ -41,6 +43,18 @@ export default function ProfileMenu() {
               className="w-full flex items-center gap-3 px-4 py-2.5 text-sm lowercase text-brass hover:bg-paper3 transition-colors"
             >
               <Sparkles size={16} /> Start free
+            </button>
+          )}
+          {isManaged && plan === 'free' && (
+            <button
+              onClick={() => {
+                setOpen(false);
+                if (onUpgrade) onUpgrade({ source: 'menu' });
+                else window.location.hash = '#/pricing';
+              }}
+              className="w-full flex items-center gap-3 px-4 py-2.5 text-sm lowercase text-brass hover:bg-paper3 transition-colors"
+            >
+              <Sparkles size={16} /> Upgrade · no watermark
             </button>
           )}
           <button

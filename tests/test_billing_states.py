@@ -78,8 +78,14 @@ class TestAttentionStates:
     def test_every_blocking_state_is_either_live_or_flagged(self):
         # A state that blocks checkout but is invisible in /api/me would recreate
         # the dead end, so the two sets must stay reconciled.
+        # ON_HOLD is shown by /api/me on its own (hold_until), not as a
+        # payment problem.
         for status in config.CHECKOUT_BLOCKING_STATES:
-            assert status in ("active", "trialing") or status in config.BILLING_ATTENTION_STATES
+            assert (status in ("active", "trialing", config.ON_HOLD)
+                    or status in config.BILLING_ATTENTION_STATES)
+
+    def test_on_hold_grants_no_plan_minutes(self):
+        assert metering._entitles(_sub(config.ON_HOLD)) is False
 
 
 class TestNewSubscriberAlert:

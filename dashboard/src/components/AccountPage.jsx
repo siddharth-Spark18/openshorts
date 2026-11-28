@@ -1,26 +1,42 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { Loader2, CreditCard, LogOut, Plus } from 'lucide-react';
 import { useAuth } from '../contexts/AuthContext';
 import { apiJson } from '../lib/api';
 import { track } from '../lib/analytics';
+import { useBackFromStripe } from '../lib/backFromStripe';
 import ApiKeysCard from './ApiKeysCard';
 import McpConnectCard from './McpConnectCard';
 import DeleteAccountCard from './DeleteAccountCard';
 import SocialAnalyticsCard from './SocialAnalyticsCard';
 import InvoicesCard from './InvoicesCard';
+import CancelPlanModal from './CancelPlanModal';
 
 const fmt1 = (n) => Math.round((n || 0) * 10) / 10;
 
 // Mirrors cloud/config.BILLING_ATTENTION_STATES: states where the customer has
 // to do something (fix a card, finish a payment) before minutes come back.
 const PAYMENT_ISSUE_STATES = ['past_due', 'unpaid', 'incomplete', 'paused'];
+// Mirrors cloud/cancellation.CANCELLABLE_STATES.
+const CANCELLABLE_STATES = ['active', 'trialing', 'past_due', 'on_hold'];
+const fmtDay = (iso) => (iso ? new Date(iso).toLocaleDateString('en-US', { month: 'long', day: 'numeric' }) : 'the end of the period');
 
 // Account/billing page: plan, usage meter, top-ups, manage billing, logout.
 export default function AccountPage() {
   const { me, refreshMe, logout, plan, minutes } = useAuth();
   const [busy, setBusy] = useState(false);
+  // `busy` disables the billing buttons only after a re-render; this ref stops
+  // a double click in the same tick (a restart or a top-up charges the card).
+  const inFlightRef = useRef(false);
+  const claim = () => {
+    if (inFlightRef.current) return false;
+    inFlightRef.current = true;
+    setBusy(true);
+    return true;
+  };
+  const release = () => { inFlightRef.current = false; setBusy(false); };
   const [topups, setTopups] = useState([]);
   const [activating, setActivating] = useState(false);
+  const [cancelOpen, setCancelOpen] = useState(false);
 
   // After returning from Checkout the webhook may lag — poll /api/me briefly.
   useEffect(() => {
@@ -78,23 +94,55 @@ export default function AccountPage() {
   }, []);
 
   const openPortal = useCallback(async () => {
-    setBusy(true);
+    if (!claim()) return;
     try {
       const { url } = await apiJson('/api/billing/portal', { method: 'POST' });
       window.location.href = url;
-    } catch (e) { setBusy(false); alert('Could not open billing portal.'); }
+    } catch (e) { release(); alert('Could not open billing portal.'); }
   }, []);
 
+  // The portal no longer cancels, and its "renew" went with that, so undoing
+  // a scheduled cancel happens here (cloud/cancellation.py).
+  const resume = useCallback(async () => {
+    if (!claim()) return;
+    try {
+      await apiJson('/api/billing/resume', { method: 'POST' });
+      track('SubscriptionResumed', { props: { plan } });
+      await refreshMe();
+    } catch (e) { alert(e?.detail || 'Could not resume your subscription.'); }
+    release();
+  }, [plan, refreshMe]);
+
+  const unpause = useCallback(async () => {
+    if (!claim()) return;
+    try {
+      const out = await apiJson('/api/billing/unpause', { method: 'POST' });
+      track('SubscriptionUnpaused', { props: { plan, charged: !!out?.charged } });
+      // A restart charges a new period; the plan comes back with the webhook.
+      if (out?.charged) await new Promise((r) => setTimeout(r, 2500));
+      await refreshMe();
+    } catch (e) { alert(e?.detail || 'Could not restart your plan.'); }
+    release();
+  }, [plan, refreshMe]);
+
   const buyTopup = useCallback(async (price_id) => {
-    setBusy(true);
+    if (!claim()) return;
+    const props = { kind: 'topup', source: 'account_topup' };
+    track('CheckoutStarted', { props });
     try {
       const { url } = await apiJson('/api/billing/checkout', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ price_id }),
+        body: JSON.stringify({ price_id, source: props.source }),
       });
+      track('CheckoutRedirected', { props });
       window.location.href = url;
-    } catch (e) { setBusy(false); alert(e?.detail || 'Could not start checkout.'); }
+    } catch (e) {
+      track('CheckoutFailed', { props: { ...props, reason: String(e?.detail || e?.message || 'unknown').slice(0, 120) } });
+      release();
+      alert(e?.detail || 'Could not start checkout.');
+    }
   }, []);
+  useBackFromStripe(release);
 
   if (!me) return <div className="flex justify-center py-16"><Loader2 className="animate-spin text-brass" /></div>;
 
@@ -128,7 +176,7 @@ export default function AccountPage() {
             <span className="text-ink font-medium capitalize">{plan ? `${plan} plan` : 'No active plan'}</span>
             {/* Payment-issue states get the explanatory banner below instead —
                 showing raw Stripe jargon ("past_due") twice explains nothing. */}
-            {me.status && me.status !== 'active'
+            {me.status && me.status !== 'active' && me.status !== 'on_hold'
               && !PAYMENT_ISSUE_STATES.includes(me.status) && (
               <span className="badge-warn">{me.status}</span>
             )}
@@ -166,6 +214,20 @@ export default function AccountPage() {
           </div>
         )}
 
+        {/* Month on hold from the cancel flow (cloud/cancellation). */}
+        {(me.status === 'on_hold' || me.hold_scheduled) && (
+          <div className="mb-4 rounded-card border border-brass/40 bg-brass/5 p-3 text-sm text-ink2 flex items-center justify-between gap-3">
+            <span>
+              {me.status === 'on_hold'
+                ? <>Your plan is paused until <b className="text-ink">{fmtDay(me.hold_until)}</b>. You're on free minutes and your clips are kept.</>
+                : <>Your plan skips next month from <b className="text-ink">{fmtDay(me.period_end)}</b>, with no charge.</>}
+            </span>
+            <button onClick={unpause} disabled={busy} className="btn-ghost px-4 py-2 text-xs shrink-0">
+              {me.status === 'on_hold' ? 'Restart now' : 'Undo pause'}
+            </button>
+          </div>
+        )}
+
         <div className="space-y-2">
           <div className="flex justify-between text-sm">
             <span className="text-muted lowercase">Plan minutes</span>
@@ -183,7 +245,35 @@ export default function AccountPage() {
             <span className="text-brass font-medium">{fmt1(m.remaining)} min</span>
           </div>
         </div>
+
+        {/* Our own cancel flow (reason + review + retention offer). The portal
+            cannot cancel (turned off in Stripe), so this is the only way out. */}
+        {me.has_billing_account && CANCELLABLE_STATES.includes(me.status) && !me.cancel_at_period_end && (
+          <div className="pt-4 mt-4 border-t border-rule text-right">
+            <button onClick={() => { track('CancelFlowOpened', { props: { plan } }); setCancelOpen(true); }}
+                    className="text-xs text-muted underline underline-offset-2 hover:text-ink">
+              Cancel subscription
+            </button>
+          </div>
+        )}
+        {me.has_billing_account && CANCELLABLE_STATES.includes(me.status) && me.cancel_at_period_end && (
+          <div className="pt-4 mt-4 border-t border-rule flex items-center justify-between gap-3 text-sm text-ink2">
+            <span>Your plan ends on {me.period_end ? new Date(me.period_end).toLocaleDateString('en-US', { month: 'long', day: 'numeric' }) : 'the end of the period'}.</span>
+            <button onClick={resume} disabled={busy} className="btn-ghost px-4 py-2 text-xs shrink-0">
+              Keep my subscription
+            </button>
+          </div>
+        )}
       </div>
+
+      {cancelOpen && (
+        <CancelPlanModal
+          plan={plan}
+          periodEnd={me.period_end}
+          onClose={() => setCancelOpen(false)}
+          onCanceled={() => { setCancelOpen(false); refreshMe(); }}
+        />
+      )}
 
       {/* Only accounts that ever had a Stripe relationship can have invoices. */}
       {me.has_billing_account && <InvoicesCard />}

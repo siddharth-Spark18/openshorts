@@ -64,9 +64,30 @@ def test_direct_file_urls_skip_the_proxy_chain():
     one static as fallback, never the per-GB proxy (prod 27-aug: 9 KB/s
     through the ISP proxy vs 17 MB/s direct)."""
     got = plan(False, ["s1", "s2"], "paid", True, youtube=False)
-    assert got == [("direct", False, None), ("static-fallback", False, "s1")]
+    # Every static is listed: the caller moves past one only when it refuses
+    # the tunnel (tests/test_refused_exit.py).
+    assert got == [("direct", False, None), ("static-fallback", False, "s1"),
+                   ("static-fallback2", False, "s2")]
+    assert all(proxy != "paid" for _label, _capped, proxy in got)
     assert plan(False, [], "paid", True, youtube=False) == [("direct", False, None)]
     assert main.is_youtube_url("https://www.youtube.com/watch?v=x")
     assert main.is_youtube_url("https://youtu.be/x")
     assert not main.is_youtube_url("https://litter.catbox.moe/u90j4q.mp4")
     assert not main.is_youtube_url("https://tmpfiles.org/dl/1/2/v.mp4")
+
+
+class TestSkipStatics:
+    """The probe already saw every static IP bot-checked for this video
+    (30-sep-2026: per video, identical on every IP): the download goes
+    straight to the paid attempts instead of repeating four anonymous hits."""
+
+    def test_skip_statics_goes_straight_to_paid(self):
+        got = plan(True, STATICS, PAID, True, skip_statics=True)
+        assert got == [('HD', True, PAID), ('fallback', True, PAID)]
+
+    def test_skip_statics_without_paid_keeps_the_statics(self):
+        assert plan(False, STATICS, None, True, skip_statics=True) == \
+            plan(False, STATICS, None, True)
+
+    def test_default_is_unchanged(self):
+        assert plan(True, STATICS, PAID, True, skip_statics=False) == plan(True, STATICS, PAID, True)

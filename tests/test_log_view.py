@@ -26,10 +26,8 @@ RAW_JOB = [
 def test_real_job_produces_clean_user_view():
     assert friendly_logs(RAW_JOB) == [
         "Job started by worker.",
-        "🎙️ Transcribing audio…",
-        "🎙️ Transcribing… 25% (3s)",
-        "🎙️ Transcribing… 100% (7s)",
-        "🔥 Found 2 viral clips!",
+        "🎙️ Transcribing audio… 100%",   # progress updates its own line
+        "🔥 Found 2 clips!",
         "🎬 Creating clip 1…",
         "✅ Clip 1 ready",
         "Process finished successfully.",
@@ -59,3 +57,36 @@ def test_errors_kept_without_paths():
 def test_consecutive_duplicates_collapse():
     logs = ["🎙️  Transcribing video...", "🎙️  Transcribing audio from: x.mp4"]
     assert friendly_logs(logs) == ["🎙️ Transcribing audio…"]
+
+
+def test_progress_glued_to_a_download_bar_is_still_seen():
+    """yt-dlp redraws its bar with \\r and no newline; the early transcription
+    prints onto the same line."""
+    logs = [
+        "📥 Download attempt: HD-static1",
+        "[download]  17.3% of  404.46MiB at 55MiB/s ETA 00:05\r[download]  24.9% of 404MiB"
+        "🎙️ Transcribing… 25% (2s)",
+        "🎧 Audio ready ahead of the video: .early_audio.m4a",
+        "🎙️ Transcribing… 100% (9s)",
+        "✅ Video downloaded in 28.95s: output/x/video.mp4",
+        "🔥 Found 6 clips!",
+    ]
+    assert friendly_logs(logs) == [
+        "📥 Downloading video… 24%",
+        "🎙️ Transcribing audio… 100%",
+        "🎧 Audio ready — transcribing while the video downloads",
+        "✅ Video downloaded",
+        "🔥 Found 6 clips!",
+    ]
+
+
+def test_each_line_keeps_the_time_it_first_appeared():
+    from log_view import friendly_logs_timed
+    logs = ["🎙️  Transcribing video...", "🎙️ Transcribing… 50% (3s)",
+            "🔥 Found 2 clips!", "🎬 Processing Clip 1: 0s - 30s"]
+    times = [100.0, 105.0, 110.0, 111.0]
+    assert friendly_logs_timed(logs, times) == [
+        ("🎙️ Transcribing audio… 50%", 100.0),
+        ("🔥 Found 2 clips!", 110.0),
+        ("🎬 Creating clip 1…", 111.0),
+    ]

@@ -24,7 +24,7 @@ def _reset_state(monkeypatch):
     alerts._last_alert.clear()
     sent = []
 
-    async def fake_alert(subject, body):
+    async def fake_alert(subject, body, **kw):
         sent.append((subject, body))
 
     monkeypatch.setattr(alerts, "send_admin_alert", fake_alert)
@@ -142,3 +142,55 @@ class TestJobFailureOpensIncident:
     def test_non_proxy_error_leaves_incident_closed(self, _reset_state):
         _run(alerts.record_job_outcome(False, "ffmpeg exploded"))
         assert not alerts._watch_down.get(alerts._PAID_TARGET)
+
+
+class TestCookieSession:
+    """The cookies are a route too: a rotated session makes every download
+    anonymous while the pool probe still says UP (30-sep-2026)."""
+
+    def test_note_session_reads_the_ytcfg_marker(self):
+        alerts._session_seen["logged_in"] = None
+        alerts._note_session('..."LOGGED_IN":false,"EVENT_ID"...')
+        assert alerts._session_seen["logged_in"] is False
+        alerts._note_session('"LOGGED_IN":true')
+        assert alerts._session_seen["logged_in"] is True
+        alerts._session_seen["logged_in"] = None
+        alerts._note_session("no player at all")
+        assert alerts._session_seen["logged_in"] is None
+
+    def test_expired_session_alerts_on_first_probe_with_the_fix(self, _reset_state, monkeypatch):
+        monkeypatch.setenv("STATIC_PROXY_URLS", "http://s1")
+        monkeypatch.setattr(alerts, "_probe_cookies", lambda: object())
+
+        async def fake_probe(url):
+            alerts._session_seen["logged_in"] = False
+            return True, ""  # the IP still answers: pool is UP
+        monkeypatch.setattr(alerts, "_probe_one", fake_probe)
+        _run(alerts.proxy_watch_tick())
+        assert len(_reset_state) == 1
+        subject, body = _reset_state[0]
+        assert "cookies expired" in subject
+        assert "YOUTUBE_COOKIES" in body and "private window" in body
+        # Still down on the next tick: no second alert inside the nag window.
+        _run(alerts.proxy_watch_tick())
+        assert len(_reset_state) == 1
+
+    def test_live_session_and_no_cookies_stay_silent(self, _reset_state, monkeypatch):
+        monkeypatch.setenv("STATIC_PROXY_URLS", "http://s1")
+
+        async def fake_probe(url):
+            alerts._session_seen["logged_in"] = True
+            return True, ""
+        monkeypatch.setattr(alerts, "_probe_one", fake_probe)
+        monkeypatch.setattr(alerts, "_probe_cookies", lambda: object())
+        _run(alerts.proxy_watch_tick())
+        assert _reset_state == []
+        # Self-host without cookies: the marker says false, nobody is paged.
+        monkeypatch.setattr(alerts, "_probe_cookies", lambda: None)
+
+        async def anon_probe(url):
+            alerts._session_seen["logged_in"] = False
+            return True, ""
+        monkeypatch.setattr(alerts, "_probe_one", anon_probe)
+        _run(alerts.proxy_watch_tick())
+        assert _reset_state == []

@@ -24,19 +24,31 @@ export interface SubtitleStyle {
   // Karaoke look: dim inactive words (0-1) and force uppercase.
   baseOpacity?: number;
   uppercase?: boolean;
+  // Words not spoken yet stay invisible (keep their slot), as burned.
+  reveal?: boolean;
+  // Drop shadow depth in burn units (subtitles.generate_ass `shadow`).
+  shadow?: number;
+  // Text colour on the active-word box ("karaoke" animation).
+  highlightTextColor?: string;
 }
 
 export interface SubtitleConfig {
   captions: CaptionWord[];
   position: SubtitlePosition;
   style: SubtitleStyle;
+  // Line budget, mirrors the burn's max_chars / max_duration.
+  maxChars?: number;
+  maxDurationMs?: number;
 }
 
 // --- Hook config ---
-export type HookPosition = "top" | "center" | "bottom";
+// "auto": the server picks a spot off the faces and the captions (hook_placement.py);
+// the browser preview and render, which cannot see faces, draw it at the top.
+export type HookPosition = "auto" | "top" | "center" | "bottom";
 export type HookSize = "S" | "M" | "L";
 export type HookEntrance = "spring" | "fade" | "slide-up" | "none";
 export type HookStyle =
+  | "pill"
   | "classic"
   | "dark"
   | "yellow"
@@ -44,11 +56,15 @@ export type HookStyle =
   | "outline"
   | "outline_yellow";
 
+export type HookFont = "montserrat" | "anton" | "serif";
+
 export interface HookConfig {
   text: string;
   position: HookPosition;
   size: HookSize;
   style?: HookStyle;
+  /** montserrat | anton | serif; unset = the style's own typeface. */
+  font?: HookFont;
   entranceAnimation: HookEntrance;
   displayDurationSec: number;
 }
@@ -108,11 +124,12 @@ export const subtitleConfigSchema = z.object({
 
 export const hookConfigSchema = z.object({
   text: z.string(),
-  position: z.enum(["top", "center", "bottom"]),
+  position: z.enum(["auto", "top", "center", "bottom"]),
   size: z.enum(["S", "M", "L"]),
   style: z
-    .enum(["classic", "dark", "yellow", "red", "outline", "outline_yellow"])
-    .default("classic"),
+    .enum(["pill", "classic", "dark", "yellow", "red", "outline", "outline_yellow"])
+    .default("pill"),
+  font: z.enum(["montserrat", "anton", "serif"]).optional(),
   entranceAnimation: z.enum(["spring", "fade", "slide-up", "none"]),
   displayDurationSec: z.number().positive(),
 });

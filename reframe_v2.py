@@ -22,13 +22,15 @@ import subprocess
 import tempfile
 
 import active_speaker
+import gpu_decode
+import gpu_render
 import camera_inset
 import punch_in
 import screencast_layout
 import layout_ranges
 import split_layout
-from ffmpeg_utils import (video_encode_args, escape_filter_value, QUALITY_FAST,
-                          METADATA_SCRUB)
+from ffmpeg_utils import (video_encode_args, blurred_backdrop, escape_filter_value,
+                          QUALITY_FAST, METADATA_SCRUB)
 
 ANALYSIS_MAX_WIDTH = 640
 
@@ -135,6 +137,25 @@ def full_width_content_height(orig_w, orig_h, out_w):
     return fg_h + (fg_h % 2)
 
 
+def _wide_crop(input_video, orig_w, orig_h, out_w, out_h, start_f, end_f, focus):
+    """The columns an automatic WIDE scene without a narrow reading area shows
+    (screencast_layout.wide_crop), centred on the scene's motion, else on the
+    shot check's reading area, else on the frame. None keeps the whole width.
+    The motion probe is a refinement: if it fails the scene still renders."""
+    probe = screencast_layout.wide_crop(orig_w, orig_h, out_w, out_h)
+    if not probe:
+        return None
+    centre = None
+    try:
+        centre = screencast_layout.wide_action_centre(
+            input_video, start_f, end_f, probe[1] / float(orig_w))
+    except Exception as e:
+        print(f"   ⚠️ WIDE motion probe failed ({e}); centring the crop.")
+    if centre is None:
+        centre = (focus[0] + focus[1]) / 2.0 if focus else 0.5
+    return screencast_layout.wide_crop(orig_w, orig_h, out_w, out_h, centre)
+
+
 def general_filtergraph(out_w, out_h, content_h=None, orig_w=None, orig_h=None):
     """Blurred-background 'general shot' layout: bg fills the frame (centre-
     cropped, blurred), fg is scaled to a readable share of the height and
@@ -157,8 +178,7 @@ def general_filtergraph(out_w, out_h, content_h=None, orig_w=None, orig_h=None):
     fg_h += fg_h % 2
     return (
         f"[0:v]split=2[bga][fga];"
-        f"[bga]scale=-2:{out_h},crop=w=min(iw\\,{out_w}):h={out_h},"
-        f"scale={out_w}:{out_h},gblur=sigma=12[bg];"
+        f"[bga]{blurred_backdrop(out_w, out_h, 12)}[bg];"
         # Scale by HEIGHT, then trim any overflow to the output width. crop
         # centres by default, and min() makes it a no-op when the scaled source
         # is already narrower than the frame (portrait/square sources).
@@ -251,87 +271,266 @@ def apply_crop_overrides(xs, strategies, scene_boundaries, overrides,
     return xs, strategies
 
 
-def _analyze_trajectory(input_video, scenes_boundaries, scene_strategies,
-                        fps, orig_w, orig_h, cameraman, tracker):
-    """Replays v1's per-frame decision loop on a downscaled ffmpeg-decoded
-    stream. Returns xs: crop x per frame (None on GENERAL frames)."""
-    import numpy as np
-    import main as m
+# Layouts whose crop is fixed for the whole scene: no camera trajectory.
+_STATIC_LAYOUTS = ('GENERAL', 'SPLIT', 'SCREENCAST', 'WIDE', 'INSET', 'ALTERNATE')
 
+# Decode only the frames the trajectory runs a detector on (see
+# _detection_frames). SPARSE_TRAJECTORY=0 pipes every frame again.
+SPARSE_TRAJECTORY = os.environ.get("SPARSE_TRAJECTORY", "1").strip() != "0"
+
+
+class _SparseMismatch(Exception):
+    """The sparse pass did not see the frames it expected; redo it in full."""
+
+
+def _analysis_size(orig_w, orig_h):
     small_w = min(ANALYSIS_MAX_WIDTH, orig_w)
     if small_w % 2:
         small_w -= 1
     small_h = max(int(orig_h * small_w / orig_w), 2)
     if small_h % 2:
         small_h += 1
-    scale = orig_w / small_w
-    frame_bytes = small_w * small_h * 3
+    return small_w, small_h
 
-    proc = subprocess.Popen(
-        ["ffmpeg", "-loglevel", "error", "-i", input_video,
-         "-vf", f"scale={small_w}:{small_h}",
-         "-f", "rawvideo", "-pix_fmt", "bgr24", "-"],
-        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=frame_bytes * 4)
+
+def _walk_scenes(scenes_boundaries, scene_strategies, n_frames):
+    """(frame_number, scene_index, strategy) for every frame, advancing through
+    the scenes exactly like the trajectory loop does."""
+    current = 0
+    for frame_number in range(n_frames):
+        if current < len(scenes_boundaries):
+            _start_f, end_f = scenes_boundaries[current]
+            if frame_number >= end_f and current < len(scenes_boundaries) - 1:
+                current += 1
+        strategy = (scene_strategies[current]
+                    if current < len(scene_strategies) else 'TRACK')
+        yield frame_number, current, strategy
+
+
+def _detection_frames(scenes_boundaries, scene_strategies, n_frames, stride,
+                      cut_reset):
+    """Frame numbers the trajectory loop hands a detector, in order.
+
+    Every other frame only advances the camera's smoothing, which never looks
+    at pixels. With DETECT_STRIDE=4 that is three frames in four, and none at
+    all in the scenes with a fixed crop."""
+    frames = []
+    for frame_number, current, strategy in _walk_scenes(
+            scenes_boundaries, scene_strategies, n_frames):
+        if strategy in _STATIC_LAYOUTS:
+            continue
+        is_scene_start = (current < len(scenes_boundaries)
+                          and frame_number == scenes_boundaries[current][0])
+        if frame_number % stride == 0 or (is_scene_start and cut_reset):
+            frames.append(frame_number)
+    return frames
+
+
+def select_expr(frames, stride):
+    """ffmpeg select= expression true exactly on ``frames`` (sorted, unique).
+
+    Runs of stride-aligned frames ``stride`` apart collapse into one
+    between()*not(mod()) term so a long clip stays a short expression."""
+    terms = []
+    i = 0
+    while i < len(frames):
+        j = i
+        if frames[i] % stride == 0:
+            while j + 1 < len(frames) and frames[j + 1] == frames[j] + stride:
+                j += 1
+        if j - i >= 2:
+            terms.append(f"between(n,{frames[i]},{frames[j]})*not(mod(n,{stride}))")
+        else:
+            j = i
+            terms.append(f"eq(n,{frames[i]})")
+        i = j + 1
+    return gpu_decode.any_of(terms)
+
+
+def _trajectory_loop(next_frame, sparse, n_frames, scenes_boundaries,
+                     scene_strategies, orig_w, scale, cameraman, tracker):
+    """v1's per-frame decision loop. ``next_frame()`` returns the next decoded
+    frame (None at the end). Dense: one call per frame, the loop ends with the
+    stream. Sparse: ``n_frames`` iterations and a call only where a detector
+    runs (``next_frame(frame_number)``)."""
+    import main as m
 
     xs = []
     frame_number = 0
     current_scene_index = 0
-    try:
-        while True:
-            buf = proc.stdout.read(frame_bytes)
-            if len(buf) < frame_bytes:
+    while not sparse or frame_number < n_frames:
+        frame = None
+        if not sparse:
+            frame = next_frame()
+            if frame is None:
                 break
-            frame = np.frombuffer(buf, dtype=np.uint8).reshape((small_h, small_w, 3))
 
-            if current_scene_index < len(scenes_boundaries):
-                start_f, end_f = scenes_boundaries[current_scene_index]
-                if frame_number >= end_f and current_scene_index < len(scenes_boundaries) - 1:
-                    current_scene_index += 1
+        if current_scene_index < len(scenes_boundaries):
+            start_f, end_f = scenes_boundaries[current_scene_index]
+            if frame_number >= end_f and current_scene_index < len(scenes_boundaries) - 1:
+                current_scene_index += 1
 
-            strategy = (scene_strategies[current_scene_index]
-                        if current_scene_index < len(scene_strategies) else 'TRACK')
+        strategy = (scene_strategies[current_scene_index]
+                    if current_scene_index < len(scene_strategies) else 'TRACK')
 
-            # SPLIT, SCREENCAST and WIDE crops are static (fixed boxes for the
-            # whole scene), so like GENERAL they need no camera trajectory.
-            # ALTERNATE gets one written in after this pass.
-            if strategy in ('GENERAL', 'SPLIT', 'SCREENCAST', 'WIDE',
-                            'INSET', 'ALTERNATE'):
-                cameraman.current_center_x = orig_w / 2
-                cameraman.target_center_x = orig_w / 2
-                xs.append(None)
-            else:
-                is_scene_start = (
-                    current_scene_index < len(scenes_boundaries)
-                    and frame_number == scenes_boundaries[current_scene_index][0])
-                cut = is_scene_start and m.SCENE_CUT_RESET
-                if cut:
-                    # New shot: forget the old subject and cut to the new one
-                    # (see SmoothedCameraman.begin_scene).
-                    tracker.reset()
-                    cameraman.begin_scene()
+        # SPLIT, SCREENCAST and WIDE crops are static (fixed boxes for the
+        # whole scene), so like GENERAL they need no camera trajectory.
+        # ALTERNATE gets one written in after this pass.
+        if strategy in _STATIC_LAYOUTS:
+            cameraman.current_center_x = orig_w / 2
+            cameraman.target_center_x = orig_w / 2
+            xs.append(None)
+        else:
+            is_scene_start = (
+                current_scene_index < len(scenes_boundaries)
+                and frame_number == scenes_boundaries[current_scene_index][0])
+            cut = is_scene_start and m.SCENE_CUT_RESET
+            if cut:
+                # New shot: forget the old subject and cut to the new one
+                # (see SmoothedCameraman.begin_scene).
+                tracker.reset()
+                cameraman.begin_scene()
 
-                if frame_number % m.DETECT_STRIDE == 0 or cut:
-                    candidates = m.detect_face_candidates(frame)
-                    for cand in candidates:
-                        cand['box'] = [int(v * scale) for v in cand['box']]
-                        cand['score'] = cand['box'][2] * cand['box'][3]
-                    target_box = tracker.get_target(candidates, frame_number, orig_w)
-                    if target_box:
-                        cameraman.update_target(target_box)
-                    elif frame_number % m.YOLO_FALLBACK_STRIDE == 0 or cut:
-                        person_box = m.detect_person_yolo(frame)
-                        if person_box:
-                            cameraman.update_target([int(v * scale) for v in person_box])
+            if frame_number % m.DETECT_STRIDE == 0 or cut:
+                if sparse:
+                    frame = next_frame(frame_number)
+                candidates = m.detect_face_candidates(frame)
+                for cand in candidates:
+                    cand['box'] = [int(v * scale) for v in cand['box']]
+                    cand['score'] = cand['box'][2] * cand['box'][3]
+                target_box = tracker.get_target(candidates, frame_number, orig_w)
+                if target_box:
+                    cameraman.update_target(target_box)
+                elif frame_number % m.YOLO_FALLBACK_STRIDE == 0 or cut:
+                    person_box = m.detect_person_yolo(frame)
+                    if person_box:
+                        cameraman.update_target([int(v * scale) for v in person_box])
 
-                x1, _y1, _x2, _y2 = cameraman.get_crop_box(force_snap=is_scene_start)
-                xs.append(x1)
+            x1, _y1, _x2, _y2 = cameraman.get_crop_box(force_snap=is_scene_start)
+            xs.append(x1)
 
-            frame_number += 1
+        frame_number += 1
+    return xs
+
+
+def _read_frame(stream, frame_bytes, shape):
+    import numpy as np
+    buf = stream.read(frame_bytes)
+    if len(buf) < frame_bytes:
+        return None
+    return np.frombuffer(buf, dtype=np.uint8).reshape(shape)
+
+
+def _sparse_trajectory(input_video, n_frames, on_gpu, small_w, small_h,
+                       scenes_boundaries, scene_strategies, orig_w, scale,
+                       cameraman, tracker):
+    """The trajectory decoding only the detector's frames (plus the last one,
+    and anything past it, to prove the clip has exactly ``n_frames``)."""
+    import main as m
+
+    wanted = _detection_frames(scenes_boundaries, scene_strategies, n_frames,
+                               m.DETECT_STRIDE, m.SCENE_CUT_RESET)
+    piped = sorted(set(wanted) | {n_frames - 1})
+    expr = gpu_decode.any_of([select_expr(piped, m.DETECT_STRIDE), f"gte(n,{n_frames})"])
+    chain = f"scale={small_w}:{small_h}"
+    vf = (f"select='{expr}',{gpu_decode.DOWNLOAD},{chain}" if on_gpu
+          else f"select='{expr}',{chain}")
+    frame_bytes = small_w * small_h * 3
+    shape = (small_h, small_w, 3)
+    proc = subprocess.Popen(
+        ["ffmpeg", "-loglevel", "error", *gpu_decode.input_args(on_gpu),
+         "-i", input_video, "-vf", vf, "-fps_mode", "passthrough",
+         "-f", "rawvideo", "-pix_fmt", "bgr24", "-"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=frame_bytes * 4)
+    queue = iter(piped)
+
+    def next_frame(frame_number):
+        expected = next(queue, None)
+        if expected != frame_number:
+            raise _SparseMismatch(f"asked frame {frame_number}, stream has {expected}")
+        frame = _read_frame(proc.stdout, frame_bytes, shape)
+        if frame is None:
+            raise _SparseMismatch(f"stream ended before frame {frame_number}")
+        return frame
+
+    try:
+        xs = _trajectory_loop(next_frame, True, n_frames, scenes_boundaries,
+                              scene_strategies, orig_w, scale, cameraman, tracker)
+        for frame_number in queue:  # the last frame, when no detector wanted it
+            if _read_frame(proc.stdout, frame_bytes, shape) is None:
+                raise _SparseMismatch(f"stream ended before frame {frame_number}")
+        if proc.stdout.read(1):
+            raise _SparseMismatch(f"clip has more than {n_frames} frames")
     finally:
         proc.stdout.close()
+        proc.kill()
         proc.wait()
-
     return xs
+
+
+def _analyze_trajectory(input_video, scenes_boundaries, scene_strategies,
+                        fps, orig_w, orig_h, cameraman, tracker):
+    """Replays v1's per-frame decision loop on a downscaled ffmpeg-decoded
+    stream. Returns xs: crop x per frame (None on GENERAL frames).
+
+    When the scene pass counted the clip's frames, only the frames a detector
+    looks at are decoded and scaled (on the card when it can): same frames,
+    same detector calls, same xs. Anything unexpected restores the camera and
+    tracker and runs the full pass, itself on the card when it can."""
+    import copy
+
+    small_w, small_h = _analysis_size(orig_w, orig_h)
+    scale = orig_w / small_w
+    n_frames = gpu_decode.decoded_frames(input_video) if SPARSE_TRAJECTORY else None
+    on_card = gpu_decode.usable(input_video)
+    saved = copy.deepcopy(cameraman.__dict__), copy.deepcopy(tracker.__dict__)
+
+    def restore():
+        cameraman.__dict__.clear()
+        cameraman.__dict__.update(copy.deepcopy(saved[0]))
+        tracker.__dict__.clear()
+        tracker.__dict__.update(copy.deepcopy(saved[1]))
+
+    if n_frames:
+        for on_gpu in ([True, False] if on_card else [False]):
+            try:
+                xs = _sparse_trajectory(input_video, n_frames, on_gpu, small_w, small_h,
+                                        scenes_boundaries, scene_strategies, orig_w,
+                                        scale, cameraman, tracker)
+                gpu_decode.note(on_gpu)
+                return xs
+            except _SparseMismatch as e:
+                print(f"   ⚠️ Sparse trajectory pass ({'GPU' if on_gpu else 'CPU'}): {e}")
+                if on_gpu:
+                    gpu_decode.note(True, failed=True)
+                restore()
+
+    # Every frame, as before; decoded on the card when it can (same frames).
+    # A card decode that does not end cleanly is thrown away and redone.
+    for on_gpu in ([True, False] if on_card and not n_frames else [False]):
+        frame_bytes = small_w * small_h * 3
+        proc = subprocess.Popen(
+            ["ffmpeg", "-loglevel", "error", *gpu_decode.input_args(on_gpu),
+             "-i", input_video,
+             "-vf", gpu_decode.vf(f"scale={small_w}:{small_h}", on_gpu),
+             "-f", "rawvideo", "-pix_fmt", "bgr24", "-"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=frame_bytes * 4)
+        try:
+            xs = _trajectory_loop(
+                lambda: _read_frame(proc.stdout, frame_bytes, (small_h, small_w, 3)),
+                False, None, scenes_boundaries, scene_strategies, orig_w, scale,
+                cameraman, tracker)
+        finally:
+            proc.stdout.close()
+            rc = proc.wait()
+        if not on_gpu:
+            return xs
+        if rc == 0 and xs:
+            gpu_decode.note(True)
+            return xs
+        gpu_decode.note(True, failed=True)
+        print("   ⚠️ GPU trajectory decode failed, decoding on the CPU")
+        restore()
 
 
 # --- render -----------------------------------------------------------------
@@ -341,13 +540,113 @@ def _run(cmd):
                    stderr=subprocess.PIPE, timeout=1800)
 
 
+def _run_segment(input_video, ss, dur, extra_inputs, graph, out_label, seg_path):
+    """Encode one scene. The clip is decoded on the card when it can
+    (gpu_decode: the same frames, so the same segment) and on the CPU if that
+    ffmpeg fails."""
+    def build(on_gpu):
+        on_gpu = on_gpu and gpu_decode.graph_ok(graph)
+        return [
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-ss", f"{ss:.4f}", "-t", f"{dur:.4f}",
+            *gpu_decode.input_args(on_gpu), "-i", input_video, *extra_inputs,
+            "-filter_complex", gpu_decode.graph(graph, on_gpu), "-map", out_label,
+            *video_encode_args(QUALITY_FAST), "-an", seg_path,
+        ]
+
+    def runner(cmd):
+        return subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                              timeout=1800)
+
+    result = gpu_decode.run(build, runner, path=input_video)
+    if result.returncode != 0:
+        raise subprocess.CalledProcessError(result.returncode, result.args,
+                                            result.stdout, result.stderr)
+
+
+def screen_ranges(input_video, scenes, fps, strategies):
+    """Which stretches of this clip show a screen, for a screencast job.
+
+    This call is what SCREENCAST_LAYOUT=1 was missing until 6-oct-2026: the
+    flag was set (by ``layouts=["screencast"]`` or the layout picker) and
+    nothing ever asked for the ranges, so every screen shot fell through to the
+    face classifier's TRACK/GENERAL. When the shot check cannot answer, the
+    scenes the classifier sent to GENERAL are taken as the screen: the job was
+    declared a screencast, and an explicit choice must not silently render
+    the blurred-strip layout it was chosen to avoid.
+    """
+    ranges = screencast_layout.detect_content_ranges(input_video, scenes, fps)
+    if ranges is None:
+        ranges = screencast_layout.fallback_ranges(scenes, strategies, fps)
+        print(f"   🖥️ Screen check unavailable — {len(ranges)} face-less "
+              f"scene(s) treated as the screen")
+    return ranges
+
+
+def encode_scenes(input_video, specs, orig_w, orig_h, out_w, out_h, fps,
+                  workdir, logo, final_output_video):
+    """Encode the scene specs into ``final_output_video`` with the clip's audio.
+
+    The whole clip in one pass on the card when it can (gpu_render);
+    otherwise one ffmpeg per scene and a concat, as always."""
+    if logo:
+        import main as m
+
+    video_in = None
+    if gpu_render.usable(input_video):
+        gpu_out = os.path.join(workdir, "gpu.mp4")
+        mark = None
+        if logo:
+            mark = {"path": logo,
+                    "x": int(out_w * m.WATERMARK_MARGIN_RATIO),
+                    "y": int(out_h * m.WATERMARK_Y_RATIO),
+                    "w": max(80, int(out_w * m.WATERMARK_WIDTH_RATIO)),
+                    "opacity": m.WATERMARK_OPACITY}
+        if gpu_render.render(input_video, specs, orig_w, orig_h, out_w, out_h,
+                             fps, gpu_out, overlay=mark):
+            video_in = ["-i", gpu_out]
+
+    if video_in is None:
+        segments = []
+        for idx, (ss, dur, graph, _boxes) in enumerate(specs):
+            seg_path = os.path.join(workdir, f"seg_{idx:03d}.mp4")
+            extra, out_label = [], "[v]"
+            if logo:
+                extra = ["-i", logo]
+                graph += ";" + m.watermark_filter(out_w, out_h, video="[v]", out="[vw]")
+                out_label = "[vw]"
+            _run_segment(input_video, ss, dur, extra, graph, out_label, seg_path)
+            segments.append(seg_path)
+
+        list_path = os.path.join(workdir, "concat.txt")
+        with open(list_path, "w") as f:
+            f.write(concat_list_content(segments))
+        video_in = ["-f", "concat", "-safe", "0", "-i", list_path]
+
+    # Video (stream copy) + audio straight from the clip.
+    _run([
+        "ffmpeg", "-y", "-loglevel", "error",
+        *video_in,
+        "-i", input_video,
+        "-map", "0:v:0", "-map", "1:a:0?",
+        "-c:v", "copy", "-c:a", "copy", *METADATA_SCRUB,
+        # +faststart moves the moov atom to the front so the browser <video>
+        # can start playing before the whole file downloads. Without it the
+        # in-app preview spins forever (download still works) — the moov
+        # lands at the end of a plain concat.
+        "-movflags", "+faststart",
+        final_output_video,
+    ])
+
+
 def render(input_video, final_output_video, aspect_ratio, content_ranges=None,
-           force_strategy=None, crop_overrides=None):
+           force_strategy=None, crop_overrides=None, watermark=False):
     """Full v2 reframe of one clip. Raises on failure (caller falls back).
 
-    ``content_ranges`` comes from screencast_layout.detect_content_ranges() on
-    the SOURCE video, already translated into this clip's timeline. None or []
-    means the layout never triggers, which is the default.
+    ``content_ranges`` pins which stretches (in this clip's timeline) show a
+    screen, in screencast_layout's range shape. Left empty, the clip asks for
+    them itself whenever the screencast layout is on for the job
+    (``screen_ranges``); with the layout off nothing triggers, the default.
 
     ``force_strategy`` ('WIDE' / 'TRACK' / any layout the render loop knows)
     applies that layout to EVERY scene, skipping the classifier and the layout
@@ -358,6 +657,10 @@ def render(input_video, final_output_video, aspect_ratio, content_ranges=None,
     listed keep the automatic camera, so correcting one bad shot never disturbs
     the ones the tracker got right. Applied AFTER force_strategy: a per-scene
     hand position always beats the whole-clip choice for the scenes it names.
+
+    ``watermark`` overlays the free-plan mark (main.watermark_filter) in every
+    segment's own encode, instead of main.apply_watermark re-encoding the
+    finished clip once more.
     """
     import main as m
     content_ranges = content_ranges or []
@@ -395,6 +698,8 @@ def render(input_video, final_output_video, aspect_ratio, content_ranges=None,
               f"passing it through, no reframe")
     else:
         strategies = m.analyze_scenes_strategy(input_video, scenes)
+        if not content_ranges and screencast_layout.ENABLED:
+            content_ranges = screen_ranges(input_video, scenes, fps, strategies)
 
     # SPLIT is an upgrade applied on top of the TRACK/GENERAL verdict, keyed by
     # the scene's START FRAME rather than its index: scene_frame_ranges() drops
@@ -453,24 +758,48 @@ def render(input_video, final_output_video, aspect_ratio, content_ranges=None,
             print(f"   📹 Webcam inset at {inset}")
 
     screencasts = {}
+    focus_crops = {}
+    insets = {}
     wide_count = 0
     inset_count = 0
     if content_ranges:
         for scene_idx, (plan, centre) in screencast_layout.detect_screencast_scenes(
                 input_video, scenes, strategies, content_ranges).items():
             # An inset beats both screen plans: it is the only one that can show
-            # the screen whole AND the person at a readable size.
-            if inset:
+            # the screen whole AND the person at a readable size. But only on
+            # the scenes the camera is actually in: the box is found once per
+            # clip, and a tutorial clip mixes shots with and without it.
+            start_f, end_f = scene_boundaries[scene_idx]
+            box = None
+            if inset and camera_inset.present_in_scene(
+                    input_video, inset, start_f, end_f):
+                box = inset
+            elif plan == 'WIDE' and screencast_layout.presenter_cam(
+                    start_f / fps, end_f / fps, content_ranges):
+                # A full screen with the presenter's camera floating over it
+                # anywhere, not only in a corner: show it below, enlarged,
+                # instead of leaving it a thumbnail inside the screen. Only
+                # where the shot check saw a live webcam window: geometry alone
+                # also enlarged game characters, photos on slides and cover art.
+                box = camera_inset.detect_in_scene(input_video, start_f, end_f)
+            if box:
                 plan, centre = 'INSET', None
             strategies[scene_idx] = plan
-            start_f = scene_boundaries[scene_idx][0]
             splits.pop(start_f, None)
             if plan == 'SCREENCAST':
-                screencasts[start_f] = centre
+                screencasts[start_f] = centre  # (face centre, content columns)
             elif plan == 'INSET':
+                insets[start_f] = box
                 inset_count += 1
             else:
                 wide_count += 1
+                crop = screencast_layout.focus_crop(
+                    orig_w, orig_h, out_w, out_h, centre)
+                if not crop:
+                    crop = _wide_crop(input_video, orig_w, orig_h, out_w, out_h,
+                                      start_f, end_f, centre)
+                if crop:
+                    focus_crops[start_f] = crop
     if screencasts:
         print(f"   🖥️ SCREENCAST layout on {len(screencasts)} scene(s)")
     if wide_count:
@@ -522,24 +851,39 @@ def render(input_video, final_output_video, aspect_ratio, content_ranges=None,
     ranges = scene_frame_ranges(scene_boundaries, strategies, len(xs))
     if not ranges:
         raise RuntimeError("no usable scene ranges")
+    logo = m.watermark_logo_path() if watermark else None
+    if logo and not os.path.exists(logo):
+        print(f"   ⚠️ Watermark asset missing ({logo}); clip kept unmarked.")
+        logo = None
+
     workdir = tempfile.mkdtemp(prefix="reframe_v2_")
-    segments = []
     try:
+        # One spec per scene: (ss, dur, graph, crop boxes). TRACK scenes carry
+        # their per-frame crop boxes for the GPU render and a sendcmd file for
+        # the ffmpeg one; every other layout is its filtergraph.
+        specs = []
+        bands = {}  # WIDE scene start -> (top, bottom) of its picture
         for idx, (start_f, end_f, strategy) in enumerate(ranges):
-            seg_path = os.path.join(workdir, f"seg_{idx:03d}.mp4")
             ss = start_f / fps
             dur = (end_f - start_f) / fps
+            boxes = None
 
             if strategy == 'INSET':
                 graph = camera_inset.inset_filtergraph(
-                    orig_w, orig_h, out_w, out_h, inset)
+                    orig_w, orig_h, out_w, out_h, insets.get(start_f, inset))
             elif strategy == 'SCREENCAST':
                 graph = screencast_layout.screencast_filtergraph(
-                    orig_w, orig_h, out_w, out_h, screencasts[start_f])
+                    orig_w, orig_h, out_w, out_h, *screencasts[start_f])
+            elif strategy == 'WIDE' and start_f in focus_crops:
+                graph = screencast_layout.focus_filtergraph(
+                    orig_w, orig_h, out_w, out_h, focus_crops[start_f])
+                bands[start_f] = screencast_layout.content_band(
+                    out_h, screencast_layout.crop_content_height(
+                        orig_h, out_w, out_h, focus_crops[start_f][1]))
             elif strategy == 'WIDE':
-                graph = general_filtergraph(
-                    out_w, out_h,
-                    full_width_content_height(orig_w, orig_h, out_w))
+                fg_h = full_width_content_height(orig_w, orig_h, out_w)
+                graph = general_filtergraph(out_w, out_h, fg_h)
+                bands[start_f] = screencast_layout.content_band(out_h, fg_h)
             elif strategy == 'SPLIT':
                 left, right = splits[start_f]
                 graph = split_layout.split_filtergraph(
@@ -567,6 +911,7 @@ def render(input_video, final_output_video, aspect_ratio, content_ranges=None,
                     # instead of trimming both ends.
                     crop_y = max(0, (orig_h - crop_h) // 2)
                     init = f"w={crop_w}:h={crop_h}:x={seg_xs[0]}:y={crop_y}"
+                    boxes = [(crop_w, crop_h, x, crop_y) for x in seg_xs]
                 with open(cmd_path, "w") as f:
                     f.write("\n".join(lines) + "\n")
                 graph = (
@@ -574,39 +919,18 @@ def render(input_video, final_output_video, aspect_ratio, content_ranges=None,
                     f"crop@c={init},"
                     f"scale={out_w}:{out_h},setsar=1[v]"
                 )
+            specs.append((ss, dur, graph, boxes))
 
-            _run([
-                "ffmpeg", "-y", "-loglevel", "error",
-                "-ss", f"{ss:.4f}", "-t", f"{dur:.4f}", "-i", input_video,
-                "-filter_complex", graph, "-map", "[v]",
-                *video_encode_args(QUALITY_FAST), "-an", seg_path,
-            ])
-            segments.append(seg_path)
-
-        list_path = os.path.join(workdir, "concat.txt")
-        with open(list_path, "w") as f:
-            f.write(concat_list_content(segments))
-
-        # Concat video segments (stream copy) + audio straight from the clip.
-        _run([
-            "ffmpeg", "-y", "-loglevel", "error",
-            "-f", "concat", "-safe", "0", "-i", list_path,
-            "-i", input_video,
-            "-map", "0:v:0", "-map", "1:a:0?",
-            "-c:v", "copy", "-c:a", "copy", *METADATA_SCRUB,
-            # +faststart moves the moov atom to the front so the browser <video>
-            # can start playing before the whole file downloads. Without it the
-            # in-app preview spins forever (download still works) — the moov
-            # lands at the end of a plain concat.
-            "-movflags", "+faststart",
-            final_output_video,
-        ])
+        encode_scenes(input_video, specs, orig_w, orig_h, out_w, out_h, fps,
+                      workdir, logo, final_output_video)
     finally:
         import shutil
         shutil.rmtree(workdir, ignore_errors=True)
 
-    # Tell the caption pass which stretches are stacked (see layout_ranges).
+    # Tell the caption pass which stretches are stacked, and the hook where a
+    # WIDE picture sits (see layout_ranges).
     layout_ranges.write(final_output_video,
-                        [(s / fps, e / fps, strategy) for s, e, strategy in ranges])
+                        [(s / fps, e / fps, strategy, bands.get(s))
+                         for s, e, strategy in ranges])
     print(f"   ✅ Clip saved to {final_output_video}")
     return True

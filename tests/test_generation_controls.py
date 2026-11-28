@@ -74,8 +74,11 @@ class TestPromptTemplates:
         assert "2–4 MOST engaging" in text
         assert "10 to 20 seconds" in text
 
-    def test_score_template_needs_no_new_keys(self):
-        # The scoring pass has no count/duration placeholders; formatting with
-        # only its classic keys must keep working.
-        _templates()["SCORE_PROMPT_TEMPLATE"].format(
+    def test_score_template_ranks_every_window(self):
+        # The pass used to SELECT ("choose up to 3 windows from this batch"),
+        # which capped the shortlist at 3 * n_batches and threw away the
+        # ranking it was computing. It scores everything now.
+        text = _templates()["SCORE_PROMPT_TEMPLATE"].format(
             video_duration=100, language="es", windows_json="[]")
+        assert "Score EVERY window" in text
+        assert "up to 3 windows" not in text

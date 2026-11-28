@@ -47,10 +47,27 @@ def main() -> int:
         shutil.copyfile(cookie_source, temp_cookies.name)
 
     result = {"max_height": 0, "mode": None, "cookies_invalid": False, "duration": 0}
+    # Same gates as the metering probe and the download (app.py also checks
+    # before spawning this): a URL on a private / tailnet address, or a
+    # YouTube page that is not one video, never reaches yt-dlp. The empty
+    # result is the fail-open "unknown", so the caller carries on and the
+    # real probe / download refuse the URL with their own message.
+    try:
+        from security_utils import assert_public_url
+        from yt_clients import youtube_non_video_reason
+        assert_public_url(args.url)
+        if youtube_non_video_reason(args.url):
+            raise ValueError("not a single video")
+    except Exception:
+        if temp_cookies:
+            os.unlink(temp_cookies.name)
+        print(json.dumps(result))
+        return 0
     try:
         from security_utils import assert_public_url
         assert_public_url(args.url)
         import yt_dlp
+        import ssrf_guard
 
         warnings = []
 
@@ -67,28 +84,41 @@ def main() -> int:
             def error(self, msg):
                 warnings.append(str(msg))
 
-        cookies_path = temp_cookies.name if temp_cookies else None
+        import contextlib
+        import yt_account
+        # One of the configured accounts; a cookies file next to the script
+        # (self-host) when the environment has none.
+        session = yt_account.Session()
+        cookies_path = session.path or (temp_cookies.name if temp_cookies else None)
         base_opts = {
             'quiet': True,
             'no_warnings': False,
             'logger': _CollectLogger(),
             'socket_timeout': 20,
             'retries': 2,
-            'noplaylist': True,
             'cachedir': False,
+            # A watch?v=X&list=... link is the one video; without this
+            # yt-dlp walks the whole list (see cloud/metering.py).
+            'noplaylist': True,
         }
         # yt-dlp's default player clients (tv_downgraded/web_safari with
         # cookies, android_vr/web_safari anonymous) are the ones that still
         # serve HD without PO tokens — never override them here.
         attempts = []
-        if cookies_path:
+        # Not while YouTube has the account limited (yt_account): the request
+        # would fail and count against it again.
+        if cookies_path and yt_account.cooling_down() <= 0:
             attempts.append(("cookie-auth", {**base_opts, 'cookiefile': cookies_path}))
         attempts.append(("anonymous", {**base_opts, 'cookiefile': None}))
 
         for mode, opts in attempts:
+            authed = mode == "cookie-auth"
             try:
-                with yt_dlp.YoutubeDL(opts) as ydl:
-                    info = ydl.extract_info(args.url, download=False)
+                with (session.request() if authed else contextlib.nullcontext()):
+                    with ssrf_guard.guarded(), yt_dlp.YoutubeDL(opts) as ydl:
+                        info = ydl.extract_info(args.url, download=False)
+                if authed:
+                    session.ok()
                 formats = info.get('formats') or []
                 heights = [
                     f.get('height') or 0
@@ -105,7 +135,9 @@ def main() -> int:
                     result["duration"] = int(info.get('duration') or 0)
                 if result["max_height"] >= 1080:
                     break
-            except Exception:
+            except Exception as e:
+                if authed and yt_account.is_rate_limit(str(e)):
+                    session.limited()
                 continue
 
         result["cookies_invalid"] = any("no longer valid" in w for w in warnings)

@@ -4,8 +4,8 @@ import {
     AlertCircle, Undo2, Redo2, ChevronsRight, ChevronsLeft,
     PanelLeft, PanelLeftClose, Film,
 } from 'lucide-react';
-import { getApiUrl } from '../config';
-import { apiFetch, apiJson, QuotaError } from '../lib/api';
+import { getApiUrl, withParam } from '../config';
+import { apiFetch, apiJson, QuotaError, openQuotaWall } from '../lib/api';
 import { useAuth } from '../contexts/AuthContext';
 
 // Full-screen clip editor: shows WHICH source segments a clip was cut from,
@@ -866,13 +866,14 @@ export default function ClipEditor({ jobId, clipIndex, clipTitle, onClose, onRer
             setRenderedFraming(data.framing || 'auto');
             setFraming(data.framing || 'auto');
             dispatch({ type: 'init', segments: data.recipe.segments.map((s) => ({ ...s })) });
-            setPreviewUrl(`${getApiUrl(data.new_video_url)}?t=${Date.now()}`);
+            setPreviewUrl(withParam(getApiUrl(data.new_video_url), 't', Date.now()));
             onRerendered?.(clipIndex, data);
             refreshMe();
         } catch (e) {
             if (e instanceof QuotaError) {
                 refreshMe();
                 setRenderError(`not enough minutes left (needs ${e.minutesRequired ?? '?'}, ${e.minutesRemaining ?? 0} remaining)`);
+                openQuotaWall(e, 'clip_editor');
             } else {
                 setRenderError(e.message || 're-render failed');
             }

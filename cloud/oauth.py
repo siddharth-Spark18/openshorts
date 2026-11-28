@@ -2,8 +2,10 @@
 
 GET /api/auth/google           -> redirect to Google consent
 GET /api/auth/google/callback  -> exchange code, upsert user, redirect to the
-                                  frontend with the JWT in the URL hash (never
-                                  reaches server logs).
+                                  frontend with a single-use login code in the
+                                  URL hash; the dashboard trades it for the JWT
+                                  at POST /api/auth/exchange with the verifier
+                                  it kept when the sign-in started (cc=).
 
 Registration happens in ``register()`` (called from setup_sync) only when Google
 credentials are configured; otherwise the endpoints 404.
@@ -16,9 +18,9 @@ from starlette.responses import RedirectResponse
 from sqlalchemy import select
 
 from .config import settings
-from . import database, email_policy
+from . import database, email_policy, evidence
 from .models import User
-from .auth import issue_jwt
+from .auth import issue_jwt, valid_challenge, create_login_code, is_banned, lock_signup_email
 
 router = APIRouter()
 oauth = None
@@ -44,10 +46,35 @@ def _now():
     return datetime.now(timezone.utc)
 
 
+# Dashboards loaded before the code exchange existed start the sign-in
+# without cc= and only understand ?token=. They get it until this date (an
+# open tab, a sign-in started across the deploy); after it they are asked to
+# sign in again from a fresh page.
+LEGACY_TOKEN_REDIRECT_UNTIL = os.environ.get(
+    "LEGACY_TOKEN_REDIRECT_UNTIL", "2026-11-12T00:00:00+00:00")
+
+
+def _legacy_token_redirect_open() -> bool:
+    try:
+        until = datetime.fromisoformat(LEGACY_TOKEN_REDIRECT_UNTIL.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if until.tzinfo is None:
+        until = until.replace(tzinfo=timezone.utc)
+    return _now() < until
+
+
 @router.get("/api/auth/google")
 async def google_login(request: Request):
     if oauth is None:
         raise HTTPException(status_code=404, detail="Google login not configured")
+    # The dashboard's PKCE-style challenge, kept in the signed session cookie
+    # until the callback binds the login code to it.
+    challenge = request.query_params.get("cc")
+    if valid_challenge(challenge):
+        request.session["login_cc"] = challenge
+    else:
+        request.session.pop("login_cc", None)
     # Explicit override for setups where the Host header doesn't match a
     # Google-registered URI (e.g. local dev through the Vite proxy, where the
     # backend sees the internal Docker host "backend:8000").
@@ -83,9 +110,37 @@ async def google_callback(request: Request):
     google_sub = userinfo.get("sub")
     if not email:
         return RedirectResponse(f"{settings.frontend_url}/#/auth/callback?error=noemail")
+    # An unverified address would sign in to (and merge with) whatever
+    # account owns that email here.
+    if userinfo.get("email_verified") is False:
+        return RedirectResponse(f"{settings.frontend_url}/#/auth/callback?error=noemail")
 
+    try:
+        user_id, user_email = await _google_user(email, google_sub)
+    except _Suspended:
+        return RedirectResponse(f"{settings.frontend_url}/#/auth/callback?error=suspended")
+    evidence.record_event(user_id=user_id, email=user_email, kind="login",
+                          method="google", request=request)
+
+    challenge = request.session.pop("login_cc", None)
+    if valid_challenge(challenge):
+        code = await create_login_code(user_id, challenge)
+        return RedirectResponse(f"{settings.frontend_url}/#/auth/callback?code={code}")
+    if _legacy_token_redirect_open():
+        jwt_token = issue_jwt(user_id, user_email)
+        return RedirectResponse(f"{settings.frontend_url}/#/auth/callback?token={jwt_token}")
+    return RedirectResponse(f"{settings.frontend_url}/#/auth/callback?error=retry")
+
+
+class _Suspended(Exception):
+    """The Google account maps to a banned account (cloud/support_ops.py)."""
+
+
+async def _google_user(email, google_sub):
+    """Find (or create, or link) the account for a Google sign-in."""
     async with database.session() as session:
         async with session.begin():
+            await lock_signup_email(session, email)
             user = (await session.execute(
                 select(User).where(User.google_sub == google_sub)
             )).scalar_one_or_none()
@@ -95,7 +150,9 @@ async def google_callback(request: Request):
                     select(User).where(User.email == email)
                 )).scalar_one_or_none()
                 if user is None:
-                    user = User(email=email, google_sub=google_sub, last_login_at=_now())
+                    from .account import free_plan_denial_for_signup
+                    user = User(email=email, google_sub=google_sub, last_login_at=_now(),
+                                free_plan_denied=await free_plan_denial_for_signup(session, email))
                     session.add(user)
                     await session.flush()
                 else:
@@ -103,7 +160,7 @@ async def google_callback(request: Request):
                     user.last_login_at = _now()
             else:
                 user.last_login_at = _now()
-            user_id, user_email = user.id, user.email
-
-    jwt_token = issue_jwt(user_id, user_email)
-    return RedirectResponse(f"{settings.frontend_url}/#/auth/callback?token={jwt_token}")
+            if is_banned(user):
+                # Nothing above is committed: the ban stops the sign-in whole.
+                raise _Suspended()
+            return user.id, user.email

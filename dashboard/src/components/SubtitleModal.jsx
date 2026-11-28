@@ -6,6 +6,8 @@ import Modal from './ui/Modal';
 import SegmentedControl from './ui/SegmentedControl';
 
 const FONT_OPTIONS = [
+    { value: 'Anton', label: 'Anton' },
+    { value: 'Montserrat ExtraBold', label: 'Montserrat' },
     { value: 'Verdana', label: 'Verdana' },
     { value: 'Arial', label: 'Arial' },
     { value: 'Impact', label: 'Impact' },
@@ -24,7 +26,10 @@ const COLOR_PRESETS = [
 ];
 
 const HIGHLIGHT_PRESETS = [
+    { color: '#FFE500', label: 'Yellow' },
     { color: '#FFDD00', label: 'Gold' },
+    { color: '#A3FF12', label: 'Lime' },
+    { color: '#7C3AED', label: 'Purple' },
     { color: '#FF4444', label: 'Red' },
     { color: '#00FF88', label: 'Green' },
     { color: '#00BBFF', label: 'Blue' },
@@ -34,9 +39,36 @@ const HIGHLIGHT_PRESETS = [
 const ANIMATION_OPTIONS = [
     { value: 'pop', label: 'Pop' },
     { value: 'word-highlight', label: 'Glow' },
-    { value: 'karaoke', label: 'Karaoke' },
+    { value: 'karaoke', label: 'Box' },
     { value: 'none', label: 'None' },
 ];
+
+// Preview animation -> the effect burned server-side, so what the modal
+// plays is what the clip gets. 'karaoke' in the preview is a box behind the
+// active word, which is the 'highlight' effect.
+const ANIMATION_TO_EFFECT = { pop: 'pop', 'word-highlight': 'glow', karaoke: 'highlight', none: 'none' };
+const EFFECT_TO_ANIMATION = { pop: 'pop', glow: 'word-highlight', highlight: 'karaoke', box: 'karaoke', none: 'none' };
+
+// Font size in the units /api/subtitle takes. S is what every clip ships
+// with (subtitles.AUTO_CAPTION_STYLE font_size 40), so opening the modal and
+// applying never resizes the captions.
+const SIZE_OPTIONS = [
+    { value: 40, label: 'S' },
+    { value: 44, label: 'M' },
+    { value: 56, label: 'L' },
+    { value: 70, label: 'XL' },
+];
+
+// Characters per line at size 44 (M), per font: Anton is condensed, Montserrat
+// wide. Bigger text gets proportionally fewer. The server also measures the
+// real width (subtitles.line_fitter), so a block is always one line.
+const LINE_CHARS = { Anton: 16, 'Montserrat ExtraBold': 9, Impact: 16 };
+const lineBudget = (fontName, fontSize, oneWord) =>
+    oneWord ? 1 : Math.max(6, Math.round((LINE_CHARS[fontName] || 14) * 44 / fontSize));
+
+// libass sizes text against PlayResY 288 (subtitles.generate_ass): one unit
+// there is ~3.85 CSS px in the 1080x1920 preview, measured on burned frames.
+const PREVIEW_PX_PER_UNIT = 3.85;
 
 const POSITION_OPTIONS = [
     { value: 'top', label: 'top' },
@@ -47,6 +79,16 @@ const POSITION_OPTIONS = [
 // Ready-made caption looks burned server-side as karaoke ASS (word highlight):
 // dimmed base text + strong active word, optional glow/pop/box effect.
 const CAPTION_PRESETS = [
+    // What every clip ships with (subtitles.AUTO_CAPTION_STYLE).
+    { id: 'default', label: 'Default',  style: 'karaoke', effect: 'pop',       highlightColor: '#FFE500', baseOpacity: 1.0, uppercase: true,  fontName: 'Anton', borderWidth: 2, fontSize: 40 },
+    // Trending short-form looks (2026): word-by-word build-up, a box behind
+    // the active word, one big word at a time, and the clean shadow-only look.
+    { id: 'hormozi', label: 'Hormozi',  style: 'karaoke', effect: 'pop',       highlightColor: '#FFE500', baseOpacity: 1.0, uppercase: true,  fontName: 'Montserrat ExtraBold', borderWidth: 4, shadow: 2, reveal: true, fontSize: 44 },
+    { id: 'pill',    label: 'Pill',     style: 'karaoke', effect: 'highlight', highlightColor: '#7C3AED', baseOpacity: 1.0, uppercase: true,  fontName: 'Montserrat ExtraBold', borderWidth: 3, fontSize: 44 },
+    { id: 'oneword', label: 'One word', style: 'karaoke', effect: 'pop',       highlightColor: '#FFFFFF', baseOpacity: 1.0, uppercase: true,  fontName: 'Anton', borderWidth: 5, oneWord: true, fontSize: 70 },
+    { id: 'clean',   label: 'Clean',    style: 'karaoke', effect: 'none',      highlightColor: '#FFFFFF', baseOpacity: 0.7, uppercase: false, fontName: 'Montserrat ExtraBold', borderWidth: 0, shadow: 2, fontSize: 34 },
+    { id: 'cine',    label: 'Cine',     style: 'karaoke', effect: 'none',      highlightColor: '#FF5A1F', baseOpacity: 0.8, uppercase: false, fontName: 'Montserrat ExtraBold', borderWidth: 0, shadow: 2, fontSize: 36 },
+    { id: 'lime',    label: 'Lime box', style: 'karaoke', effect: 'highlight', highlightColor: '#A3FF12', baseOpacity: 1.0, uppercase: true,  fontName: 'Montserrat ExtraBold', borderWidth: 3, fontSize: 44 },
     { id: 'tiktok',  label: 'TikTok',     style: 'karaoke', effect: 'none', highlightColor: '#FE2C55', baseOpacity: 0.75, uppercase: false, fontName: 'Verdana', borderWidth: 2 },
     { id: 'reels',   label: 'Reels',      style: 'karaoke', effect: 'none', highlightColor: '#E1306C', baseOpacity: 0.7,  uppercase: false, fontName: 'Verdana', borderWidth: 2 },
     { id: 'shorts',  label: 'Shorts Pop', style: 'karaoke', effect: 'pop',  highlightColor: '#FF0000', baseOpacity: 0.7,  uppercase: false, fontName: 'Verdana', borderWidth: 2 },
@@ -60,30 +102,48 @@ const CAPTION_PRESETS = [
     { id: 'classic', label: 'Classic',    style: 'classic', effect: 'none', highlightColor: '#FFD700', baseOpacity: 1.0,  uppercase: false, fontName: 'Verdana', borderWidth: 2 },
 ];
 
+// Mirrors subtitles._luminance (Rec. 601).
+const luminance = (hex) => {
+    const m = /^#?([0-9a-fA-F]{6})$/.exec(hex || '');
+    if (!m) return 1;
+    const [r, g, b] = [0, 2, 4].map((i) => parseInt(m[1].slice(i, i + 2), 16));
+    return (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+};
+
 const swatchClass = (selected) =>
     `w-6 h-6 rounded-full transition-all ${selected
         ? 'ring-2 ring-[color:var(--color-accent)] ring-offset-2 ring-offset-[color:var(--color-paper-2)]'
         : 'ring-1 ring-[color:var(--color-rule-2)] hover:ring-[color:var(--color-accent)]'}`;
 
 export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll, onRemove, isProcessing, videoUrl, jobId, clipIndex, existingHook, bulkCount = 0, bulkProgress }) {
+    // Opens on the look the clip already has (the Default preset), so
+    // "apply" without touching anything changes nothing.
     const [position, setPosition] = useState('bottom');
-    const [fontSize] = useState(24);
-    const [fontName, setFontName] = useState('Verdana');
+    const [fontSize, setFontSize] = useState(40);
+    const [fontName, setFontName] = useState('Anton');
     const [fontColor, setFontColor] = useState('#FFFFFF');
-    const [highlightColor, setHighlightColor] = useState('#FFDD00');
+    const [highlightColor, setHighlightColor] = useState('#FFE500');
     const [borderColor, setBorderColor] = useState('#000000');
     const [borderWidth, setBorderWidth] = useState(2);
     const [bgColor, setBgColor] = useState('#000000');
     const [bgOpacity, setBgOpacity] = useState(0.0);
-    const [animation, setAnimation] = useState('pop');
+    const [animation, setAnimationState] = useState('pop');
     const [showTextEditor, setShowTextEditor] = useState(false);
 
     // Karaoke (server-side ASS burn) state
-    const [style, setStyle] = useState('classic'); // classic | karaoke
-    const [effect, setEffect] = useState('none'); // none | glow | pop | box
+    const [style, setStyle] = useState('karaoke'); // classic | karaoke
+    const [effect, setEffect] = useState('pop'); // none | glow | pop | box | highlight
     const [baseOpacity, setBaseOpacity] = useState(1.0);
-    const [uppercase, setUppercase] = useState(false);
-    const [activePreset, setActivePreset] = useState(null);
+    const [uppercase, setUppercase] = useState(true);
+    const [reveal, setReveal] = useState(false);
+    const [shadow, setShadow] = useState(0);
+    const [oneWord, setOneWord] = useState(false);
+    const [activePreset, setActivePreset] = useState('default');
+
+    const setAnimation = (value) => {
+        setAnimationState(value);
+        if (style === 'karaoke') setEffect(ANIMATION_TO_EFFECT[value] || 'none');
+    };
 
     const applyPreset = (p) => {
         setActivePreset(p.id);
@@ -96,9 +156,16 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
         setBorderWidth(p.borderWidth);
         setFontColor('#FFFFFF');
         setBgOpacity(0);
-        // Keep the Remotion preview roughly in sync with the burned look
-        setAnimation(p.style === 'karaoke' ? (p.effect === 'pop' ? 'pop' : p.effect === 'glow' ? 'word-highlight' : 'karaoke') : 'none');
+        setReveal(!!p.reveal);
+        setShadow(p.shadow || 0);
+        setOneWord(!!p.oneWord);
+        if (p.fontSize) setFontSize(p.fontSize);
+        setAnimationState(p.style === 'karaoke' ? (EFFECT_TO_ANIMATION[p.effect] || 'none') : 'none');
     };
+
+    const maxChars = lineBudget(fontName, fontSize, oneWord);
+    // Same block duration as the auto captions (AUTO_CAPTION_STYLE).
+    const maxDuration = 1.4;
 
     // Remotion preview state
     const [captions, setCaptions] = useState([]);
@@ -158,9 +225,11 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
     const subtitleConfig = {
         captions,
         position,
+        maxChars,
+        maxDurationMs: maxDuration * 1000,
         style: {
             fontFamily: fontName,
-            fontSize: fontSize * 2.2, // Scale up for 1080p (modal fontSize is for small preview)
+            fontSize: Math.round(fontSize * 0.85 * PREVIEW_PX_PER_UNIT),
             fontColor,
             highlightColor,
             borderColor,
@@ -171,6 +240,10 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
             // Karaoke look reflected live in the playable preview.
             baseOpacity: style === 'karaoke' ? baseOpacity : 1,
             uppercase: style === 'karaoke' ? uppercase : false,
+            reveal: style === 'karaoke' && reveal,
+            shadow: style === 'karaoke' ? shadow : 0,
+            // Text on the active-word box: black on a light box, as burned.
+            highlightTextColor: luminance(highlightColor) > 0.6 ? '#000000' : fontColor,
         },
     };
 
@@ -296,6 +369,38 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
                             />
                         </div>
 
+                        {/* Size */}
+                        <div>
+                            <p className="eyebrow mb-2">Size</p>
+                            <SegmentedControl
+                                options={SIZE_OPTIONS}
+                                value={fontSize}
+                                onChange={setFontSize}
+                                size="sm"
+                            />
+                        </div>
+
+                        {style === 'karaoke' && (
+                            <div className="space-y-3">
+                                <div className="flex items-center justify-between">
+                                    <span className="readout">One word at a time</span>
+                                    <label className="relative inline-flex items-center cursor-pointer">
+                                        <input type="checkbox" checked={oneWord} onChange={(e) => setOneWord(e.target.checked)} className="sr-only peer" />
+                                        <div className="w-8 h-4 rounded-full bg-paper3 peer-checked:bg-brass transition-colors after:content-[''] after:absolute after:top-0 after:left-0 after:h-4 after:w-4 after:rounded-full after:bg-ink after:transition-all peer-checked:after:translate-x-full"></div>
+                                    </label>
+                                </div>
+                                {!oneWord && (
+                                    <div className="flex items-center justify-between">
+                                        <span className="readout">Reveal word by word</span>
+                                        <label className="relative inline-flex items-center cursor-pointer">
+                                            <input type="checkbox" checked={reveal} onChange={(e) => setReveal(e.target.checked)} className="sr-only peer" />
+                                            <div className="w-8 h-4 rounded-full bg-paper3 peer-checked:bg-brass transition-colors after:content-[''] after:absolute after:top-0 after:left-0 after:h-4 after:w-4 after:rounded-full after:bg-ink after:transition-all peer-checked:after:translate-x-full"></div>
+                                        </label>
+                                    </div>
+                                )}
+                            </div>
+                        )}
+
                         {/* Animation Style (new) */}
                         <div>
                             <p className="eyebrow mb-2">Animation</p>
@@ -324,6 +429,7 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
                                         value={editableText}
                                         onChange={(e) => handleTextEdit(e.target.value)}
                                         rows={5}
+                                        dir="auto"
                                         className="input-field resize-none leading-relaxed animate-fade"
                                         placeholder="Edit subtitle text..."
                                     />
@@ -453,6 +559,7 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
                                 position, fontSize, fontName, fontColor, borderColor, borderWidth, bgColor, bgOpacity,
                                 // Karaoke burn (server-side ASS render)
                                 style, effect, baseOpacity, uppercase, highlightColor,
+                                reveal: !oneWord && reveal, shadow, maxChars, maxDuration,
                                 // Remotion data
                                 remotion: useRemotionPreview ? subtitleConfig : null,
                                 captions: textEdited ? captions : null,

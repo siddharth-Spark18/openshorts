@@ -150,7 +150,16 @@ Be thorough. Use REAL data from your search results, not made-up information."""
 
 
 def scrape_website(url: str) -> dict:
-    """Scrape a SaaS website to extract key content for analysis."""
+    """Scrape a SaaS website to extract key content for analysis.
+
+    Only public addresses resolve while it runs (ssrf_guard): the per-hop
+    checks below look the host up once, the connection looks it up again."""
+    import ssrf_guard
+    with ssrf_guard.guarded():
+        return _scrape_website(url)
+
+
+def _scrape_website(url: str) -> dict:
     from bs4 import BeautifulSoup
     from security_utils import assert_public_url
 
@@ -1073,10 +1082,17 @@ def transcribe_audio_for_subs(audio_path: str) -> list:
     Transcribe audio with word-level timestamps via the configured ASR backend.
     Returns list of {"word": str, "start": float, "end": float}.
     """
-    from transcribe_backends import transcribe_media
+    from transcribe_backends import transcribe_media, release_models
 
     print(f"[SaaSShorts] 🎙️ Transcribing audio for subtitles...")
-    transcript = transcribe_media(audio_path)
+    try:
+        transcript = transcribe_media(audio_path)
+    finally:
+        # This runs inside the API process, like the thumbnail studio and
+        # the dubbed-subtitle path: the models must not stay resident
+        # (transcribe_backends.release_models). Measured 17-sep-2026, 30 min
+        # after a deploy: one SaaSShorts job left uvicorn holding 5.1 GB.
+        release_models()
 
     words = [
         {"word": w["word"].strip(), "start": w["start"], "end": w["end"]}

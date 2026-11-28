@@ -41,7 +41,8 @@ from . import database, email_policy, storage
 from .models import (
     User, Subscription, CreditTopup, UsageLedger, MagicLinkToken,
     SignupAttribution, ApiKey, UploadPostProfile, UserVideo, ClipExpiryWarning,
-    Project, AccountDeletion, OAuthCode,
+    Project, AccountDeletion, OAuthCode, OAuthRefreshToken, AutopilotRun, AutopilotSettings,
+    LifecycleEmail, CancellationFeedback, OnboardingSurvey, LoginCode, EvidenceEvent,
 )
 
 # Every table that holds rows belonging to a user, child-first (clip_expiry_
@@ -55,7 +56,9 @@ from .models import (
 # foreign-key violation the first time a real user tries to leave.
 USER_OWNED_TABLES = (
     ClipExpiryWarning, UserVideo, Project, UsageLedger, CreditTopup,
-    Subscription, ApiKey, SignupAttribution, UploadPostProfile, OAuthCode,
+    Subscription, OAuthRefreshToken, ApiKey, SignupAttribution, UploadPostProfile, OAuthCode,
+    AutopilotRun, AutopilotSettings, LifecycleEmail, CancellationFeedback,
+    OnboardingSurvey, LoginCode, EvidenceEvent,
 )
 
 # The optional "why are you leaving" answer, as a closed list. It was a free
@@ -93,6 +96,28 @@ def email_fingerprint(email: str) -> str:
     return hashlib.sha256(email_policy.normalize_email(email).encode()).hexdigest()
 
 
+async def free_plan_denial_for_signup(session, email: str) -> Optional[str]:
+    """``User.free_plan_denied`` value for a brand-new account, or None.
+
+    An address whose account was erased in the last FREE_REDO_BLOCK_DAYS
+    comes back without the free allowance: the ledger is keyed by user id, so
+    a new row would otherwise start the month with a fresh 20 minutes. Paid
+    plans and top-ups work as for anyone. Matched on the same fingerprint the
+    erasure stored, so it needs no new personal data.
+    """
+    from .config import FREE_REDO_BLOCK_DAYS
+    if not email or FREE_REDO_BLOCK_DAYS <= 0:
+        return None
+    since = _now() - timedelta(days=FREE_REDO_BLOCK_DAYS)
+    hit = (await session.execute(
+        select(AccountDeletion.id).where(
+            AccountDeletion.email_sha256 == email_fingerprint(email),
+            AccountDeletion.deleted_at >= since,
+        ).limit(1)
+    )).scalar_one_or_none()
+    return "recreated_after_deletion" if hit is not None else None
+
+
 async def _session_user(request: Request):
     """The signed-in user, refusing API-key auth.
 
@@ -128,7 +153,7 @@ async def _cancel_subscriptions(user_id) -> Optional[str]:
         )).scalars())
 
     live = [r for r in rows if r.status not in ("canceled", "incomplete_expired")]
-    plan = live[0].plan if live else (rows[0].plan if rows else None)
+    plan = _plan_of(rows)
     for row in live:
         try:
             # cancel(), not cancel_at_period_end: the user is leaving now, and
@@ -143,6 +168,25 @@ async def _cancel_subscriptions(user_id) -> Optional[str]:
             # a hard error would trap the user: the one account that cannot be
             # deleted is the one Stripe already stopped billing.
             print(f"ℹ️  Subscription {row.stripe_subscription_id} already gone at Stripe: {e}")
+
+    # Our table keeps one row per user, but a customer can hold two live
+    # subscriptions at Stripe (a second checkout before the first webhook
+    # landed). The one without a row would keep charging a deleted account,
+    # so Stripe's own list is the authority here.
+    async with database.session() as session:
+        user = await session.get(User, user_id)
+        customer_id = user.stripe_customer_id if user else None
+    if customer_id:
+        done = {r.stripe_subscription_id for r in live}
+        listed = await asyncio.to_thread(lambda: stripe.Subscription.list(
+            customer=customer_id, status="all", limit=100))
+        for sub in listed.auto_paging_iter():
+            if sub["id"] in done or sub["status"] in ("canceled", "incomplete_expired"):
+                continue
+            try:
+                await asyncio.to_thread(lambda sid=sub["id"]: stripe.Subscription.cancel(sid))
+            except stripe.InvalidRequestError as e:
+                print(f"ℹ️  Subscription {sub['id']} already gone at Stripe: {e}")
     return plan
 
 
@@ -181,7 +225,8 @@ async def _erase_rows(user_id, email, stripe_customer_id, plan, r2_deleted, reas
     All-or-nothing on purpose: a half-erased account is worse than an un-erased
     one, because the user is told they are gone while some of their rows are
     not. Magic-link tokens are keyed by email rather than user id, so they need
-    their own statement on top of [USER_OWNED_TABLES].
+    their own statement on top of [USER_OWNED_TABLES]; so do evidence events,
+    which carry the email next to the user id.
 
     Returns whether this call is the one that removed the account. Two requests
     can race here — a double-click, or two tabs — and everything before this
@@ -197,6 +242,9 @@ async def _erase_rows(user_id, email, stripe_customer_id, plan, r2_deleted, reas
                     delete(model).where(model.user_id == user_id))
             await session.execute(
                 delete(MagicLinkToken).where(MagicLinkToken.email == email))
+            # Evidence rows also carry the address; catch any without a user_id.
+            await session.execute(
+                delete(EvidenceEvent).where(EvidenceEvent.email == email))
             result = await session.execute(delete(User).where(User.id == user_id))
             if result.rowcount == 0:
                 return False
@@ -231,8 +279,28 @@ async def delete_account(payload: DeleteAccountRequest, request: Request):
         raise HTTPException(status_code=400, detail=(
             "That doesn't match the email on this account."))
 
+    # Anything not in the closed list is dropped rather than rejected: a
+    # mismatched client must not be able to fail a deletion over a label.
+    reason = payload.reason if payload.reason in DELETION_REASONS else None
+    return await erase_account(user.id, reason=reason)
+
+
+def _plan_of(rows) -> Optional[str]:
+    """The plan for the deletion record: the live subscription's, else the last one's."""
+    live = [r for r in rows if r.status not in ("canceled", "incomplete_expired")]
+    return live[0].plan if live else (rows[0].plan if rows else None)
+
+
+async def erase_account(user_id, reason=None, *, cancel_stripe=True, notify_user=True):
+    """Erase one account: the steps of ``DELETE /api/account`` past its gate.
+
+    ``cancel_stripe=False`` and ``notify_user=False`` are for the support
+    back-office (cloud/support_ops.py), which handles Stripe itself and never
+    mails the customer from there; it refuses an account with a live
+    subscription row before calling this.
+    """
     async with database.session() as session:
-        row = await session.get(User, user.id)
+        row = await session.get(User, user_id)
         if row is None:
             raise HTTPException(status_code=404, detail="Account not found.")
         email, stripe_customer_id = row.email, row.stripe_customer_id
@@ -247,20 +315,26 @@ async def delete_account(payload: DeleteAccountRequest, request: Request):
         # on a missing file, in a tab whose session is about to end anyway.
         in_flight = (await session.execute(
             select(func.count(UsageLedger.id)).where(
-                UsageLedger.user_id == user.id, UsageLedger.status == "reserved")
+                UsageLedger.user_id == user_id, UsageLedger.status == "reserved")
         )).scalar_one()
+        sub_rows = list((await session.execute(
+            select(Subscription).where(Subscription.user_id == user_id)
+        )).scalars())
     if in_flight:
         raise HTTPException(status_code=409, detail=(
             "A video is still processing. Wait for it to finish, then delete "
             "your account."))
 
-    try:
-        plan = await _cancel_subscriptions(user.id)
-    except Exception as e:
-        print(f"⚠️  Account deletion aborted, Stripe cancel failed for {user.id}: {e}")
-        raise HTTPException(status_code=502, detail=(
-            "We couldn't cancel your subscription, so nothing was deleted. "
-            "Please try again, or email info@openshorts.app."))
+    if cancel_stripe:
+        try:
+            plan = await _cancel_subscriptions(user_id)
+        except Exception as e:
+            print(f"⚠️  Account deletion aborted, Stripe cancel failed for {user_id}: {e}")
+            raise HTTPException(status_code=502, detail=(
+                "We couldn't cancel your subscription, so nothing was deleted. "
+                "Please try again, or email info@openshorts.app."))
+    else:
+        plan = _plan_of(sub_rows)
 
     # Storage before the third party: if the bucket refuses, the only thing that
     # has changed so far is the cancelled subscription, and the error below can
@@ -269,9 +343,9 @@ async def delete_account(payload: DeleteAccountRequest, request: Request):
     if settings.r2_configured:
         try:
             r2_deleted = await asyncio.to_thread(
-                storage.delete_prefix, storage.user_prefix(user.id))
+                storage.delete_prefix, storage.user_prefix(user_id))
         except Exception as e:
-            print(f"⚠️  Account deletion aborted, R2 purge failed for {user.id}: {e}")
+            print(f"⚠️  Account deletion aborted, R2 purge failed for {user_id}: {e}")
             raise HTTPException(status_code=502, detail=(
                 "We couldn't reach the storage that holds your clips, so your "
                 "account was not deleted. Your subscription has already been "
@@ -281,23 +355,20 @@ async def delete_account(payload: DeleteAccountRequest, request: Request):
         try:
             # rmtree over gigabytes of video: off the event loop, or every other
             # request on the process waits for this user's disk to clear.
-            await asyncio.to_thread(_local_purge, user.id)
+            await asyncio.to_thread(_local_purge, user_id)
         except Exception as e:
-            print(f"⚠️  Local job purge failed for {user.id}: {e}")
+            print(f"⚠️  Local job purge failed for {user_id}: {e}")
 
-    await _delete_upload_post_profile(user.id)
+    await _delete_upload_post_profile(user_id)
 
-    # Anything not in the closed list is dropped rather than rejected: a
-    # mismatched client must not be able to fail a deletion over a label.
-    reason = payload.reason if payload.reason in DELETION_REASONS else None
     try:
         erased = await _erase_rows(
-            user.id, email, stripe_customer_id, plan, r2_deleted, reason)
+            user_id, email, stripe_customer_id, plan, r2_deleted, reason)
     except Exception as e:
         # The content is already gone; only the account row survived. Say that
         # rather than a bare 500 — the user needs to know a retry is safe and
         # that the account they can still sign into is now empty.
-        print(f"⚠️  Account row delete failed for {user.id} after purge: {e}")
+        print(f"⚠️  Account row delete failed for {user_id} after purge: {e}")
         raise HTTPException(status_code=500, detail=(
             "Your clips were deleted but we couldn't close the account itself. "
             "Please try again, or email info@openshorts.app."))
@@ -308,26 +379,29 @@ async def delete_account(payload: DeleteAccountRequest, request: Request):
         # A concurrent request got there first and has already sent the email.
         return {"deleted": True, "r2_objects_deleted": r2_deleted}
 
-    print(f"🗑️  Account erased: {user.id} (plan={plan}, r2_objects={r2_deleted})")
+    print(f"🗑️  Account erased: {user_id} (plan={plan}, r2_objects={r2_deleted})")
 
     # Everything below is after-the-fact and must never fail the deletion.
+    from . import owner_cache
+    owner_cache.forget_user(user_id)
     try:
         # OpenPanel only ever received the account uuid, never the address (see
         # cloud/analytics.py), and it expires those identifiers on its own
         # 13-month schedule — so this event adds no identity, it just makes the
         # one churn signal we cannot otherwise see countable.
         from . import analytics
-        analytics.track("AccountDeleted", user_id=user.id, plan=plan)
+        analytics.track("AccountDeleted", user_id=user_id, plan=plan)
     except Exception:
         pass
+    if notify_user:
+        try:
+            from .emails import send_account_deleted_email
+            await send_account_deleted_email(email)
+        except Exception as e:
+            print(f"⚠️  Goodbye email failed: {e}")
     try:
-        from .emails import send_account_deleted_email
-        await send_account_deleted_email(email)
-    except Exception as e:
-        print(f"⚠️  Goodbye email failed: {e}")
-    try:
-        from .alerts import send_telegram
-        await send_telegram(f"🗑️ Account deleted (plan: {plan or 'free'})")
+        from .alerts import notify
+        await notify(f"🗑️ Account deleted (plan: {plan or 'free'})")
     except Exception:
         pass
 

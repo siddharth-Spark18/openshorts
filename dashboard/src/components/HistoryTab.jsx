@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { Loader2, Download, Film, FolderOpen } from 'lucide-react';
 import { apiJson } from '../lib/api';
+import { track } from '../lib/analytics';
 
 // The signed-in user's saved video library (stored in R2). Private, signed links.
 // Videos are grouped by project (job); re-openable projects get a "reopen"
@@ -42,6 +43,7 @@ export default function HistoryTab({ onReopenProject }) {
     setReopenError('');
     try {
       await onReopenProject(jobId);
+      track('ProjectReopened');
     } catch (e) {
       setReopenError('Could not reopen this project. Please try again.');
       setReopening(null);
@@ -56,7 +58,7 @@ export default function HistoryTab({ onReopenProject }) {
 
   return (
     <div className="h-full overflow-y-auto p-8 max-w-5xl mx-auto animate-fade">
-      <p className="eyebrow mb-1.5">06 · HISTORY</p>
+      <p className="eyebrow mb-1.5">07 · HISTORY</p>
       <h1 className="font-display lowercase text-2xl text-ink mb-2">Your library</h1>
       <p className="text-muted text-sm mb-8 lowercase">
         All the shorts you've generated, saved while your plan is active. Kept for 7 days after your plan ends. Reopen a project to keep editing its clips.

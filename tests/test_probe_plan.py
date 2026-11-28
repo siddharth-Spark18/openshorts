@@ -66,3 +66,58 @@ class TestDirectFileProbe:
         monkeypatch.setattr(metering, "_ffprobe_url_seconds", boom)
         with pytest.raises(ValueError):
             metering.probe_url_minutes("https://cdn.example.com/v.mp4")
+
+
+class TestStaticsBotCheckedVerdict:
+    """When every static answers the bot-check and the paid proxy answers the
+    video, the probe leaves a one-shot verdict for the download to skip the
+    statics (main.plan_download_attempts skip_statics)."""
+
+    def _fake_ydl(self, monkeypatch, paid):
+        import types, sys, security_utils
+        monkeypatch.setattr(security_utils, "assert_public_url", lambda u: u)
+        class _YDL:
+            def __init__(self, opts): self.proxy = opts.get("proxy")
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def extract_info(self_, url, download=False):
+                if self_.proxy == paid:
+                    return {"extractor": "youtube", "duration": 600}
+                raise RuntimeError("ERROR: [youtube] x: Sign in to confirm you're not a bot.")
+        monkeypatch.setitem(sys.modules, "yt_dlp", types.SimpleNamespace(YoutubeDL=_YDL))
+
+    def test_verdict_is_left_once_and_popped(self, monkeypatch):
+        monkeypatch.setenv("STATIC_PROXY_URLS", "http://s1,http://s2")
+        monkeypatch.setenv("PROXY_URL", "http://paid")
+        monkeypatch.delenv("DIRECT_FIRST", raising=False)
+        monkeypatch.delenv("YOUTUBE_COOKIES", raising=False)
+        self._fake_ydl(monkeypatch, "http://paid")
+        metering._static_bot_verdicts.clear()
+        metering.pop_paid_probe_events()
+        url = "https://www.youtube.com/watch?v=eWpDO6w362Q"
+        assert metering.probe_url_minutes(url) == 10.0
+        assert metering.pop_statics_bot_checked(url) is True
+        assert metering.pop_statics_bot_checked(url) is False
+        assert metering.pop_paid_probe_events()  # the paid probe is still recorded
+
+    def test_no_verdict_when_a_static_failed_for_another_reason(self, monkeypatch):
+        monkeypatch.setenv("STATIC_PROXY_URLS", "http://s1")
+        monkeypatch.setenv("PROXY_URL", "http://paid")
+        monkeypatch.delenv("DIRECT_FIRST", raising=False)
+        monkeypatch.delenv("YOUTUBE_COOKIES", raising=False)
+        import types, sys, security_utils
+        monkeypatch.setattr(security_utils, "assert_public_url", lambda u: u)
+        class _YDL:
+            def __init__(self, opts): self.proxy = opts.get("proxy")
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def extract_info(self_, url, download=False):
+                if self_.proxy == "http://paid":
+                    return {"extractor": "youtube", "duration": 600}
+                raise RuntimeError("HTTP Error 429: Too Many Requests")
+        monkeypatch.setitem(sys.modules, "yt_dlp", types.SimpleNamespace(YoutubeDL=_YDL))
+        metering._static_bot_verdicts.clear()
+        url = "https://www.youtube.com/watch?v=abcdefghijk"
+        assert metering.probe_url_minutes(url) == 10.0
+        assert metering.pop_statics_bot_checked(url) is False
+        metering.pop_paid_probe_events()

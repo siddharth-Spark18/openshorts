@@ -1,0 +1,67 @@
+# Remote CPU worker (docs/architecture/remote-worker.md). Runs worker.py from
+# the CPU image on a host without a GPU; it only calls the API, nothing calls it.
+#
+#   WORKER_API_URL=https://api.example.com WORKER_TOKEN=... GEMINI_API_KEY=... \
+#     docker compose -f docker-compose.worker.yml up -d --build
+#
+# The network below is internal to this compose project. Add host firewall
+# rules so it cannot reach private ranges (the host itself, other Docker
+# networks, a VPN): the worker needs the public internet only.
+services:
+  worker:
+    build: .
+    command: ["python", "-u", "worker.py"]
+    working_dir: /app
+    restart: unless-stopped
+    # On a stop the worker hands every running job back to the API so they are
+    # retried at once and do not count against it: give it time to say so.
+    stop_grace_period: 45s
+    environment:
+      WORKER_API_URL: ${WORKER_API_URL:?set WORKER_API_URL}
+      WORKER_TOKEN: ${WORKER_TOKEN:?set WORKER_TOKEN}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:?set GEMINI_API_KEY}
+      WORKER_SLOTS: ${WORKER_SLOTS:-4}
+      # 1 on a worker with a GPU (image built with GPU=1): the API host sends
+      # the source alone and prepares no transcript or scenes for it.
+      WORKER_SOURCE_ONLY: ${WORKER_SOURCE_ONLY:-0}
+      # 1 on a worker with video-site accounts of its own (the cookies below,
+      # set by its operator and never sent by the API): it fetches a job's
+      # link itself instead of waiting for the API host to send the source.
+      WORKER_DOWNLOADS: ${WORKER_DOWNLOADS:-0}
+      # How many of its jobs fetch a link at once (the rest are sent their
+      # source), and how long it stops asking after a run of failed fetches.
+      WORKER_DOWNLOAD_SLOTS: ${WORKER_DOWNLOAD_SLOTS:-2}
+      WORKER_DOWNLOAD_PAUSE_SECONDS: ${WORKER_DOWNLOAD_PAUSE_SECONDS:-900}
+      YOUTUBE_COOKIES: ${YOUTUBE_COOKIES:-}
+      YOUTUBE_COOKIES_2: ${YOUTUBE_COOKIES_2:-}
+      YOUTUBE_COOKIES_3: ${YOUTUBE_COOKIES_3:-}
+      YT_ACCOUNT_SLOTS: ${YT_ACCOUNT_SLOTS:-1}
+      YT_ACCOUNT_MIN_INTERVAL: ${YT_ACCOUNT_MIN_INTERVAL:-12}
+      TRANSCRIBE_BACKEND: ${TRANSCRIBE_BACKEND:-parakeet}
+      AUTO_LAYOUT: ${AUTO_LAYOUT:-1}
+      FFMPEG_THREADS: ${FFMPEG_THREADS:-2}
+      JOB_NICE: ${JOB_NICE:-10}
+    volumes:
+      - worker_output:/app/output
+      - worker_uploads:/app/uploads
+      - worker_models:/app/.cache
+    tmpfs:
+      - /tmp:size=4g
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 4096
+    cpus: ${WORKER_CPUS:-32}
+    mem_limit: ${WORKER_MEMORY:-48g}
+    healthcheck:
+      disable: true
+    networks: [worker]
+
+volumes:
+  worker_output:
+  worker_uploads:
+  worker_models:
+
+networks:
+  worker:
+    driver: bridge

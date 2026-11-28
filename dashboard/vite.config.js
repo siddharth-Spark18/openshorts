@@ -14,10 +14,26 @@ export default defineConfig({
   // into #root and emits the static /alternatives pages, sitemap.xml and
   // llms.txt. See vite-plugin-seo.js.
   plugins: [react(), seo()],
+  // The free tools (/youtube-transcript-generator and friends) are static
+  // pages emitted by seo(); their behaviour ships as small standalone entries
+  // with no React in them. vite-plugin-seo.js finds each entry's hashed file
+  // name in the bundle and adds the <script> to its page.
+  build: {
+    rollupOptions: {
+      input: {
+        main: 'index.html',
+        'tool-transcript': 'tools/transcript.js',
+        'tool-metadata': 'tools/metadata.js',
+        'tool-vertical': 'tools/vertical.js',
+        'tool-paste-link': 'tools/paste-link.js',
+      },
+    },
+  },
   server: {
     allowedHosts: [
       'openshorts.app',
-      'www.openshorts.app'
+      'www.openshorts.app',
+      'openshorts-dev.duckdns.org'
     ],
     proxy: {
       '/api': { target: backend, changeOrigin: true },

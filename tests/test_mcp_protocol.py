@@ -68,6 +68,16 @@ class TestTools:
             for req in tool["inputSchema"].get("required", []):
                 assert req in tool["inputSchema"]["properties"], tool["name"]
 
+    def test_every_tool_declares_behaviour_hints(self):
+        # The ChatGPT app review rejects a tool missing any of these three.
+        for tool in TOOLS:
+            hints = tool["annotations"]
+            for key in ("readOnlyHint", "destructiveHint", "openWorldHint"):
+                assert isinstance(hints[key], bool), (tool["name"], key)
+        by_name = {t["name"]: t["annotations"] for t in TOOLS}
+        assert by_name["publish_clip"]["openWorldHint"] is True
+        assert by_name["get_quota"]["readOnlyHint"] is True
+
     def test_call_wraps_result_as_text_and_structured(self):
         resp = _run({"jsonrpc": "2.0", "id": 4, "method": "tools/call",
                      "params": {"name": "get_quota", "arguments": {"a": 1}}})
@@ -81,3 +91,71 @@ class TestTools:
                      "params": {"name": "get_quota", "arguments": {}}},
                     tool_caller=_err_tool)
         assert resp["result"]["isError"] is True
+
+
+class TestClipSummaries:
+    def test_source_segments_tell_recut_where_the_clip_is(self):
+        from mcp_server import _clip_summaries
+        clips = _clip_summaries("j", {"clips": [
+            {"start": 10.0, "end": 40.5, "video_url": "/videos/j/a.mp4"},
+            {"start": 5, "end": 30, "recipe": {"segments": [
+                {"start": 5, "end": 12, "text": "x"}, {"start": 20, "end": 30}]}},
+            {"video_url": "/videos/j/c.mp4"},
+        ]})
+        assert clips[0]["source_segments"] == [{"start": 10.0, "end": 40.5}]
+        assert clips[1]["source_segments"] == [{"start": 5, "end": 12}, {"start": 20, "end": 30}]
+        assert clips[2]["source_segments"] == []
+
+
+class TestExpiredJobs:
+    def _client(self, on_disk):
+        import httpx
+        calls = []
+
+        def handler(req):
+            calls.append((req.method, req.url.path))
+            if req.url.path.endswith("/restore"):
+                on_disk.append(True)
+                return httpx.Response(200, json={"status": "completed"})
+            if not on_disk:
+                return httpx.Response(404, json={"detail": "Job not found"})
+            return httpx.Response(200, json={"status": "completed", "result": {"clips": []}})
+        return httpx.AsyncClient(transport=httpx.MockTransport(handler),
+                                 base_url="http://api"), calls
+
+    def test_a_job_gone_from_disk_is_restored_from_the_archive(self):
+        from mcp_server import _tool_get_job_status
+        client, calls = self._client([])
+        out, is_error = asyncio.run(_tool_get_job_status(client, {"job_id": "j"}))
+        assert not is_error and out["status"] == "completed"
+        assert calls == [("GET", "/api/status/j"), ("POST", "/api/projects/j/restore"),
+                         ("GET", "/api/status/j")]
+
+    def test_a_live_job_is_not_restored(self):
+        from mcp_server import _tool_get_job_status
+        client, calls = self._client([True])
+        asyncio.run(_tool_get_job_status(client, {"job_id": "j"}))
+        assert calls == [("GET", "/api/status/j")]
+
+
+def test_ids_that_are_not_ids_never_reach_an_api_path():
+    """job_id / upload_id are spliced into REST paths; "../" or "?" in one
+    would address another endpoint with the caller's credentials."""
+    import mcp_server
+
+    called = []
+
+    async def impl(client, args):
+        called.append(args)
+        return {}, False
+
+    mcp_server._TOOL_IMPLS["__probe"] = impl
+    try:
+        for bad in ("../../api/billing/end-trial?", "a/b", "x?y=1", "", 5):
+            out, is_error = asyncio.run(mcp_server.call_tool(None, "__probe", {"job_id": bad}))
+            assert is_error and "Invalid job_id" in out["error"]
+        out, is_error = asyncio.run(mcp_server.call_tool(None, "__probe", {"upload_id": "../x"}))
+        assert is_error
+        assert called == []
+    finally:
+        mcp_server._TOOL_IMPLS.pop("__probe", None)

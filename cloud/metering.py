@@ -19,21 +19,29 @@ Probing input duration (ffprobe / yt-dlp metadata) lives here too.
 import asyncio
 import json
 import math
+import contextlib
 import os
 from urllib.parse import urlparse
 import random
+import time
 import subprocess
+
+import yt_account
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal
 
 from sqlalchemy import select, update, func, and_
 
 from . import config, database
-from .models import User, Subscription, CreditTopup, UsageLedger
+from .models import User, Subscription, CreditTopup, UsageLedger, FirstVideoGrant
 
 
 SWEEP_INTERVAL_SECONDS = 15 * 60
 STUCK_RESERVATION_HOURS = 3
+# A reservation whose job is still queued or running outlives the stuck window;
+# one whose job has not MOVED for this long (env LIVE_RESERVATION_MAX_HOURS: a
+# run that never ends, a manifest nobody resumes) is released as hung.
+LIVE_RESERVATION_MAX_HOURS = 24
 
 
 class QuotaExceeded(Exception):
@@ -91,7 +99,7 @@ _CONTENT_HINTS = (
     "join this channel", "not available on this app", "is not a valid url",
     "unsupported url", "no video formats found", "premieres in", "will begin in",
     "this live event", "no duration in metadata", "requested format is not available",
-    "account has been terminated", "video is age", "confirm your age",
+    "account has been terminated", "video is age", "confirm your age", "age-restricted",
     # An uploader's country block: the residential pool exits from the same
     # blocked countries, so the paid probe failed with the identical error in
     # 5 of the 6 cases between 3-sep and 5-sep-2026 (3.6 MB each, and the
@@ -112,6 +120,29 @@ def static_failure_warrants_paid(err) -> bool:
 # Paid-probe events queued for app.py (thread-safe enough: appended from the
 # executor thread that runs the probe, drained on the event loop).
 _paid_probe_events: list = []
+
+# URLs whose probe saw EVERY static IP answer the bot-check and the paid proxy
+# answer the video. Since 30-sep-2026 that verdict is per video and identical
+# on every one of our IPs (measured: 9 of 10 videos, 3 statics + the server's
+# own IP, twice each), so the download repeating the four anonymous attempts
+# costs ~8 s and four more hits on IPs YouTube is already scoring, for the
+# same answer. app.py pops the verdict when it builds the job.
+_static_bot_verdicts: set = set()
+
+
+def pop_statics_bot_checked(url) -> bool:
+    """True (once) when the probe of ``url`` found the static pool bot-checked
+    for this video and had to use the paid proxy."""
+    try:
+        _static_bot_verdicts.remove(url)
+        return True
+    except KeyError:
+        return False
+
+
+def _all_bot_checked(static_errors) -> bool:
+    return bool(static_errors) and all(
+        "not a bot" in (e or "") for e in static_errors.values())
 
 
 def pop_paid_probe_events() -> list:
@@ -169,6 +200,17 @@ def probe_url_minutes(url: str, allow_paid: bool = True) -> float:
     if reason:
         raise NotASingleVideo(f"This link is {reason}.")
 
+    # A YouTube video probed in the last hours (the download cache keeps its
+    # length): a video's length does not change, and asking again would spend
+    # a request of a YouTube account for an answer we already have.
+    import source_cache
+    known = source_cache.probe_get(url)
+    if known:
+        if known.get("max_height"):
+            _probe_facts[url] = {"at": time.time(), "max_height": int(known["max_height"]),
+                                 "duration": int(known["seconds"])}
+        return known["seconds"] / 60.0
+
     bgutil_http = os.environ.get("BGUTIL_BASE_URL", "").strip()
     bgutil_script = os.environ.get("BGUTIL_SCRIPT_PATH", "").strip()
     # Same client lists as the download (yt_clients.py): the authed defaults
@@ -190,12 +232,8 @@ def probe_url_minutes(url: str, allow_paid: bool = True) -> float:
     strategies = ([(hd_args, True)] if hd_args else []) + [
         (fallback_extractor_args(bgutil_http, bgutil_script), not hd_args)]
 
-    # Rotated per probe to spread load across the pool, like the download does.
     statics = [p.strip() for p in
                os.environ.get("STATIC_PROXY_URLS", "").split(",") if p.strip()]
-    if statics:
-        k = random.randrange(len(statics))
-        statics = statics[k:] + statics[:k]
     paid = os.environ.get("PROXY_URL", "").strip()
     if not allow_paid:
         paid = ""  # daily budget hit (cloud/proxy_ledger.budget_exceeded)
@@ -204,33 +242,182 @@ def probe_url_minutes(url: str, allow_paid: bool = True) -> float:
     # Rumble, product pages and drive links were all reaching it here.
     if not is_youtube_url(url):
         paid = ""
-    proxies = plan_probe_proxies(
-        os.environ.get("DIRECT_FIRST", "").strip() == "1",
-        statics,
-        paid,
-    )
     static_errors: dict = {}
 
     # Same cookies + PO token the download uses: an anonymous probe gets
     # "Sign in to confirm you're not a bot" from the static IPs (4-sep-2026,
     # all three, ~10 probes/day paying 1.8 MB each on the per-GB proxy)
     # while the authenticated download sails through the same IPs.
-    cookies_env = os.environ.get("YOUTUBE_COOKIES")
-    ck_path = None
-    if cookies_env:
-        import tempfile
-        fd, ck_path = tempfile.mkstemp(prefix="probe_ck_", suffix=".txt")
-        with os.fdopen(fd, "w") as f:
-            f.write(cookies_env)
+    # One of the configured accounts (yt_account.Session), as a private file.
+    session = yt_account.Session()
     try:
-        return _probe_with_proxies(url, proxies, strategies, static_errors,
-                                   paid, ck_path)
+        # The account's own exit first (yt_account.home_exit), like the
+        # download: an account leaves through the same address every time.
+        # With no account, any of them, to spread the load.
+        if statics:
+            k = (yt_account.home_exit(session.account, len(statics)) if session.path
+                 else random.randrange(len(statics)))
+            statics = statics[k:] + statics[:k]
+        proxies = plan_probe_proxies(
+            os.environ.get("DIRECT_FIRST", "").strip() == "1", statics, paid)
+        minutes = _probe_with_proxies(url, proxies, strategies, static_errors,
+                                      paid, session.path)
     finally:
-        if ck_path:
-            try:
-                os.remove(ck_path)
-            except OSError:
-                pass
+        session.close()
+    facts = _probe_facts.get(url) or {}
+    source_cache.probe_put(url, minutes * 60.0, facts.get("max_height"))
+    return minutes
+
+
+# --- The probe in its own process -------------------------------------------
+# yt-dlp is pure Python: a probe holds the GIL for about a second of CPU, and
+# the API is one process whose event loop needs the same GIL. At 30-50 probes
+# a minute (16-nov) the loop got too little of it, DB connections stayed
+# checked out and every endpoint answered 500 for minutes. In a pool of
+# processes the probes use other cores and leave the loop alone. What a probe
+# leaves behind in this module (quality facts, the static-pool verdict, paid
+# proxy events) comes back with its result; the YouTube accounts' budget is
+# already shared through files (yt_account). PROBE_PROCESSES=0: in a thread.
+# Sized for waiting, not for CPU: a probe spends most of its time asleep on
+# the YouTube account's turn (yt_account, up to YT_ACCOUNT_MAX_WAIT), and four
+# processes asleep queued every other probe behind them (16-nov: estimate p50
+# 45 s). ~150 MB each, started on demand.
+PROBE_PROCESSES = max(0, int(os.environ.get("PROBE_PROCESSES", "12") or 0))
+PROBE_TASKS_PER_CHILD = 200
+_probe_pool = None
+
+
+def _probe_in_child(url, allow_paid):
+    """Runs in a pool process: the probe and what it left in this module."""
+    from yt_clients import LiveStreamOnAir, NotASingleVideo
+    out = {"minutes": None, "error": None, "single": False, "live": False}
+    try:
+        out["minutes"] = probe_url_minutes(url, allow_paid=allow_paid)
+    except NotASingleVideo as e:
+        out["error"], out["single"] = str(e), True
+        out["live"] = isinstance(e, LiveStreamOnAir)
+    except Exception as e:
+        out["error"] = f"{type(e).__name__}: {e}"[:500]
+    out["facts"] = _probe_facts.get(url)
+    out["bot_checked"] = pop_statics_bot_checked(url)
+    out["events"] = pop_paid_probe_events()
+    return out
+
+
+def _merge_child_probe(url, out):
+    if out.get("facts"):
+        now = time.time()
+        for k in [k for k, v in _probe_facts.items() if now - v["at"] > _PROBE_FACTS_TTL]:
+            _probe_facts.pop(k, None)
+        _probe_facts[url] = out["facts"]
+    if out.get("bot_checked"):
+        _static_bot_verdicts.add(url)
+    _paid_probe_events.extend(out.get("events") or [])
+    if out.get("error") is not None:
+        if out.get("live"):
+            from yt_clients import LiveStreamOnAir
+            raise LiveStreamOnAir(out["error"])
+        if out.get("single"):
+            from yt_clients import NotASingleVideo
+            raise NotASingleVideo(out["error"])
+        raise ValueError(out["error"])
+    return out["minutes"]
+
+
+def _get_probe_pool():
+    global _probe_pool
+    if _probe_pool is None:
+        import concurrent.futures
+        import multiprocessing
+        # spawn, not fork: the API process has threads and an event loop.
+        _probe_pool = concurrent.futures.ProcessPoolExecutor(
+            max_workers=PROBE_PROCESSES, mp_context=multiprocessing.get_context("spawn"),
+            max_tasks_per_child=PROBE_TASKS_PER_CHILD)
+    return _probe_pool
+
+
+async def run_probe(url: str, allow_paid: bool = True) -> float:
+    """``probe_url_minutes`` off the event loop and, with PROBE_PROCESSES, off
+    this process's GIL."""
+    import functools
+    loop = asyncio.get_running_loop()
+    if PROBE_PROCESSES:
+        global _probe_pool
+        try:
+            out = await loop.run_in_executor(_get_probe_pool(), _probe_in_child, url, allow_paid)
+        except Exception as e:
+            from concurrent.futures.process import BrokenProcessPool
+            if not isinstance(e, BrokenProcessPool):
+                raise
+            print(f"⚠️ Probe pool broke ({e}); this probe runs in a thread.")
+            _probe_pool = None
+        else:
+            return _merge_child_probe(url, out)
+    return await loop.run_in_executor(
+        None, functools.partial(probe_url_minutes, url, allow_paid=allow_paid))
+
+
+# What the last probes learned about each URL, for the quality gate that runs
+# right after the metering probe (app._probe_youtube_quality): asking YouTube
+# a second time for the same video spent the account's budget twice per
+# submission. Small and short-lived: one entry per recent submission.
+_PROBE_FACTS_TTL = 600
+_probe_facts: dict = {}
+
+
+def _keep_extraction(url, info, proxy, authed, extractor_args):
+    """Leave what YouTube just answered for the download that follows this
+    probe (``source_cache.info_put``): it then asks nothing of the account.
+    Best effort, and never from the per-GB proxy: its exit address changes
+    between requests, and media links only work from the one that asked."""
+    try:
+        import source_cache
+        import yt_dlp
+        if not source_cache.info_enabled() or not is_youtube_url(url):
+            return
+        clean = yt_dlp.YoutubeDL.sanitize_info(info, remove_private_keys=True)
+        # The sanitizer drops every "__" key, and one of them is how yt-dlp
+        # knows a format has to be tested before it is picked (the HLS
+        # formats of a recent upload): without it the download would take
+        # such a format untested where a fresh extraction rejects it.
+        untested = {f.get("format_id") for f in (info.get("formats") or [])
+                    if isinstance(f, dict) and f.get("__needs_testing")}
+        for f in clean.get("formats") or []:
+            if f.get("format_id") in untested:
+                f["__needs_testing"] = True
+        # Most of the result's size, and nothing a download reads.
+        for key in ("automatic_captions", "subtitles", "thumbnails", "heatmap"):
+            clean.pop(key, None)
+        source_cache.info_put(url, clean, proxy, authed, extractor_args)
+    except Exception:
+        pass
+
+
+def _remember_probe(url, info):
+    try:
+        heights = [f.get("height") or 0 for f in (info.get("formats") or [])
+                   if f.get("vcodec", "none") != "none" and f.get("protocol") != "mhtml"
+                   and f.get("ext") != "mhtml"]
+        height = max(heights, default=0)
+        if not height:
+            return            # nothing to say about quality: let the gate ask
+        now = time.time()
+        for k in [k for k, v in _probe_facts.items() if now - v["at"] > _PROBE_FACTS_TTL]:
+            _probe_facts.pop(k, None)
+        _probe_facts[url] = {"at": now, "max_height": int(height),
+                             "duration": int(info.get("duration") or 0)}
+    except Exception:
+        pass
+
+
+def probe_facts(url):
+    """``{max_height, duration, mode, cookies_invalid}`` from a probe of this
+    URL in the last few minutes, or None."""
+    f = _probe_facts.get(url)
+    if not f or time.time() - f["at"] > _PROBE_FACTS_TTL:
+        return None
+    return {"max_height": f["max_height"], "duration": f["duration"],
+            "mode": "metering-probe", "cookies_invalid": False}
 
 
 def _probe_with_proxies(url, proxies, strategies, static_errors, paid, ck_path):
@@ -252,6 +439,7 @@ def _probe_with_proxies(url, proxies, strategies, static_errors, paid, ck_path):
         def error(self, msg): pass
 
     last_err = None
+    session = yt_account.Session.of(ck_path)
     for proxy in proxies:
         is_paid = bool(paid) and proxy == paid
         # Every attempt's error on this route, not just the last one. The
@@ -280,19 +468,43 @@ def _probe_with_proxies(url, proxies, strategies, static_errors, paid, ck_path):
             opts = {"skip_download": True, "quiet": True, "no_warnings": True,
                     "noplaylist": True,
                     "logger": _QuietLogger(), "extractor_args": extractor_args}
-            if ck_path and use_cookies:
+            authed = bool(ck_path and use_cookies)
+            if authed and session.spent:
+                # YouTube said twice for this video (or, during a cooldown,
+                # to everybody) that the account is limited: asking again
+                # with its cookies gets the same answer and counts against
+                # it. (Once is often one exit IP only: the next route is
+                # still asked.) The anonymous step of this route still runs.
+                route_errors.append("skipped: the YouTube account is limited")
+                continue
+            if authed:
                 opts["cookiefile"] = ck_path
             if proxy:
                 opts["proxy"] = proxy
             try:
-                with yt_dlp.YoutubeDL(opts) as ydl:
-                    info = ydl.extract_info(url, download=False)
+                import ssrf_guard
+                # With the cookies: one of the account's slots, spaced from
+                # the previous request (yt_account), like the download.
+                with (session.request() if authed else contextlib.nullcontext()):
+                    with ssrf_guard.guarded(), yt_dlp.YoutubeDL(opts) as ydl:
+                        info = ydl.extract_info(url, download=False)
+                if authed:
+                    session.ok()
+                from yt_clients import LiveStreamOnAir, live_not_ready
+                if live_not_ready(info):
+                    # Same answer on every route: stop here, bill nothing.
+                    raise LiveStreamOnAir()
                 duration = info.get("duration")
                 if duration:
+                    _remember_probe(url, info)
+                    if not is_paid:
+                        _keep_extraction(url, info, proxy, authed, extractor_args)
                     if is_paid:
                         _paid_probe_events.append({
                             "url": url, "static_errors": dict(static_errors),
                             "bytes_estimate": 1_800_000 * (1 + step)})
+                        if _all_bot_checked(static_errors):
+                            _static_bot_verdicts.add(url)
                     return float(duration) / 60.0
                 last_err = ValueError("no duration in metadata")
                 if info.get("extractor") == "generic":
@@ -301,8 +513,17 @@ def _probe_with_proxies(url, proxies, strategies, static_errors, paid, ck_path):
                     # container header over HTTP instead.
                     break
             except Exception as e:
+                from yt_clients import LiveStreamOnAir
+                if isinstance(e, LiveStreamOnAir):
+                    raise
                 last_err = e
                 route_errors.append(str(e)[:300])
+                if authed and yt_account.is_rate_limit(str(e)):
+                    session.limited()   # moves to another account if one is awake
+                elif authed and yt_account.is_age_gate(str(e)):
+                    session.age_gated()  # an age-verified account may open it
+                elif authed and yt_account.is_drm(str(e)):
+                    session.drm_refused()  # an account served protected formats only
         else:
             if not is_paid:
                 static_errors[_route_name(proxy, proxies)] = (
@@ -375,6 +596,64 @@ async def _active_subscription(session, user_id):
     return row if _entitles(row) else None
 
 
+LIVE_PLANS_CHUNK = 500
+
+
+async def live_plans(user_ids) -> dict:
+    """``{str(user_id): plan}`` for the users among ``user_ids`` whose
+    subscription grants its plan right now (the rule of ``_entitles``). For
+    the job queue, which may hold thousands of jobs: one query per
+    LIVE_PLANS_CHUNK owners, never one per job. Ids that are not uuids
+    (self-host, test doubles) are skipped."""
+    import uuid as _uuid
+    ids = []
+    for u in {str(x) for x in (user_ids or ()) if x is not None}:
+        try:
+            ids.append(_uuid.UUID(u))
+        except ValueError:
+            continue
+    plans = {}
+    if not ids:
+        return plans
+    async with database.session() as session:
+        for i in range(0, len(ids), LIVE_PLANS_CHUNK):
+            rows = (await session.execute(
+                select(Subscription.user_id, Subscription.plan).where(and_(
+                    Subscription.user_id.in_(ids[i:i + LIVE_PLANS_CHUNK]),
+                    Subscription.status.in_(("active", "trialing")),
+                    Subscription.current_period_end > _now(),
+                ))
+            )).all()
+            plans.update({str(uid): plan for uid, plan in rows})
+    return plans
+
+
+async def topup_owners(user_ids) -> set:
+    """``{str(user_id)}`` of the users among ``user_ids`` with top-up minutes
+    left (the free queue's saturation mode queues their jobs as paid). One
+    query per LIVE_PLANS_CHUNK owners; non-uuid ids are skipped."""
+    import uuid as _uuid
+    ids = []
+    for u in {str(x) for x in (user_ids or ()) if x is not None}:
+        try:
+            ids.append(_uuid.UUID(u))
+        except ValueError:
+            continue
+    out = set()
+    if not ids:
+        return out
+    async with database.session() as session:
+        for i in range(0, len(ids), LIVE_PLANS_CHUNK):
+            rows = (await session.execute(
+                select(CreditTopup.user_id).where(and_(
+                    CreditTopup.user_id.in_(ids[i:i + LIVE_PLANS_CHUNK]),
+                    CreditTopup.minutes_total > CreditTopup.minutes_consumed,
+                )).distinct()
+            )).scalars().all()
+            out.update(str(u) for u in rows)
+    return out
+
+
 def free_plan_eligible(user) -> bool:
     """True if this ``User`` row qualifies for the free monthly allowance.
 
@@ -385,6 +664,11 @@ def free_plan_eligible(user) -> bool:
     the free plan entirely.
     """
     if user is None or config.FREE_PLAN_MINUTES <= 0:
+        return False
+    # Denied accounts (re-registered after an erasure, temp-mail MX): no free
+    # minutes whatever the sign-in method. getattr: test doubles and rows
+    # loaded before the column existed.
+    if getattr(user, "free_plan_denied", None):
         return False
     if user.google_sub:
         return True
@@ -408,11 +692,61 @@ def free_period_end(now: datetime | None = None) -> datetime:
     return datetime(now.year, now.month + 1, 1, tzinfo=timezone.utc)
 
 
+# A checkout whose first charge never went through: there was no paid plan.
+_NEVER_PAID = ("incomplete", "incomplete_expired")
+
+
+def plan_ended_at(row, now: datetime | None = None) -> datetime | None:
+    """When this subscription row stopped granting its plan, or None: it still
+    does, it is on hold, or it never did (a first charge that failed).
+
+    A canceled or unpaid row ended at the webhook that said so
+    (``last_event_at``), never later than the period it had paid for; a row
+    still marked live whose period is over (a webhook that never came) ended
+    with that period.
+    """
+    if row is None or row.status in _NEVER_PAID or row.status == config.ON_HOLD:
+        return None
+    period_end = row.current_period_end
+    if row.status in ("active", "trialing"):
+        return period_end if period_end and period_end <= (now or _now()) else None
+    ended = row.last_event_at or period_end
+    if ended and period_end and period_end < ended:
+        ended = period_end
+    return ended
+
+
+async def in_paid_grace(session, user_id, days: int, now: datetime | None = None) -> bool:
+    """True while a plan that ended is within ``days`` of its end.
+
+    The Terms keep a paid library "while your subscription is active" and
+    delete it "7 days after it ends". Without this the account read as a plain
+    free one the moment the plan ended, and the free sweep deleted every clip
+    older than a week on its next pass: hours after the end, not 7 days.
+    """
+    now = now or _now()
+    ended = plan_ended_at(await _subscription_row(session, user_id), now)
+    return bool(ended and ended + timedelta(days=days) > now)
+
+
 async def is_free_user(session, user_id) -> bool:
-    """Google-authed user currently on the free plan (no active/trialing sub)."""
+    """User currently on the free tier (no active/trialing sub).
+
+    Used by the retention sweeps: an account whose free minutes were withdrawn
+    (``free_plan_denied``) still keeps its library on the free 7-day expiry,
+    not forever.
+    """
     if await _active_subscription(session, user_id):
         return False
-    return free_plan_eligible(await session.get(User, user_id))
+    # A month on hold spends free minutes but is still a paying customer's
+    # library: it must not expire like a free one while they are away.
+    row = await _subscription_row(session, user_id)
+    if row is not None and row.status == config.ON_HOLD:
+        return False
+    user = await session.get(User, user_id)
+    if user is not None and getattr(user, "free_plan_denied", None):
+        return True
+    return free_plan_eligible(user)
 
 
 async def _plan_used_this_period(session, user_id, period_end) -> Decimal:
@@ -424,6 +758,64 @@ async def _plan_used_this_period(session, user_id, period_end) -> Decimal:
         ))
     )).scalar_one()
     return _D(total)
+
+
+async def has_processed_before(user_id) -> bool:
+    """True once the account has any live (reserved/committed) process job.
+
+    Released reservations (a job that failed or never started) don't count, so
+    a first video that errors out keeps the first-video grant for the retry.
+    """
+    async with database.session() as session:
+        row = (await session.execute(
+            select(UsageLedger.id).where(and_(
+                UsageLedger.user_id == user_id,
+                UsageLedger.job_type == "process",
+                UsageLedger.status.in_(("reserved", "committed")),
+            )).limit(1)
+        )).first()
+    return row is not None
+
+
+def ip_fingerprint(ip) -> str:
+    """HMAC of a client IP (keyed on the app secret), or "" when unknown."""
+    import hashlib
+    import hmac
+    if not ip or ip == "unknown":
+        return ""
+    key = (config.settings.jwt_secret or "openshorts").encode()
+    return hmac.new(key, f"ip:{ip}".encode(), hashlib.sha256).hexdigest()
+
+
+async def ip_had_first_video(ip_hash: str) -> bool:
+    """True when this network already got a live first-video grant inside
+    ``FIRST_VIDEO_IP_WINDOW_DAYS``."""
+    if not ip_hash:
+        return False
+    since = _now() - timedelta(days=config.FIRST_VIDEO_IP_WINDOW_DAYS)
+    async with database.session() as session:
+        row = (await session.execute(
+            select(FirstVideoGrant.id)
+            .join(UsageLedger, UsageLedger.job_id == FirstVideoGrant.job_id)
+            .where(and_(
+                FirstVideoGrant.ip_hash == ip_hash,
+                FirstVideoGrant.created_at >= since,
+                UsageLedger.status.in_(("reserved", "committed")),
+            )).limit(1)
+        )).first()
+    return row is not None
+
+
+async def record_first_video(ip_hash: str, job_id: str):
+    """Remember a first-video grant for this network; prune expired rows."""
+    if not ip_hash:
+        return
+    from sqlalchemy import delete
+    since = _now() - timedelta(days=config.FIRST_VIDEO_IP_WINDOW_DAYS)
+    async with database.session() as session:
+        async with session.begin():
+            await session.execute(delete(FirstVideoGrant).where(FirstVideoGrant.created_at < since))
+            session.add(FirstVideoGrant(ip_hash=ip_hash, job_id=job_id))
 
 
 async def _topups_fifo(session, user_id):
@@ -551,6 +943,57 @@ async def reserve_minutes(user_id, minutes: float, job_id: str, job_type: str = 
             return str(row.id)
 
 
+async def free_actions_today(user_id, job_type: str) -> int:
+    """How many zero-minute ``job_type`` rows this user has today (UTC)."""
+    day_start = _now().replace(hour=0, minute=0, second=0, microsecond=0)
+    async with database.session() as session:
+        return int((await session.execute(
+            select(func.count(UsageLedger.id)).where(and_(
+                UsageLedger.user_id == user_id,
+                UsageLedger.job_type == job_type,
+                UsageLedger.created_at >= day_start,
+            ))
+        )).scalar_one() or 0)
+
+
+async def free_actions_total(user_id, job_type: str) -> int:
+    """How many zero-minute ``job_type`` rows this user has, ever."""
+    async with database.session() as session:
+        return int((await session.execute(
+            select(func.count(UsageLedger.id)).where(and_(
+                UsageLedger.user_id == user_id,
+                UsageLedger.job_type == job_type,
+                UsageLedger.minutes == 0,
+            ))
+        )).scalar_one() or 0)
+
+
+async def record_free_action(user_id, job_id: str, job_type: str):
+    """A committed zero-minute row: counts a free allowance (AI edits per day,
+    social posts in total) across restarts without touching the balance.
+    Returns the row id, for undo_free_action."""
+    row = UsageLedger(
+        user_id=user_id, job_id=str(job_id), job_type=job_type,
+        minutes=_D(0), minutes_from_plan=_D(0), minutes_from_topup=_D(0),
+        status="committed",
+    )
+    async with database.session() as session:
+        async with session.begin():
+            session.add(row)
+    return str(row.id)
+
+
+async def undo_free_action(ledger_id):
+    """Give back a free action whose work failed (zero-minute rows only)."""
+    if not ledger_id:
+        return
+    async with database.session() as session:
+        async with session.begin():
+            row = await session.get(UsageLedger, ledger_id)
+            if row is not None and row.minutes == 0 and row.status == "committed":
+                await session.delete(row)
+
+
 async def commit_reservation(ledger_id: str):
     """Flip a reservation to committed. Consumption already happened at reserve."""
     async with database.session() as session:
@@ -558,6 +1001,53 @@ async def commit_reservation(ledger_id: str):
             row = await session.get(UsageLedger, ledger_id)
             if row and row.status == "reserved":
                 row.status = "committed"
+
+
+async def reservation_minutes(ledger_id: str):
+    """Minutes held by a still-``reserved`` row, or None."""
+    async with database.session() as session:
+        row = await session.get(UsageLedger, ledger_id)
+        if not row or row.status != "reserved":
+            return None
+        return float(row.minutes)
+
+
+async def trim_reservation(ledger_id: str, minutes) -> float:
+    """Lower a still-``reserved`` row to ``minutes`` and give the rest back.
+
+    For a job whose source turned out shorter than what was reserved for it
+    (a download that got less than the probe announced). Only ever lowers.
+    The bought minutes go back first, then the plan's. Returns the minutes
+    given back (0 when nothing changed).
+    """
+    new = _D(minutes)
+    async with database.session() as session:
+        async with session.begin():
+            row = await session.get(UsageLedger, ledger_id)
+            if not row or row.status != "reserved" or new < 0 or new >= _D(row.minutes):
+                return 0.0
+            await session.execute(
+                select(User.id).where(User.id == row.user_id).with_for_update()
+            )
+            refund = _D(row.minutes) - new
+            from_topup = min(refund, _D(row.minutes_from_topup))
+            need = from_topup
+            allocations = [dict(a) for a in (row.topup_allocations or [])]
+            # Newest allocation first: the reverse of the FIFO reserve.
+            for alloc in reversed(allocations):
+                if need <= 0:
+                    break
+                give = min(_D(alloc["minutes"]), need)
+                t = await session.get(CreditTopup, alloc["topup_id"])
+                if t is not None:
+                    t.minutes_consumed = max(_D(0), _D(t.minutes_consumed) - give)
+                alloc["minutes"] = float(_D(alloc["minutes"]) - give)
+                need -= give
+            row.topup_allocations = [a for a in allocations if a["minutes"] > 0] or None
+            row.minutes_from_topup = _D(row.minutes_from_topup) - from_topup
+            row.minutes_from_plan = _D(row.minutes_from_plan) - (refund - from_topup)
+            row.minutes = new
+            return float(refund)
 
 
 async def release_reservation(ledger_id: str):
@@ -577,7 +1067,13 @@ async def release_reservation(ledger_id: str):
             row.status = "released"
 
 
-async def release_orphaned_reservations(keep_ids=None):
+# A reservation this recent at startup may belong to a job the other instance
+# of a deploy accepted while this one booted, whose manifest the startup scan
+# could not have seen yet: leave it to the sweeper, which checks liveness.
+ORPHAN_GRACE_SECONDS = 120
+
+
+async def release_orphaned_reservations(keep_ids=None, created_before=None):
     """At startup, release every still-``reserved`` row.
 
     Jobs live only in memory, so a restart loses all in-flight jobs; their
@@ -585,12 +1081,18 @@ async def release_orphaned_reservations(keep_ids=None):
 
     ``keep_ids`` are reservations for jobs being *resumed* after the restart —
     those keep running and will settle themselves, so they must not be refunded.
+    ``created_before`` (the boot instant) limits it to rows older than that
+    minus ORPHAN_GRACE_SECONDS: during a deploy the old instance keeps taking
+    jobs, and one reserved while this instance booted has a manifest the keep
+    set was computed too early to contain.
     """
     keep = {str(k) for k in (keep_ids or ())}
+    q = select(UsageLedger.id).where(UsageLedger.status == "reserved")
+    if created_before is not None:
+        q = q.where(UsageLedger.created_at
+                    < created_before - timedelta(seconds=ORPHAN_GRACE_SECONDS))
     async with database.session() as session:
-        ids = list((await session.execute(
-            select(UsageLedger.id).where(UsageLedger.status == "reserved")
-        )).scalars())
+        ids = list((await session.execute(q)).scalars())
     released = 0
     for lid in ids:
         if str(lid) in keep:
@@ -601,31 +1103,81 @@ async def release_orphaned_reservations(keep_ids=None):
         print(f"☁️  Released {released} orphaned reservation(s) at startup.")
 
 
-async def _sweep_once():
-    cutoff = _now() - timedelta(hours=STUCK_RESERVATION_HOURS)
+def _live_cap_hours() -> float:
+    try:
+        return float(os.environ.get("LIVE_RESERVATION_MAX_HOURS") or LIVE_RESERVATION_MAX_HOURS)
+    except ValueError:
+        return float(LIVE_RESERVATION_MAX_HOURS)
+
+
+async def _sweep_once(live_ids=None):
+    """Release reservations older than STUCK_RESERVATION_HOURS whose job is over.
+
+    ``live_ids()`` (app.py; may be a coroutine) maps the reservations whose job
+    is still queued, running or waiting in a resume manifest on the shared disk
+    to the moment that job was last known to be moving (``alive_since``, epoch
+    seconds; a plain set counts as "moving now"). A queue longer than the stuck
+    window must not refund a video that will still be delivered: its commit
+    would then find nothing to commit. It is read BEFORE the rows, so a job
+    that ends in between is either committed already or still counted live. If
+    it fails the pass is skipped: not knowing what is alive is no reason to
+    refund everything. A live reservation whose job has not moved for
+    LIVE_RESERVATION_MAX_HOURS is released as hung; that clock is the job's
+    (a run that never ends, a manifest nobody takes), never the reservation's
+    age, so a long wait in the queue does not count.
+    """
+    live = None
+    if live_ids is not None:
+        try:
+            got = live_ids()
+            if asyncio.iscoroutine(got) or isinstance(got, asyncio.Future):
+                got = await got
+            if isinstance(got, dict):
+                live = {str(k): float(v) for k, v in got.items()}
+            else:
+                stamp = _now().timestamp()
+                live = {str(k): stamp for k in got}
+        except Exception as e:
+            print(f"⚠️  Metering sweep skipped, live jobs unknown: {e}")
+            return
+    now = _now()
+    cutoff = now - timedelta(hours=STUCK_RESERVATION_HOURS)
+    hung_before = now.timestamp() - _live_cap_hours() * 3600
     async with database.session() as session:
-        ids = list((await session.execute(
+        rows = list((await session.execute(
             select(UsageLedger.id).where(and_(
                 UsageLedger.status == "reserved",
                 UsageLedger.created_at < cutoff,
             ))
         )).scalars())
+    ids = [lid for lid in rows
+           if live is None or str(lid) not in live or live[str(lid)] < hung_before]
     for lid in ids:
         await release_reservation(str(lid))
     if ids:
         print(f"☁️  Swept {len(ids)} stuck reservation(s).")
+    kept = len(rows) - len(ids)
+    if kept:
+        print(f"☁️  Kept {kept} reservation(s) older than {STUCK_RESERVATION_HOURS} h: "
+              f"their job is still queued or running.")
 
 
-async def _sweeper_loop():
+async def _sweeper_loop(live_ids=None, is_active=None):
     while True:
         try:
             await asyncio.sleep(SWEEP_INTERVAL_SECONDS)
-            await _sweep_once()
+            # A draining instance leaves the sweep to the new one: from here
+            # the new one's queue looks like manifests nobody has taken.
+            if is_active is not None and not is_active():
+                continue
+            await _sweep_once(live_ids)
         except asyncio.CancelledError:
             break
         except Exception as e:  # never let the sweeper die
             print(f"⚠️  Metering sweeper error: {e}")
 
 
-def start_sweeper():
-    asyncio.create_task(_sweeper_loop())
+def start_sweeper(live_ids=None, is_active=None):
+    """``live_ids``: callable (or coroutine function) returning the live
+    reservations, see ``_sweep_once``. ``is_active``: False while draining."""
+    asyncio.create_task(_sweeper_loop(live_ids, is_active))

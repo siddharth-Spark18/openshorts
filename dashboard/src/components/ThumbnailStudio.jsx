@@ -1,11 +1,20 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
 import { Upload, Image, Loader2, Send, Check, Download, ArrowRight, ArrowLeft, Sparkles, Video, Type, X, Plus, MessageSquare, FileText, Youtube, AlertCircle, Settings } from 'lucide-react';
 import { getApiUrl } from '../config';
-import { apiFetch } from '../lib/api';
+import { apiFetch, QuotaError, openQuotaWall } from '../lib/api';
 import StepIndicator from './ui/StepIndicator';
 import SegmentedControl from './ui/SegmentedControl';
 
 const STEPS = ['Input', 'Titles', 'Generate', 'Description', 'Publish'];
+
+// The server's reason ("This video is 240 minutes long...") instead of raw JSON.
+function errorDetail(text) {
+  try {
+    const d = JSON.parse(text).detail;
+    if (typeof d === 'string') return d;
+  } catch { /* not JSON */ }
+  return text;
+}
 
 function DragDropZone({ label, accept, onFile, file, onClear, icon }) {
   const Icon = icon;
@@ -173,10 +182,7 @@ export default function ThumbnailStudio({ geminiApiKey, uploadPostKey, uploadUse
         body: formData
       });
 
-      if (!res.ok) {
-        const err = await res.text();
-        throw new Error(err);
-      }
+      if (!res.ok) throw new Error(errorDetail(await res.text()));
 
       const data = await res.json();
       setSessionId(data.session_id);
@@ -189,6 +195,7 @@ export default function ThumbnailStudio({ geminiApiKey, uploadPostKey, uploadUse
       }]);
       setStep(1);
     } catch (e) {
+      if (e instanceof QuotaError) { openQuotaWall(e, 'thumbnails'); return; }
       alert(`Analysis failed: ${e.message}`);
     } finally {
       setIsAnalyzing(false);
@@ -243,7 +250,7 @@ export default function ThumbnailStudio({ geminiApiKey, uploadPostKey, uploadUse
         body: JSON.stringify({ session_id: sessionId, message: userMsg })
       });
 
-      if (!res.ok) throw new Error(await res.text());
+      if (!res.ok) throw new Error(errorDetail(await res.text()));
       const data = await res.json();
       setTitles(data.titles || []);
       setThumbnailTexts(data.thumbnail_texts || []);
@@ -254,9 +261,10 @@ export default function ThumbnailStudio({ geminiApiKey, uploadPostKey, uploadUse
       }]);
       setTimeout(scrollToBottom, 100);
     } catch (e) {
+      if (e instanceof QuotaError) openQuotaWall(e, 'thumbnails');
       setChatHistory(prev => [...prev, {
         role: 'assistant',
-        content: `Failed to refine: ${e.message}`
+        content: `Failed to refine: ${e instanceof QuotaError ? 'no minutes left' : e.message}`
       }]);
     } finally {
       setIsRefining(false);
@@ -300,6 +308,7 @@ export default function ThumbnailStudio({ geminiApiKey, uploadPostKey, uploadUse
       }
       setGeneratedThumbnails(data.thumbnails);
     } catch (e) {
+      if (e instanceof QuotaError) { openQuotaWall(e, 'thumbnails'); return; }
       alert(`Generation failed: ${e.message}`);
     } finally {
       setIsGenerating(false);
@@ -410,7 +419,7 @@ export default function ThumbnailStudio({ geminiApiKey, uploadPostKey, uploadUse
       await new Promise((resolve, reject) => {
         const interval = setInterval(async () => {
           try {
-            const statusRes = await fetch(getApiUrl(`/api/thumbnail/publish/status/${publish_id}`));
+            const statusRes = await apiFetch(`/api/thumbnail/publish/status/${publish_id}`);
             if (!statusRes.ok) { clearInterval(interval); reject(new Error('Status check failed')); return; }
             const statusData = await statusRes.json();
 
@@ -431,6 +440,7 @@ export default function ThumbnailStudio({ geminiApiKey, uploadPostKey, uploadUse
       });
 
     } catch (e) {
+      if (e instanceof QuotaError) { openQuotaWall(e, 'thumbnail_publish'); return; }
       setPublishResult({ success: false, error: e.message });
     } finally {
       setIsPublishing(false);
@@ -471,7 +481,7 @@ export default function ThumbnailStudio({ geminiApiKey, uploadPostKey, uploadUse
         {/* Header */}
         <div className="flex items-end justify-between mb-2">
           <div>
-            <p className="eyebrow mb-2">05 · YOUTUBE STUDIO</p>
+            <p className="eyebrow mb-2">06 · YOUTUBE STUDIO</p>
             <h1 className="font-display lowercase text-2xl text-ink flex items-center gap-3">
               <span className="w-10 h-10 rounded-card bg-paper3 flex items-center justify-center">
                 <Image size={18} className="text-brass" />

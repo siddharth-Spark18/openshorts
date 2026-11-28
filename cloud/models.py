@@ -6,6 +6,7 @@ usage_ledger) are designed for atomic, restart-safe metering — see cloud/meter
 import uuid
 from sqlalchemy import (
     Column, String, Integer, Numeric, Boolean, DateTime, ForeignKey, Text, func, Index,
+    UniqueConstraint,
 )
 from sqlalchemy.dialects.postgresql import UUID, CITEXT, JSONB
 
@@ -24,16 +25,31 @@ class User(Base):
     stripe_customer_id = Column(Text, unique=True, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     last_login_at = Column(DateTime(timezone=True), nullable=True)
-    # Set by the unsubscribe link in the only email we send that is a
-    # commercial communication rather than a service notice (the out-of-minutes
-    # upsell). LSSI art. 21.2 lets us mail our own customers about a similar
-    # product, but only if every message carries a way out — so this column is
-    # what that link writes, and cloud/emails.py refuses to send when it is set.
+    # Set by the unsubscribe link in the emails that are commercial
+    # communications rather than service notices (the out-of-minutes upsell and
+    # the lifecycle emails). LSSI art. 21.2 lets us mail our own customers about
+    # a similar product, but only if every message carries a way out — so this
+    # column is what that link writes, and emails.send_commercial_email refuses
+    # to send when it is set.
     # Schema bootstrap is create_all, which never ALTERs: see
     # cloud/database.init_engine for the additive statement that adds it to an
     # existing database.
     marketing_opt_out = Column(Boolean, nullable=False, server_default="false",
                                default=False)
+    # Why this account gets no free monthly minutes, or NULL (the normal case).
+    # Set at sign-up for an address erased in the last FREE_REDO_BLOCK_DAYS
+    # ("recreated_after_deletion": deleting and re-registering handed out a
+    # fresh 20 minutes), and for accounts whose mail domain turns out to be a
+    # temp-mail front ("disposable_mx"), which the domain list alone cannot
+    # see. Paid plans and top-ups are untouched; clearing it restores the free
+    # plan. Added to existing databases by cloud/database._ADDITIVE_COLUMNS.
+    free_plan_denied = Column(String(32), nullable=True)
+    # Set by the support back-office (cloud/support_ops.py): a banned account
+    # cannot sign in, and its session tokens and API keys stop authenticating
+    # (cloud/auth.py). NULL is the normal case. Added to existing databases by
+    # cloud/database._ADDITIVE_COLUMNS.
+    ban_reason = Column(Text, nullable=True)
+    banned_at = Column(DateTime(timezone=True), nullable=True)
 
 
 class MagicLinkToken(Base):
@@ -54,6 +70,23 @@ class MagicLinkToken(Base):
     )
 
 
+class LoginCode(Base):
+    """A single-use code the Google callback hands the dashboard instead of the
+    session JWT itself (which used to ride in the redirect's URL hash, where
+    analytics and browser history could see it). The dashboard trades it for
+    the JWT by POST, proving with ``challenge`` that it is the same browser
+    that started the sign-in, so a code mailed to someone else signs nobody
+    in. Only the sha256 of the code is stored; it lives a few minutes."""
+    __tablename__ = "login_codes"
+    code_hash = Column(Text, primary_key=True)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"),
+                     nullable=False, index=True)
+    challenge = Column(Text, nullable=False)   # base64url(sha256(verifier))
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    used_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
 class Subscription(Base):
     __tablename__ = "subscriptions"
     id = Column(UUID(as_uuid=True), primary_key=True, default=_uuid)
@@ -68,6 +101,10 @@ class Subscription(Base):
     current_period_start = Column(DateTime(timezone=True), nullable=False)
     current_period_end = Column(DateTime(timezone=True), nullable=False)
     cancel_at_period_end = Column(Boolean, nullable=False, default=False)
+    # Month on hold from the cancel flow (config.ON_HOLD), mirrored from the
+    # Stripe metadata. hold_from stays set after the hold: one per subscription.
+    hold_from = Column(DateTime(timezone=True), nullable=True)
+    hold_until = Column(DateTime(timezone=True), nullable=True)
     last_event_at = Column(DateTime(timezone=True), nullable=True)  # ordering guard for webhooks
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
@@ -102,6 +139,7 @@ class UsageLedger(Base):
     __table_args__ = (
         Index("ix_usage_user_status", "user_id", "status"),
         Index("ix_usage_user_period_status", "user_id", "period_end", "status"),
+        Index("ix_usage_job_id", "job_id"),
     )
 
 
@@ -154,6 +192,9 @@ class ApiKey(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     last_used_at = Column(DateTime(timezone=True), nullable=True)
     revoked_at = Column(DateTime(timezone=True), nullable=True)
+    # OAuth-issued keys carry the scope granted at consent (cloud/scopes.py);
+    # NULL is a key the user made by hand, which reaches the whole API.
+    scope = Column(Text, nullable=True)
 
 
 class UploadPostProfile(Base):
@@ -298,6 +339,26 @@ class OAuthCode(Base):
     used_at = Column(DateTime(timezone=True), nullable=True)
 
 
+class OAuthRefreshToken(Base):
+    """The refresh token handed out with an OAuth access token. Access tokens
+    are ``osk_`` keys that never expire, so a refresh only happens when a
+    client insists on one: it swaps the key's secret in place (same row, same
+    entry in the account page) and returns the *same* refresh token, which is
+    what "persistent linking" clients (Gemini) expect. Revoking the key in the
+    account page or through ``/oauth/revoke`` kills the refresh token with it.
+    Only the sha256 is stored. Its own table because the schema bootstrap is
+    ``create_all`` (new columns on ``api_keys`` would not appear)."""
+    __tablename__ = "oauth_refresh_tokens"
+    token_hash = Column(Text, primary_key=True)
+    api_key_id = Column(UUID(as_uuid=True), ForeignKey("api_keys.id", ondelete="CASCADE"),
+                        nullable=False, index=True)
+    client_id = Column(Text, ForeignKey("oauth_clients.id", ondelete="CASCADE"), nullable=False)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"),
+                     nullable=False, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    last_used_at = Column(DateTime(timezone=True), nullable=True)
+
+
 class ProxyUsage(Base):
     """One row per event that put bytes through the per-GB paid proxy, or per
     download route decision worth keeping (the winner and why the free routes
@@ -319,3 +380,163 @@ class ProxyUsage(Base):
     route = Column(String(32), nullable=True)            # winning attempt label, or "none"
     paid_bytes = Column(Integer, nullable=False, default=0)
     detail = Column(JSONB, nullable=True)                # attempts: [{label, ok, bytes, error}]
+
+
+class AutopilotSettings(Base):
+    """Per-user switch for Autopilot: clip every new video on the user's
+    connected YouTube channel, and optionally publish the best clips.
+
+    The channel itself is not stored here. It is whatever YouTube account the
+    user connected to their Upload-Post profile, read at poll time, so
+    reconnecting a different channel just works and disconnecting stops it.
+
+    ``enabled_at`` is the baseline: only videos published after it are clipped
+    automatically, so switching Autopilot on never burns the month on the back
+    catalogue. Older videos can still be clipped by hand from the same page.
+    """
+    __tablename__ = "autopilot_settings"
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"),
+                     primary_key=True)
+    enabled = Column(Boolean, nullable=False, default=False)
+    enabled_at = Column(DateTime(timezone=True), nullable=True)
+    # The user confirmed they own (or have rights to) the channel's content.
+    # /api/process requires that attestation per job; Autopilot records it once.
+    rights_ack_at = Column(DateTime(timezone=True), nullable=True)
+    autopublish = Column(Boolean, nullable=False, default=False)
+    publish_platforms = Column(JSONB, nullable=True)      # ["tiktok", "instagram", "youtube"]
+    clips_to_publish = Column(Integer, nullable=False, default=3)
+    max_minutes = Column(Integer, nullable=False, default=30)
+    # Autopublish slot: one clip a day at this local hour, in this IANA zone.
+    publish_hour = Column(Integer, nullable=False, default=17)
+    timezone = Column(Text, nullable=True)
+    last_checked_at = Column(DateTime(timezone=True), nullable=True)
+    last_error = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class AutopilotRun(Base):
+    """One channel video Autopilot picked up, and what happened to it.
+
+    The (user_id, video_id) unique constraint is the dedupe: during a deploy two
+    API containers run the poller at once, and only the one whose INSERT wins
+    submits the job.
+    """
+    __tablename__ = "autopilot_runs"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"),
+                     nullable=False, index=True)
+    video_id = Column(Text, nullable=False)
+    video_url = Column(Text, nullable=True)
+    video_title = Column(Text, nullable=True)
+    thumbnail_url = Column(Text, nullable=True)
+    published_at = Column(DateTime(timezone=True), nullable=True)
+    trigger = Column(String(12), nullable=False, default="auto")   # auto | manual
+    status = Column(String(16), nullable=False, default="queued")  # queued | processing | completed | failed | skipped
+    reason = Column(Text, nullable=True)
+    job_id = Column(Text, nullable=True, index=True)
+    clips_count = Column(Integer, nullable=True)
+    posted_count = Column(Integer, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    __table_args__ = (
+        UniqueConstraint("user_id", "video_id", name="uq_autopilot_user_video"),
+    )
+
+
+class LifecycleEmail(Base):
+    """One lifecycle email sent to one account (cloud/lifecycle.py).
+
+    The (user_id, kind) unique constraint is the dedupe and the claim: the row
+    is inserted BEFORE the email goes out, so two API containers running the
+    loop during a deploy never both send it, and an account never gets the
+    same kind twice.
+    """
+    __tablename__ = "lifecycle_emails"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"),
+                     nullable=False, index=True)
+    kind = Column(String(32), nullable=False)  # welcome | first_clip | winback | checkout_recovery
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    __table_args__ = (
+        UniqueConstraint("user_id", "kind", name="uq_lifecycle_user_kind"),
+    )
+
+
+class CancellationFeedback(Base):
+    """Why a subscriber cancelled, and their review (cloud/cancellation.py).
+
+    One row per pass through the dashboard flow that ended in a cancel or in
+    the retention offer being taken (``outcome``). User-owned: the
+    free text belongs to the account and is erased with it, which is why it is
+    allowed here and not in ``account_deletions``.
+    """
+    __tablename__ = "cancellation_feedback"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"),
+                     nullable=False, index=True)
+    stripe_subscription_id = Column(Text, nullable=True)
+    plan = Column(String(20), nullable=True)
+    interval = Column(String(10), nullable=True)
+    reason = Column(String(32), nullable=False)          # one of cancellation.CANCEL_REASONS
+    details = Column(Text, nullable=True)
+    rating = Column(Integer, nullable=True)              # 1-5
+    review = Column(Text, nullable=True)
+    review_public_ok = Column(Boolean, nullable=False, default=False)
+    outcome = Column(String(16), nullable=True)          # canceled | retained
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+
+class OnboardingSurvey(Base):
+    """The sign-up survey (cloud/onboarding.py): where they heard of us, what
+    they came to make, who they are. One row per account, a skip included."""
+    __tablename__ = "onboarding_surveys"
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"),
+                     primary_key=True)
+    skipped = Column(Boolean, nullable=False, default=False)
+    source = Column(String(32), nullable=True, index=True)   # one of onboarding.SOURCES
+    source_other = Column(Text, nullable=True)
+    goals = Column(JSONB, nullable=True)                      # list of onboarding.GOALS
+    role = Column(String(32), nullable=True, index=True)      # one of onboarding.ROLES
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+
+class FirstVideoGrant(Base):
+    """One free first video clipped whole (app.free_overflow), by client IP.
+
+    Keyed on an HMAC of the IP, not the IP, and deliberately NOT tied to the
+    user row: deleting an account must not hand its network a fresh grant.
+    Rows past ``FIRST_VIDEO_IP_WINDOW_DAYS`` are deleted on the next grant.
+    A grant only counts while its job's reservation is live, so a first video
+    that fails does not use up the network's grant.
+    """
+    __tablename__ = "first_video_grants"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    ip_hash = Column(String(64), nullable=False, index=True)
+    job_id = Column(Text, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+
+class EvidenceEvent(Base):
+    """A successful sign-in or a checkout started, with the client IP and user
+    agent it came from: evidence for payment disputes (cloud/evidence.py).
+
+    Written best-effort in the background, never inside the request's own
+    transaction. ``email`` is kept next to ``user_id`` so a dispute can be
+    answered from the address on the charge. Erased with the account and
+    purged after ``evidence.RETENTION_DAYS``.
+    """
+    __tablename__ = "evidence_events"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"),
+                     nullable=True, index=True)
+    email = Column(CITEXT, nullable=True)
+    kind = Column(Text, nullable=False)       # login | checkout
+    method = Column(Text, nullable=False)     # magic_link | google | password | stripe_checkout
+    ip = Column(Text, nullable=True)
+    user_agent = Column(Text, nullable=True)  # truncated to evidence.USER_AGENT_MAX
+    meta = Column(JSONB, nullable=False, default=dict, server_default="{}")
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    __table_args__ = (
+        Index("ix_evidence_email_created", "email", "created_at"),
+    )

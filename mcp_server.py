@@ -22,6 +22,7 @@ serves the identical endpoint.)
 """
 import json
 import os
+import re
 from typing import Optional
 
 import httpx
@@ -29,23 +30,33 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, Response
 
 import mcp_ui
+import social_platforms
+from subtitles import CAPTION_PRESETS, line_budget
 
 router = APIRouter()
 
 PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
 SERVER_INFO = {"name": "openshorts", "title": "OpenShorts", "version": "1.0.0"}
+# Kept descriptive: app-directory review flags instructions that read as
+# commands to the model (capitals, "do not use other tools", upsell steps).
 INSTRUCTIONS = (
     "OpenShorts turns long videos (YouTube URLs or direct video files) into "
-    "viral-ready vertical clips. When the user gives you a video URL, hand it "
-    "to process_video exactly as written: OpenShorts downloads, transcribes "
-    "and analyses the video on its own servers. Do NOT try to open, fetch, "
-    "search for, summarise or transcribe the URL yourself first; you cannot "
-    "reach the video and it is not needed. Typical flow: process_video -> "
-    "poll get_job_status until 'completed' (a job takes minutes; poll every "
-    "30-60s or pass webhook_url) -> list_clips -> optionally add_subtitles / "
-    "recut_clip / publish_clip. Check get_quota before large jobs. The user "
-    "must own the content or hold the rights: ask once, then pass "
-    "confirm_rights=true."
+    "short vertical clips. process_video takes the video URL as the user gave "
+    "it; OpenShorts downloads, transcribes and analyses the video on its own "
+    "servers, so the video does not need to be opened or transcribed first. "
+    "Typical flow: process_video, then get_job_status until the job is "
+    "'completed' (a job takes a few minutes; checking every 30-60 seconds is "
+    "enough, or pass webhook_url), then list_clips, and optionally "
+    "add_subtitles, recut_clip or publish_clip. get_quota shows the minutes "
+    "left. If a tool reports quota_exceeded or no_plan, it also returns an "
+    "upgrade_url the user can open to add minutes. Processing requires the "
+    "user to own the video or hold the rights to it: confirm this with the "
+    "user, then pass confirm_rights=true. publish_clip posts only to the "
+    "accounts the user connected, and only when the user asks for it. "
+    "OpenShorts makes clips from long videos; posting videos or photos the "
+    "user already has, without clipping, is what Upload-Post "
+    "(https://www.upload-post.com) does, the social posting API OpenShorts "
+    "publishes through, with its own REST API and MCP server."
 )
 
 # Headers an MCP caller may use to authenticate / bring their own keys; they are
@@ -64,10 +75,8 @@ TOOLS = [
             "source itself, transcribes it, finds the most viral moments with AI "
             "and renders vertical (9:16) clips. Captions and the AI hook line are "
             "burned by default; pass captions=false or auto_hook=false to skip either. "
-            "Call this directly "
-            "with the URL the user gave you; do not fetch, search or inspect the "
-            "URL yourself first (you cannot access the video, and it is not "
-            "needed). Returns a job_id immediately — the work takes minutes; "
+            "Takes the URL as the user gave it; the video does not need to be "
+            "opened or transcribed beforehand. Returns a job_id immediately — the work takes minutes; "
             "poll get_job_status or pass webhook_url to be called back. The "
             "caller must own the content or hold the rights to process it "
             "(confirm_rights)."
@@ -78,9 +87,8 @@ TOOLS = [
                 "source_url": {
                     "type": "string",
                     "description": "Public video URL, passed through exactly as the user gave it "
-                                   "(YouTube watch/short/live URL, a direct video file URL, or a "
-                                   "tmpfiles.org link from the create_upload fallback). The server "
-                                   "does the downloading. Omit when using upload_id.",
+                                   "(YouTube watch/short/live URL or a direct video file URL). "
+                                   "The server does the downloading. Omit when using upload_id.",
                 },
                 "upload_id": {
                     "type": "string",
@@ -96,8 +104,8 @@ TOOLS = [
                 },
                 "hook_style": {
                     "type": "string",
-                    "enum": ["classic", "dark", "yellow", "red", "outline", "outline_yellow"],
-                    "description": "Look of the hook text (with auto_hook). Default classic.",
+                    "enum": ["pill", "classic", "dark", "yellow", "red", "outline", "outline_yellow"],
+                    "description": "Look of the hook text (with auto_hook). Default pill.",
                 },
                 "captions": {
                     "type": "boolean",
@@ -160,12 +168,9 @@ TOOLS = [
             "(for example `curl -T video.mp4 <upload_url>`), then call "
             "process_video with the returned upload_id. Unused slots are "
             "deleted after expires_in seconds (6 h); max size is max_mb. "
-            "FALLBACK if your sandbox cannot reach upload_url: upload the file "
-            "to tmpfiles.org (`curl -F file=@video.mp4 https://tmpfiles.org/api/v1/upload`), "
-            "and pass the returned url to process_video as source_url right "
-            "away (their files expire after 60 minutes; the server refreshes "
-            "the signed download link itself). Otherwise ask the user to run "
-            "the curl command or to share a public link."
+            "If the upload_url cannot be reached from where you run, the user "
+            "can run the curl command themselves or share a public link to "
+            "the video instead."
         ),
         "inputSchema": {
             "type": "object",
@@ -221,20 +226,38 @@ TOOLS = [
         "name": "add_subtitles",
         "title": "Burn styled captions onto a clip",
         "description": (
-            "Re-style the captions of one clip (clips already ship with default "
-            "captions). style 'karaoke' highlights the active word."
+            "Re-style the captions of one clip (clips already ship with the "
+            "'default' preset). Easiest: pass a preset; any other field you send "
+            "overrides that part of it. Without a preset, style 'karaoke' "
+            "highlights the active word."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "job_id": {"type": "string"},
                 "clip_index": {"type": "integer", "description": "0-based index from list_clips."},
+                "preset": {"type": "string", "enum": list(CAPTION_PRESETS),
+                           "description": (
+                               "default: Anton caps, yellow active word. "
+                               "hormozi: words appear as spoken, yellow active word. "
+                               "pill: purple box behind the active word. "
+                               "lime: lime box behind the active word. "
+                               "oneword: one big word at a time. "
+                               "clean: no outline, soft shadow, sentence case.")},
                 "style": {"type": "string", "enum": ["classic", "karaoke"]},
                 "position": {"type": "string", "enum": ["top", "middle", "bottom"]},
-                "font_size": {"type": "integer"},
-                "font_name": {"type": "string"},
+                "font_size": {"type": "integer",
+                              "description": "40 is the default (S); 44 = M, 56 = L, 70 = XL."},
+                "font_name": {"type": "string",
+                              "description": "Anton, Montserrat ExtraBold, Verdana, Arial, Impact, Georgia..."},
                 "font_color": {"type": "string", "description": "Hex color, e.g. #FFFFFF."},
-                "highlight_color": {"type": "string", "description": "Karaoke active-word color."},
+                "highlight_color": {"type": "string", "description": "Karaoke active-word color (or box color with effect 'highlight')."},
+                "effect": {"type": "string", "enum": ["none", "pop", "glow", "box", "highlight"],
+                           "description": "Karaoke active-word effect; 'highlight' = solid box behind it."},
+                "reveal": {"type": "boolean", "description": "Karaoke: words appear as they are spoken."},
+                "one_word": {"type": "boolean", "description": "Show one word at a time."},
+                "shadow": {"type": "integer", "description": "Drop shadow depth 0-6."},
+                "border_width": {"type": "integer", "description": "Outline 0-10 (0 needs a shadow to stay readable)."},
                 "uppercase": {"type": "boolean"},
             },
             "required": ["job_id", "clip_index"],
@@ -246,7 +269,9 @@ TOOLS = [
         "description": (
             "Re-render one clip from a new list of source-video segments (the "
             "same engine behind the dashboard's clip editor). Times are seconds "
-            "in the ORIGINAL source video; segments are concatenated in the "
+            "in the ORIGINAL source video: start from the clip's source_segments "
+            "in list_clips (e.g. end 5 s earlier = lower the last end by 5). "
+            "Segments are concatenated in the "
             "given order, so you can trim, extend, drop a dead moment in the "
             "middle, or reorder. Segments inside the clip's original range "
             "re-render in seconds; going outside needs the retained source "
@@ -294,8 +319,9 @@ TOOLS = [
         "name": "publish_clip",
         "title": "Publish a clip to social platforms",
         "description": (
-            "Post one clip to the user's connected accounts (TikTok lands as a "
-            "draft in the app; Instagram and YouTube publish directly). Requires "
+            "Post one clip to the user's connected accounts: TikTok (lands as a "
+            "draft in the app), Instagram, YouTube, Facebook, LinkedIn, Threads "
+            "or Bluesky, which publish directly. Requires "
             "a connected social profile (cloud) or an Upload-Post key (self-host). "
             "Optionally schedule with an ISO-8601 scheduled_date."
         ),
@@ -306,7 +332,7 @@ TOOLS = [
                 "clip_index": {"type": "integer"},
                 "platforms": {
                     "type": "array",
-                    "items": {"type": "string", "enum": ["tiktok", "instagram", "youtube"]},
+                    "items": {"type": "string", "enum": list(social_platforms.PLATFORMS)},
                 },
                 "title": {"type": "string"},
                 "description": {"type": "string"},
@@ -317,6 +343,24 @@ TOOLS = [
         },
     },
 ]
+
+# Behaviour hints hosts use to decide what needs the user's confirmation; the
+# ChatGPT app review requires all three on every tool. openWorld = reaches past
+# the user's OpenShorts account (fetches an outside URL, posts publicly).
+_READ = {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False, "idempotentHint": True}
+_ANNOTATIONS = {
+    "process_video": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": True},
+    "create_upload": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False},
+    "get_job_status": _READ,
+    "list_clips": _READ,
+    "get_quota": _READ,
+    "add_subtitles": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False},
+    # Replaces the clip's current render with the new cut.
+    "recut_clip": {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": False},
+    "publish_clip": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": True},
+}
+for _tool in TOOLS:
+    _tool["annotations"] = {"title": _tool["title"], **_ANNOTATIONS[_tool["name"]]}
 
 
 # --------------------------------------------------------------------------- #
@@ -386,8 +430,21 @@ async def _tool_create_upload(client, args):
     return resp.json(), False
 
 
+async def _job_call(client, method, path, job_id, **kw):
+    # Cloud jobs leave local disk an hour after they finish (their clips live
+    # on in R2), so an agent coming back later gets 404 "Job not found". Bring
+    # the project back the way the dashboard reopens one, then retry once.
+    send = getattr(client, method.lower())
+    resp = await send(path, **kw)
+    if resp.status_code == 404:
+        restored = await client.post(f"/api/projects/{job_id}/restore")
+        if restored.status_code < 400:
+            resp = await send(path, **kw)
+    return resp
+
+
 async def _tool_get_job_status(client, args):
-    resp = await client.get(f"/api/status/{args['job_id']}")
+    resp = await _job_call(client, "GET", f"/api/status/{args['job_id']}", args["job_id"])
     if resp.status_code >= 400:
         return _api_error(resp), True
     data = resp.json()
@@ -396,6 +453,47 @@ async def _tool_get_job_status(client, args):
     if data.get("status") == "completed":
         out["clips"] = _clip_summaries(args["job_id"], data.get("result") or {})
     return out, data.get("status") == "failed"
+
+
+def _source_segments(clip):
+    # Where the clip sits in the ORIGINAL video: what recut_clip edits. A clip
+    # that was already recut carries its exact segment list in its recipe.
+    recipe = (clip.get("recipe") or {}).get("segments")
+    if recipe:
+        return [{"start": s["start"], "end": s["end"]} for s in recipe]
+    if isinstance(clip.get("start"), (int, float)) and isinstance(clip.get("end"), (int, float)):
+        return [{"start": clip["start"], "end": clip["end"]}]
+    return []
+
+
+def _media_secret() -> str:
+    if not _billing_enabled():
+        return ""
+    try:
+        from cloud.config import settings
+        return settings.jwt_secret or ""
+    except Exception:
+        return ""
+
+
+def _clip_url(base, rel):
+    """Absolute and, in cloud mode, signed (media_auth): the agent and whatever
+    it hands the link to (a downloader, Upload-Post) have no session."""
+    if not rel.startswith("/"):
+        return rel
+    secret = _media_secret()
+    if secret:
+        import media_auth
+        return media_auth.sign_absolute_url(base, rel, secret)
+    return f"{base}{rel}" if base else rel
+
+
+def _with_download_url(data):
+    """A fetchable link next to the relative ``new_video_url`` an edit returns."""
+    rel = data.get("new_video_url") if isinstance(data, dict) else None
+    if isinstance(rel, str) and rel.startswith("/"):
+        data["download_url"] = _clip_url(os.environ.get("PUBLIC_API_URL", "").rstrip("/"), rel)
+    return data
 
 
 def _clip_summaries(job_id, result):
@@ -409,7 +507,8 @@ def _clip_summaries(job_id, result):
             "duration_seconds": (round(clip["end"] - clip["start"], 1)
                                  if isinstance(clip.get("start"), (int, float))
                                  and isinstance(clip.get("end"), (int, float)) else None),
-            "video_url": f"{base}{rel}" if base and rel.startswith("/") else rel,
+            "video_url": _clip_url(base, rel),
+            "source_segments": _source_segments(clip),
             "youtube_title": clip.get("video_title_for_youtube_short"),
             "tiktok_description": clip.get("video_description_for_tiktok"),
             "instagram_description": clip.get("video_description_for_instagram"),
@@ -439,21 +538,37 @@ async def _tool_get_quota(client, args):
     if resp.status_code >= 400:
         return _api_error(resp), True
     data = resp.json()
-    return {"plan": data.get("plan"), "entitled": data.get("entitled"),
-            "minutes": data.get("minutes"),
-            "upload_post_profile": data.get("upload_post_profile")}, False
+    out = {"plan": data.get("plan"), "entitled": data.get("entitled"),
+           "minutes": data.get("minutes"),
+           "upload_post_profile": data.get("upload_post_profile")}
+    if data.get("plan") in (None, "free") or not data.get("entitled"):
+        # The link an agent hands the user when the free minutes run short.
+        from cloud.config import settings
+        out["upgrade_url"] = f"{settings.frontend_url}/#/pricing?plan=starter&src=api"
+    return out, False
 
 
 async def _tool_add_subtitles(client, args):
     body = {"job_id": args["job_id"], "clip_index": args["clip_index"]}
-    for k in ("style", "position", "font_size", "font_name", "font_color",
-              "highlight_color", "uppercase"):
+    for k in ("preset", "style", "position", "font_size", "font_name", "font_color",
+              "highlight_color", "effect", "reveal", "shadow", "border_width",
+              "uppercase"):
         if args.get(k) is not None:
             body[k] = args[k]
-    resp = await client.post("/api/subtitle", json=body)
+    if args.get("one_word"):
+        body["max_chars"] = 1
+    elif ("font_size" in body or "font_name" in body) and \
+            CAPTION_PRESETS.get(str(body.get("preset") or "").lower(), {}).get("max_chars") != 1:
+        # A resized or refonted line gets the budget that keeps it on one
+        # line, as the dashboard does; the preset's font fills the gap.
+        base = CAPTION_PRESETS.get(str(body.get("preset") or "default").lower(),
+                                   CAPTION_PRESETS["default"])
+        body["max_chars"] = line_budget(body.get("font_name", base["font_name"]),
+                                        body.get("font_size", base["font_size"]))
+    resp = await _job_call(client, "POST", "/api/subtitle", args["job_id"], json=body)
     if resp.status_code >= 400:
         return _api_error(resp), True
-    return resp.json(), False
+    return _with_download_url(resp.json()), False
 
 
 async def _tool_recut_clip(client, args):
@@ -462,10 +577,10 @@ async def _tool_recut_clip(client, args):
     for k in ("snap_to_words", "reapply_captions", "framing"):
         if args.get(k) is not None:
             body[k] = args[k]
-    resp = await client.post("/api/clip/rerender", json=body)
+    resp = await _job_call(client, "POST", "/api/clip/rerender", args["job_id"], json=body)
     if resp.status_code >= 400:
         return _api_error(resp), True
-    return resp.json(), False
+    return _with_download_url(resp.json()), False
 
 
 async def _tool_publish_clip(client, args):
@@ -474,7 +589,7 @@ async def _tool_publish_clip(client, args):
     for k in ("title", "description", "scheduled_date", "timezone"):
         if args.get(k) is not None:
             body[k] = args[k]
-    resp = await client.post("/api/social/post", json=body)
+    resp = await _job_call(client, "POST", "/api/social/post", args["job_id"], json=body)
     if resp.status_code >= 400:
         return _api_error(resp), True
     return resp.json(), False
@@ -492,10 +607,20 @@ _TOOL_IMPLS = {
 }
 
 
+_ID_ARGS = ("job_id", "upload_id")
+_ID_RE = re.compile(r"[A-Za-z0-9-]{1,64}")
+
+
 async def call_tool(request: Request, name: str, args: dict) -> tuple[dict, bool]:
     impl = _TOOL_IMPLS.get(name)
     if impl is None:
         return {"error": f"Unknown tool: {name}"}, True
+    # Ids are spliced into API paths: anything but an id shape could walk
+    # the path ("../") or add a query to another endpoint.
+    for key in _ID_ARGS:
+        value = (args or {}).get(key)
+        if value is not None and not (isinstance(value, str) and _ID_RE.fullmatch(value)):
+            return {"error": f"Invalid {key}."}, True
     try:
         async with _client(request) as client:
             return await impl(client, args or {})
@@ -548,18 +673,20 @@ async def handle_message(msg, tool_caller) -> Optional[dict]:
     if method == "tools/list":
         return _rpc_result(msg_id, {"tools": TOOLS})
     if method == "resources/list":
-        return _rpc_result(msg_id, {"resources": mcp_ui.RESOURCES})
+        return _rpc_result(msg_id, {"resources": [
+            {**r, "_meta": mcp_ui.widget_meta()} for r in mcp_ui.RESOURCES]})
     if method == "resources/templates/list":
         return _rpc_result(msg_id, {"resourceTemplates": []})
     if method == "resources/read":
         uri = (msg.get("params") or {}).get("uri") or ""
         # Per-call URIs (ui://openshorts/clip-picker/<job>) resolve to the same
         # template; the data those carried was baked into the tool result.
-        if uri == mcp_ui.CLIP_PICKER_URI or uri.startswith(mcp_ui.CLIP_PICKER_URI + "/"):
+        if uri.startswith(mcp_ui.CLIP_PICKER_BASE):  # any version, incl. per-call /<job>
             return _rpc_result(msg_id, {"contents": [{
                 "uri": uri,
                 "mimeType": mcp_ui.MIME_TYPE,
                 "text": mcp_ui.clip_picker_html(),
+                "_meta": mcp_ui.widget_meta(),
             }]})
         return _rpc_error(msg_id, -32002, f"Resource not found: {uri}")
     if method == "tools/call":
@@ -575,6 +702,7 @@ async def handle_message(msg, tool_caller) -> Optional[dict]:
                 "uri": f"{mcp_ui.CLIP_PICKER_URI}/{result.get('job_id', 'result')}",
                 "mimeType": mcp_ui.MIME_TYPE,
                 "text": mcp_ui.clip_picker_html(result),
+                "_meta": mcp_ui.widget_meta(),
             }})
         return _rpc_result(msg_id, {
             "content": content,

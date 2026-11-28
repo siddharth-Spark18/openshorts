@@ -1,12 +1,16 @@
+import json
 import os
+import tempfile
 import re
+import shutil
 import textwrap
 import subprocess
 import urllib.request
 import uuid
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
-from ffmpeg_utils import video_encode_args, QUALITY, METADATA_SCRUB
+from ffmpeg_utils import video_encode_args, QUALITY, METADATA_SCRUB, finished_before_crash
+import gpu_decode
 
 
 def _truncate_bytes(text, max_bytes):
@@ -23,6 +27,17 @@ def _truncate_bytes(text, max_bytes):
 FONT_URL = "https://github.com/googlefonts/noto-fonts/raw/main/hinted/ttf/NotoSerif/NotoSerif-Bold.ttf"
 FONT_DIR = "fonts"
 FONT_PATH = os.path.join(FONT_DIR, "NotoSerif-Bold.ttf")
+# Bundled (SIL OFL, see fonts/Montserrat-OFL.txt): the "pill" look's sans.
+PILL_FONT_PATH = os.path.join(FONT_DIR, "Montserrat-ExtraBold.ttf")
+
+# Typefaces the hook editor offers, all bundled so the server render and the
+# browser preview use the same file. The size factor (share of the box width)
+# evens out their visual weight: Anton is condensed, Montserrat wide.
+HOOK_FONTS = {
+    "montserrat": (PILL_FONT_PATH, 0.064),
+    "anton": (os.path.join(FONT_DIR, "Anton-Regular.ttf"), 0.08),
+    "serif": (FONT_PATH, 0.05),
+}
 
 # Codepoint ranges NotoSerif has no glyphs for (would render as tofu boxes).
 _EMOJI_RE = re.compile(
@@ -190,6 +205,10 @@ def download_font_if_needed():
 # Hook visual styles. Each maps to box fill (RGBA, alpha 0 = no box), text
 # color, and an optional text outline (color, px) for box-less looks.
 HOOK_STYLES = {
+    # Default. TikTok-native look: every line its own white rounded box,
+    # black bold sans (Montserrat ExtraBold).
+    "pill":    {"box": (255, 255, 255, 250), "text": (0, 0, 0), "outline": None, "shadow": False,
+                "font": PILL_FONT_PATH, "pills": True},
     # White card, black serif text (original look).
     "classic": {"box": (255, 255, 255, 240), "text": (0, 0, 0), "outline": None, "shadow": True},
     # Dark card, white text.
@@ -205,15 +224,46 @@ HOOK_STYLES = {
 }
 
 
-def create_hook_image(text, target_width, output_image_path="hook_overlay.png", font_scale=1.0, style="classic"):
+def _draw_pills(lines, font, emoji_font, font_size, box_fill, text_fill, output_image_path):
+    """One rounded box per line, stacked and centred (the "pill" style).
+
+    Every box has the same height (from the font's own ascent/descent plus
+    accents), so the stack reads as one block whatever the letters are.
+    """
+    lines = [ln for ln in lines if ln.strip()] or [" "]
+    pad_x = int(font_size * 0.48)
+    pad_y = int(font_size * 0.24)
+    radius = int(font_size * 0.36)
+    probe = ImageDraw.Draw(Image.new('RGBA', (1, 1)))
+    top, bottom = probe.textbbox((0, 0), "ÁÉÍÓÚÑgjpqy", font=font)[1::2]
+    line_h = (bottom - top) + 2 * pad_y
+    widths = [int(_measure_width(probe, ln, font, emoji_font)) for ln in lines]
+    canvas_w = max(widths) + 2 * pad_x + 40
+    canvas_h = line_h * len(lines) + 40
+
+    img = Image.new('RGBA', (canvas_w, canvas_h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    for i, (ln, w) in enumerate(zip(lines, widths)):
+        box_w = w + 2 * pad_x
+        x0 = (canvas_w - box_w) // 2
+        y0 = 20 + i * line_h
+        draw.rounded_rectangle([x0, y0, x0 + box_w, y0 + line_h], radius=radius, fill=box_fill)
+        _draw_mixed(img, draw, (x0 + pad_x, y0 + pad_y - top), ln, font, emoji_font,
+                    fill=text_fill, outline=None)
+    img.save(output_image_path)
+    return output_image_path, canvas_w, canvas_h
+
+
+def create_hook_image(text, target_width, output_image_path="hook_overlay.png", font_scale=1.0, style="pill",
+                      font=None):
     """
     Generates a hook overlay image using pixel-based wrapping.
     target_width: The max width the box should occupy (e.g. 85% of video)
-    style: one of HOOK_STYLES (classic/dark/yellow/red/outline/outline_yellow)
+    style: one of HOOK_STYLES (pill/classic/dark/yellow/red/outline/outline_yellow)
     """
     download_font_if_needed()
 
-    look = HOOK_STYLES.get(style, HOOK_STYLES["classic"])
+    look = HOOK_STYLES.get(style, HOOK_STYLES["pill"])
     box_fill = look["box"]
     text_fill = look["text"]
     outline = look["outline"]
@@ -229,13 +279,18 @@ def create_hook_image(text, target_width, output_image_path="hook_overlay.png", 
     shadow_blur = 10
     
     # Font Size Calculation (approx 5% of width - tuned to match Noto Serif Bold metrics in browser)
-    base_font_size = int(target_width * 0.05)
+    pills = bool(look.get("pills"))
+    # A chosen typeface (HOOK_FONTS key) wins; otherwise the style's own
+    # (pill -> Montserrat, the rest -> Noto Serif, as they always rendered).
+    default_font = "montserrat" if look.get("font") == PILL_FONT_PATH else "serif"
+    font_path, size_factor = HOOK_FONTS.get(font or default_font, HOOK_FONTS[default_font])
+    base_font_size = int(target_width * size_factor)
     font_size = int(base_font_size * font_scale)
     
     try:
-        font = ImageFont.truetype(FONT_PATH, font_size)
+        font = ImageFont.truetype(font_path, font_size)
     except Exception as e:
-        print(f"⚠️ Warning: Could not load font {FONT_PATH}, using default. Error: {e}")
+        print(f"⚠️ Warning: Could not load font {font_path}, using default. Error: {e}")
         font = ImageFont.load_default()
 
     # Emoji handling: render with an emoji-capable font if one exists,
@@ -290,6 +345,10 @@ def create_hook_image(text, target_width, output_image_path="hook_overlay.png", 
 
         if current_line:
             lines.append(' '.join(current_line))
+
+    if pills:
+        return _draw_pills(lines, font, emoji_font, font_size, box_fill, text_fill,
+                           output_image_path)
 
     # Recalculate true width/height
     max_line_width = 0
@@ -370,12 +429,86 @@ def create_hook_image(text, target_width, output_image_path="hook_overlay.png", 
     img.save(output_image_path)
     return output_image_path, canvas_w, canvas_h
 
-def add_hook_to_video(video_path, text, output_path, position="top", font_scale=1.0, duration=None, style="classic"):
+def _auto_place(video_path, text, target_box_width, hook_filename, font_scale, style, font,
+                video_width, video_height, duration, ranges, has_captions, first_dims):
+    """position='auto': pick the height (and, only if every height covers a
+    face, a smaller text) with hook_placement. Returns {"image": (path, w, h),
+    "y_px", "y", "scale"}, or None to fall back to the legacy top spot (no
+    readable frames, no MediaPipe, or nothing fits between the bands)."""
+    import hook_placement
+    import layout_ranges as _layouts
+
+    window_end = float(duration) if duration else hook_placement.DEFAULT_WINDOW
+    if ranges is None:
+        ranges = _layouts.read(video_path)
+    ranges = _layouts.normalise(ranges)
+    bands = hook_placement.caption_bands(ranges, 0.0, window_end, has_captions)
+    # A WIDE picture floats in blur: keep the hook in the blur when it fits,
+    # and only fall back to the caption-only rule when it does not.
+    pictures = hook_placement.content_bands(ranges, 0.0, window_end)
+    frames = hook_placement.detect_faces(video_path, 0.0, window_end)
+    if frames is None:
+        print("   ℹ️ Hook placement: no frames read, keeping the top spot.")
+        return None
+
+    dims = {1.0: first_dims}
+
+    def measure(rel):
+        if rel not in dims:
+            _, w, h = create_hook_image(text, target_box_width, hook_filename,
+                                        font_scale=font_scale * rel, style=style, font=font)
+            dims[rel] = (w, h)
+        w, h = dims[rel]
+        return w / video_width, h / video_height
+
+    y = None
+    if pictures:
+        rel, y, cost = hook_placement.best_scale(measure, frames,
+                                                 sorted(set(bands) | set(pictures)))
+        if y is not None:
+            bands = sorted(set(bands) | set(pictures))
+    if y is None:
+        rel, y, cost = hook_placement.best_scale(measure, frames, bands)
+    if y is None:
+        print("   ℹ️ Hook placement: no spot clears the captions, keeping the top spot.")
+        return None
+    # The temp PNG holds the last size measured: render the chosen one again.
+    _, w, h = create_hook_image(text, target_box_width, hook_filename,
+                                font_scale=font_scale * rel, style=style, font=font)
+    n_faces = sum(len(f) for f in frames)
+    print(f"   🎯 Hook placement: y={y:.2f} scale={rel:g} face cover={cost:.2f} "
+          f"({n_faces} faces in {len(frames)} frames, bands={bands})")
+    return {"image": (hook_filename, w, h), "y_px": int(round(y * video_height)),
+            "y": round(y, 3), "scale": rel}
+
+
+def add_hook_to_video(video_path, text, output_path, position="top", font_scale=1.0, duration=None, style="pill",
+                      also=None, font=None, layout_ranges=None, has_captions=True,
+                      mark=None, clean=True):
     """
     Overlays text hook onto video.
-    position: 'top', 'center', 'bottom'
+    position: 'top', 'center', 'bottom', or 'auto' (hook_placement: off the
+      faces in the hook's window and off the caption bands; what the job
+      pipeline and an editor left on "auto" use). An explicit top/center/
+      bottom is drawn exactly where it always was.
+    layout_ranges / has_captions: only read by 'auto', to know where the
+      captions sit (seam on SPLIT stretches, bottom elsewhere). None reads
+      the clip's own ``.layout.json`` sidecar.
     font_scale: float multiplier (1.0 = default)
     style: hook look (see HOOK_STYLES)
+    also: optional (vf, path): ALSO write ``path`` = the hooked picture with
+      ``vf`` applied (the captions), from the same decode. The editor
+      re-captions from the hooked-only picture, but most clips are never
+      re-captioned, so with ``also`` that file is not encoded: a recipe
+      (overlay image + position) is kept instead and ``materialize`` encodes
+      it the first time it is asked for (``HOOK_LAZY=0``: encode it here).
+    mark: optional (logo_path, make_filter, path), only with ``also``: ALSO
+      write ``path`` = the captioned picture with the free-plan mark, from the
+      same decode (the served ``wm_`` copy, see main.mark_delivery).
+      ``make_filter(vw, vh, video=, logo=, out=)`` is main.watermark_filter.
+    clean: with ``mark``, False writes only the marked copy and keeps a
+      recipe for the clean captioned file instead (clean_twin.py, ``also[2]``
+      = the caption file it is made from).
     """
     if not os.path.exists(video_path):
         raise FileNotFoundError(f"Video {video_path} not found")
@@ -402,17 +535,31 @@ def add_hook_to_video(video_path, text, output_path, position="top", font_scale=
     # debugging hint, so it is trimmed by BYTES (filesystems cap at 255 bytes,
     # and one Bengali or Arabic character costs three). Embedding it untrimmed
     # raised OSError 36 and killed the endpoint in prod on 26-jul-2026.
+    # In the system temp dir, not the working directory: the process may run
+    # from a read-only tree (the remote worker's container), where writing the
+    # overlay next to the code failed and every clip came out without its hook.
     stem = os.path.splitext(os.path.basename(video_path))[0]
-    hook_filename = (f"temp_hook_{uuid.uuid4().hex[:8]}_"
-                     f"{_truncate_bytes(stem, 80)}.png")
+    hook_filename = os.path.join(
+        tempfile.gettempdir(),
+        f"temp_hook_{uuid.uuid4().hex[:8]}_{_truncate_bytes(stem, 80)}.png")
     
     try:
-        img_path, box_w, box_h = create_hook_image(text, target_box_width, hook_filename, font_scale=font_scale, style=style)
-        
+        img_path, box_w, box_h = create_hook_image(text, target_box_width, hook_filename, font_scale=font_scale, style=style,
+                                                       font=font)
+        placed = None
+        if position == "auto":
+            placed = _auto_place(video_path, text, target_box_width, hook_filename, font_scale,
+                                 style, font, video_width, video_height, duration,
+                                 layout_ranges, has_captions, (box_w, box_h))
+            if placed:
+                img_path, box_w, box_h = placed["image"]
+
         # 3. Calculate Overlay Position
         overlay_x = (video_width - box_w) // 2
         
-        if position == "center":
+        if placed:
+            overlay_y = placed["y_px"]
+        elif position == "center":
             overlay_y = (video_height - box_h) // 2
         elif position == "bottom":
              # Bottom 20% mark (approx)
@@ -424,21 +571,86 @@ def add_hook_to_video(video_path, text, output_path, position="top", font_scale=
         # 4. FFmpeg Command
         print(f"🎬 Overlaying hook: '{text}' at {overlay_x},{overlay_y}")
         
-        ffmpeg_cmd = [
-            'ffmpeg', '-y',
-            '-i', video_path,
-            '-i', img_path,
-            '-filter_complex', f"[0:v][1:v]overlay={overlay_x}:{overlay_y}"
-                + (f":enable='between(t,0,{float(duration)})'" if duration else ""),
-            '-c:a', 'copy',
-            *video_encode_args(QUALITY),
-            *METADATA_SCRUB,
-            '-movflags', '+faststart',
-            output_path
-        ]
-        
-        subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=1800)
-        print(f"✅ Hook added to {output_path}")
+        overlay = _overlay_graph(overlay_x, overlay_y, duration)
+        tail = _encode_tail()
+        lazy = also is not None and LAZY
+        hooked_out = [] if lazy else ['-map', '[h]', '-map', '0:a?', *tail, output_path]
+        clean = clean or not (also and mark)
+        if also and mark:
+            extra_vf, extra_path = also[:2]
+            logo_path, make_filter, mark_path = mark
+            marked = make_filter(video_width, video_height, video="[sm]",
+                                 logo="[2:v]", out="[m]")
+            captioned = f"{extra_vf},split=2[s][sm]" if clean else f"{extra_vf}[sm]"
+            graph = (f"{overlay},{captioned};{marked}" if lazy else
+                     f"{overlay},split=2[h][c];[c]{captioned};{marked}")
+            clean_out = ['-map', '[s]', '-map', '0:a?', *tail, extra_path] if clean else []
+            ffmpeg_cmd = [
+                'ffmpeg', '-y',
+                '-i', video_path,
+                '-i', img_path,
+                '-i', logo_path,
+                '-filter_complex', graph,
+                *hooked_out,
+                *clean_out,
+                '-map', '[m]', '-map', '0:a?', *tail, mark_path,
+            ]
+        elif also:
+            extra_vf, extra_path = also[:2]
+            graph = (f"{overlay},{extra_vf}[s]" if lazy else
+                     f"{overlay},split=2[h][c];[c]{extra_vf}[s]")
+            ffmpeg_cmd = [
+                'ffmpeg', '-y',
+                '-i', video_path,
+                '-i', img_path,
+                '-filter_complex', graph,
+                *hooked_out,
+                '-map', '[s]', '-map', '0:a?', *tail, extra_path,
+            ]
+        else:
+            ffmpeg_cmd = _overlay_cmd(video_path, img_path, overlay, output_path)
+
+        outputs = [] if lazy else [output_path]
+        stages = [] if lazy else [("hook", output_path)]
+        if also:
+            if clean:
+                outputs.append(also[1])
+                stages.append(("ass", also[1]))
+            if mark:
+                outputs.append(mark[2])
+                stages.append(("mark", mark[2]))
+        import gpu_burn
+        # The same pictures from the card when it can (gpu_burn.py), else ffmpeg.
+        if not gpu_burn.burn(video_path, stages, hook=(img_path, overlay_x, overlay_y, duration),
+                             ass_vf=also[0] if also else None,
+                             mark=(mark[0], mark[1]) if also and mark else None,
+                             video_size=(video_width, video_height)):
+            result = _run_encode(ffmpeg_cmd, video_path, outputs)
+            if result.returncode != 0 and not finished_before_crash(result, outputs):
+                raise subprocess.CalledProcessError(result.returncode, ffmpeg_cmd,
+                                                    result.stdout, result.stderr)
+        if lazy:
+            try:
+                _write_recipe(output_path, video_path, img_path, overlay_x, overlay_y, duration)
+                print(f"✅ Hook added to {also[1]} ({os.path.basename(output_path)} on demand)")
+            except Exception as e:
+                # No recipe, no on-demand file: encode the hooked picture now.
+                print(f"⚠️ Hook recipe not kept ({e}); encoding {output_path} now")
+                cmd = _overlay_cmd(video_path, img_path, overlay, output_path)
+                done = _run_encode(cmd, video_path, [output_path])
+                if done.returncode != 0 and not finished_before_crash(done, [output_path]):
+                    raise subprocess.CalledProcessError(done.returncode, cmd,
+                                                        done.stdout, done.stderr)
+        else:
+            print(f"✅ Hook added to {output_path}")
+        if not clean:
+            # Only the marked copy was encoded: keep how to make the clean one
+            # (clean_twin.py). A failure here fails the pass like an encode.
+            import clean_twin
+            clean_twin.write_recipe(also[1], output_path, also[2])
+        if placed:
+            return {"position": "auto", "y": placed["y"], "scale": placed["scale"],
+                    "height": round(box_h / video_height, 3)}
         return True
 
     except subprocess.TimeoutExpired:
@@ -454,3 +666,105 @@ def add_hook_to_video(video_path, text, output_path, position="top", font_scale=
         # Cleanup temp image
         if os.path.exists(hook_filename):
             os.remove(hook_filename)
+
+
+# --- the hooked-only picture, encoded on demand -------------------------------
+
+LAZY = os.environ.get("HOOK_LAZY", "1").strip() != "0"
+RECIPE_PREFIX = ".hookrecipe_"
+
+
+def _overlay_graph(x, y, duration):
+    return (f"[0:v][1:v]overlay={x}:{y}"
+            + (f":enable='between(t,0,{float(duration)})'" if duration else ""))
+
+
+def _encode_tail():
+    return ['-c:a', 'copy', *video_encode_args(QUALITY), *METADATA_SCRUB,
+            '-movflags', '+faststart']
+
+
+def _overlay_cmd(video_path, img_path, overlay, output_path):
+    return ['ffmpeg', '-y', '-i', video_path, '-i', img_path,
+            '-filter_complex', overlay, *_encode_tail(), output_path]
+
+
+def _run_encode(cmd, video_path, outputs):
+    return gpu_decode.run(
+        lambda on_gpu: gpu_decode.on_card(cmd, video_path) if on_gpu else cmd,
+        lambda c: subprocess.run(c, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                 timeout=1800),
+        ok=lambda r: r.returncode == 0 or finished_before_crash(r, outputs),
+        path=video_path)
+
+
+def recipe_paths(output_dir, hooked_name):
+    """(json, png) holding how to encode ``hooked_name``, next to the clip."""
+    base = os.path.join(output_dir, f"{RECIPE_PREFIX}{hooked_name}")
+    return base + ".json", base + ".png"
+
+
+def has_recipe(output_dir, hooked_name):
+    return os.path.exists(recipe_paths(output_dir, hooked_name)[0])
+
+
+def _write_recipe(output_path, video_path, img_path, x, y, duration):
+    """Keep what it takes to encode ``output_path`` later: the overlay image
+    and where it went. The source must sit in the same directory."""
+    output_dir = os.path.dirname(output_path)
+    if os.path.dirname(os.path.abspath(video_path)) != os.path.abspath(output_dir):
+        raise ValueError("the hook's source must be next to its output")
+    json_path, png_path = recipe_paths(output_dir, os.path.basename(output_path))
+    shutil.copyfile(img_path, png_path)
+    # The JSON last and atomically: a recipe whose JSON exists is whole (a
+    # remote worker sends recipes while the job is still running).
+    tmp = f"{json_path}.{uuid.uuid4().hex[:8]}.part"
+    with open(tmp, "w") as f:
+        json.dump({"source": os.path.basename(video_path), "x": x, "y": y,
+                   "duration": duration}, f)
+    os.replace(tmp, json_path)
+
+
+def materialize(output_dir, hooked_name):
+    """Encode ``hooked_name`` from its recipe if it is not on disk yet.
+
+    True when the file exists afterwards. Safe to call concurrently: each
+    call encodes to its own temporary name and renames it into place."""
+    path = os.path.join(output_dir, hooked_name)
+    if os.path.exists(path):
+        return True
+    json_path, png_path = recipe_paths(output_dir, hooked_name)
+    try:
+        with open(json_path) as f:
+            r = json.load(f)
+        source = os.path.join(output_dir, os.path.basename(r["source"]))
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+    if not (os.path.exists(source) and os.path.exists(png_path)):
+        return False
+    # The recipe is a file: its numbers are read as numbers before they go
+    # into a filter graph, whoever wrote it.
+    try:
+        x, y = int(r["x"]), int(r["y"])
+        duration = float(r["duration"]) if r.get("duration") else None
+    except (KeyError, TypeError, ValueError):
+        return False
+    if not (-20000 <= x <= 20000 and -20000 <= y <= 20000) or (
+            duration is not None and not 0 < duration < 86400):
+        return False
+    tmp = os.path.join(output_dir, f".part_{uuid.uuid4().hex[:8]}_{hooked_name}")
+    cmd = _overlay_cmd(source, png_path, _overlay_graph(x, y, duration), tmp)
+    try:
+        import gpu_burn
+        if gpu_burn.burn(source, [("hook", tmp)], hook=(png_path, x, y, duration)):
+            os.replace(tmp, path)
+            return True
+        result = _run_encode(cmd, source, [tmp])
+        if result.returncode != 0 and not finished_before_crash(result, [tmp]):
+            print(f"⚠️ Could not encode {hooked_name} from its recipe")
+            return False
+        os.replace(tmp, path)
+        return True
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)

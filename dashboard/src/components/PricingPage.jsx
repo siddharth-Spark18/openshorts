@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { ArrowDown, ArrowRight, Check, ChevronDown, Github, MoveRight, Cpu, KeyRound, Send, Server, HardDrive } from 'lucide-react';
+import { ArrowDown, ArrowRight, Check, ChevronDown, Github, MoveRight, Cpu, KeyRound, Send, Server, HardDrive, Repeat } from 'lucide-react';
 import PricingSection from './PricingSection';
 
 // The honest hosted-vs-self-hosted trade-off. The software is identical and open
@@ -24,8 +24,14 @@ const HOSTED_VS_SELF = [
   {
     icon: Send,
     label: 'Auto-posting',
-    hosted: 'TikTok, Instagram Reels and YouTube Shorts connect straight from your account.',
+    hosted: 'Paid plans: connect TikTok, Instagram, YouTube, Facebook, LinkedIn, Threads and Bluesky once and every clip posts or schedules straight from the app.',
     self: 'You register your own Upload-Post account and wire up the credentials.',
+  },
+  {
+    icon: Repeat,
+    label: 'Autopilot',
+    hosted: 'Paid plans: each new video on your YouTube channel is clipped on its own and the best clips are scheduled to your socials, one a day.',
+    self: 'Not included: it needs an always-on server watching your channel.',
   },
   {
     icon: Server,
@@ -41,27 +47,29 @@ const HOSTED_VS_SELF = [
   },
 ];
 
-// Billing / value questions reused verbatim from Landing.jsx faqs
+// Billing / value questions reused verbatim from Landing.jsx faqs, minus the
+// two that called the product free with no limits: this page is where every
+// cancelled checkout lands, right under the paid plans.
 const FAQS = [
   {
     question: "Is OpenShorts really free? What's the catch?",
-    answer: "There is no catch, but there are two different things on offer. (1) Self-hosted is 100% free and open source: you run it with Docker on your own machine, bring your own API keys, and there are no watermarks, no usage limits and no subscription. What it costs you is hardware and time. On a typical CPU an 8-minute video takes 5 to 8 minutes to process, and you need your own Google Gemini key (required, free tier is 1,500 requests/day), plus ElevenLabs for dubbing and fal.ai for AI Shorts if you want those. (2) Hosted at openshorts.app is the same software with the running costs covered: our NVIDIA GPU clips that same 8-minute video in about 50 seconds, the Gemini key is included so there is nothing to create or paste, auto-posting to TikTok, Instagram and YouTube is already wired up, and your clips are stored and re-openable from any browser. It has a free plan (20 minutes a month, watermark, no credit card) and paid plans from $12/mo for 100 minutes without watermark. So: free if you are happy to run it yourself, paid if you would rather it just ran fast. Both are far cheaper than Opus Clip ($15-228/month) or Kapwing ($24-79/month)."
-  },
-  {
-    question: "How does OpenShorts compare to Opus Clip?",
-    answer: "OpenShorts is a free, self-hosted alternative to Opus Clip. Both offer AI viral moment detection and smart vertical cropping. Key differences: OpenShorts is completely free vs Opus Clip's $15-228/month pricing. OpenShorts runs on your infrastructure (full data privacy) vs cloud-only. OpenShorts uses Google Gemini 3.1 Flash-Lite for AI analysis vs Opus Clip's proprietary model. OpenShorts adds AI voice dubbing in 30+ languages, AI-generated video effects, and hook text overlays. The trade-off is that OpenShorts requires Docker self-hosting, while Opus Clip is a ready-to-use cloud service."
+    answer: "There is no catch, but there are two different things on offer. (1) Self-hosted is 100% free and open source: you run it with Docker on your own machine, bring your own API keys, and there are no watermarks, no usage limits and no subscription. What it costs you is hardware and time. On a typical CPU an 8-minute video takes 5 to 8 minutes to process, and you need your own Google Gemini key (required, free tier is 1,500 requests/day), plus ElevenLabs for dubbing and fal.ai for AI Shorts if you want those. (2) Hosted at openshorts.app is the same software with the running costs covered: our NVIDIA GPU clips that same 8-minute video in about 50 seconds, the Gemini key is included so there is nothing to create or paste, paid plans post every clip to TikTok, Instagram, YouTube, Facebook, LinkedIn, Threads and Bluesky for you and Autopilot clips each new video on your channel on its own, and your clips are stored and re-openable from any browser. It has a free plan (20 minutes a month, watermark, no credit card) and paid plans from $12/mo for 100 minutes without watermark. So: free if you are happy to run it yourself, paid if you would rather it just ran fast. Both are far cheaper than Opus Clip ($15-228/month) or Kapwing ($24-79/month)."
   },
   {
     question: "Can OpenShorts generate YouTube thumbnails and titles for free?",
-    answer: "Yes. OpenShorts includes a free AI YouTube thumbnail generator, a free AI YouTube title generator, and a free AI YouTube description generator — all powered by Google Gemini 3.1 Flash-Lite. Upload your video and the AI suggests 10 viral title options with an interactive refinement chat. Then it generates multiple thumbnail designs using AI image generation — upload a face photo and background image for personalized results. The studio also auto-generates YouTube descriptions with chapter timestamps and lets you publish directly to YouTube. Everything is 100% free with the Gemini free tier."
-  },
-  {
-    question: "Is there a free open source clip generator?",
-    answer: "Yes — OpenShorts is a 100% free, open source clip generator. Unlike paid clip generators like Opus Clip ($15-228/month) or Kapwing ($24-79/month), OpenShorts lets you generate unlimited clips with no watermarks, no usage limits, and no subscription fees. It also includes a free AI YouTube thumbnail generator, free AI YouTube title generator, and free AI YouTube description generator — features that other clip generators charge extra for. You self-host it with Docker on your own machine for full privacy and control."
+    answer: "Yes. OpenShorts includes a free AI YouTube thumbnail generator, a free AI YouTube title generator, and a free AI YouTube description generator — all powered by Google Gemini 3.1 Flash-Lite. Upload your video and the AI suggests 10 viral title options with an interactive refinement chat. Then it generates multiple thumbnail designs using AI image generation — upload a face photo and background image for personalized results. The studio also auto-generates YouTube descriptions with chapter timestamps and lets you publish directly to YouTube. Self-hosted, it all runs on your own Gemini key (the free tier works). On OpenShorts Cloud, titles and descriptions work on every plan and thumbnail images need a paid plan, from $12/month."
   },
   {
     question: "How much does it cost to generate an AI UGC video?",
     answer: "OpenShorts itself is free, but the AI Shorts feature uses external APIs (fal.ai for video generation, ElevenLabs for voiceover) that charge per use. Low Cost mode costs approximately $0.65 per video (Flux image $0.05 + ElevenLabs voice $0.10 + Hailuo img2video $0.19 + VEED Lipsync $0.20 + b-roll $0.10). Premium mode costs approximately $2.00 per video using Kling Avatar v2 for higher quality. Both modes are significantly cheaper than hiring UGC creators ($50-500 per video) or using platforms like HeyGen ($24-180/month)."
+  },
+  {
+    question: "Can OpenShorts post my clips to my social networks automatically?",
+    answer: "Yes, on every paid plan of OpenShorts Cloud (from $12/month). Connect your TikTok, Instagram, YouTube, Facebook, LinkedIn, Threads and Bluesky accounts once from the app and each clip can be posted to all of them in one go, or scheduled, without downloading anything; posting runs on Upload-Post and is already set up for you. Autopilot goes one step further: connect your YouTube channel and every new video you upload is clipped on its own, and the best clips are scheduled to your socials, one a day at the hour you choose. The free plan is download-only. Self-hosted, you can post with your own Upload-Post account, but Autopilot is Cloud only."
+  },
+  {
+    question: "I only want to post videos I already have. Do I need OpenShorts?",
+    answer: "No. OpenShorts is for cutting long videos into clips. If you only want to post videos or photos you already have to TikTok, Instagram, YouTube, LinkedIn, Facebook, X, Threads, Pinterest, Bluesky or Reddit, use Upload-Post (upload-post.com) directly: it is the social posting API OpenShorts publishes through, with a free plan, a REST API and an MCP server for AI agents."
   },
   {
     question: "Does API and MCP access cost extra?",
@@ -93,10 +101,10 @@ const TRUST_CARDS = [
     ),
   },
   {
-    eyebrow: 'no watermarks · no per-clip credits',
+    eyebrow: 'no watermark on paid plans · no per-clip credits',
     body: (
       <>
-        Clips export clean — no watermarks. Plans meter minutes of input video per billing
+        Paid plans export clean clips, with no watermark. Plans meter minutes of input video per billing
         period, never per-clip credits.
       </>
     ),
@@ -105,7 +113,7 @@ const TRUST_CARDS = [
     eyebrow: 'cancel anytime',
     body: (
       <>
-        Start on the free plan — 20 minutes a month, no credit card. Billing for paid
+        Start on the free plan — your first video free up to 60 minutes, then 20 minutes a month, no credit card. Billing for paid
         plans runs on Stripe — cancel anytime from your account.
       </>
     ),
@@ -167,7 +175,7 @@ export default function PricingPage({ onRequireLogin }) {
           <h1 className="font-display lowercase text-ink tracking-tight text-4xl md:text-6xl leading-[1.02] mb-5">
             start clipping in minutes.
           </h1>
-          <p className="readout">free plan · 20 min/month · no credit card</p>
+          <p className="readout">first video free (up to 60 min) · then 20 min/month · no credit card</p>
         </div>
       </header>
 

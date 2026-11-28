@@ -185,6 +185,9 @@ class TestStripeCancel:
             async def execute(self, _stmt):
                 return _Result()
 
+            async def get(self, _model, _id):
+                return None
+
             async def __aenter__(self):
                 return self
 
@@ -198,3 +201,48 @@ class TestStripeCancel:
         monkeypatch.setattr(stripe.Subscription, "cancel", staticmethod(_boom))
 
         assert asyncio.run(account._cancel_subscriptions("uid")) == "starter"
+
+
+    def test_a_live_subscription_without_a_row_is_cancelled_too(self, monkeypatch):
+        """One row per user here, but Stripe can hold two live subscriptions
+        for the customer; the unlisted one must not keep charging."""
+        stripe = pytest.importorskip("stripe")
+
+        class _Row:
+            stripe_subscription_id = "sub_known"
+            status = "active"
+            plan = "pro"
+
+        class _Result:
+            def scalars(self):
+                return [_Row()]
+
+        class _User:
+            stripe_customer_id = "cus_1"
+
+        class _Session:
+            async def execute(self, _stmt):
+                return _Result()
+
+            async def get(self, _model, _id):
+                return _User()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_a):
+                return False
+
+        class _List:
+            def auto_paging_iter(self):
+                return iter([{"id": "sub_known", "status": "active"},
+                             {"id": "sub_extra", "status": "active"},
+                             {"id": "sub_old", "status": "canceled"}])
+
+        cancelled = []
+        monkeypatch.setattr(account.database, "session", lambda: _Session())
+        monkeypatch.setattr(stripe.Subscription, "cancel", staticmethod(cancelled.append))
+        monkeypatch.setattr(stripe.Subscription, "list", staticmethod(lambda **k: _List()))
+
+        assert asyncio.run(account._cancel_subscriptions("uid")) == "pro"
+        assert cancelled == ["sub_known", "sub_extra"]

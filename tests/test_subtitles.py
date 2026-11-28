@@ -1,4 +1,5 @@
 """Tests for subtitle word merging, SRT generation and style sanitizing."""
+import subprocess
 from subtitles import (
     merge_continuation_words,
     generate_srt,
@@ -124,6 +125,51 @@ class TestGenerateAss:
         assert content.count("\\c&H5EC522&") == 3  # #22C55E -> BGR 5EC522
         assert content.count("{\\r}") == 3          # reset to dimmed base style
         assert "Style: Default,Verdana," in content
+
+    def _render(self, tmp_path, **kw):
+        from subtitles import generate_ass
+        out = tmp_path / "subs.ass"
+        words = [_w(" one", 0.0, 0.3), _w(" two", 0.3, 0.6), _w(" three", 0.6, 0.9)]
+        assert generate_ass(self._transcript(words), 0, 10, str(out), **kw) is True
+        return out.read_text(encoding="utf-8-sig")
+
+    def test_highlight_puts_active_word_on_a_box(self, tmp_path):
+        content = self._render(tmp_path, effect="highlight", highlight_color="#7C3AED")
+        active = [l for l in content.splitlines() if l.startswith("Style: Active,")]
+        assert len(active) == 1
+        fields = active[0].split(",")
+        assert fields[15] == "3"                      # BorderStyle 3 = opaque box
+        assert fields[6] == "&H00ED3A7C"              # box in the highlight colour
+        assert fields[3] == "&H00FFFFFF"              # white text on a dark box
+        assert content.count("{\\rActive}") == 3
+
+    def test_highlight_light_box_gets_black_text(self, tmp_path):
+        content = self._render(tmp_path, effect="highlight", highlight_color="#FFE500")
+        active = next(l for l in content.splitlines() if l.startswith("Style: Active,"))
+        assert active.split(",")[3] == "&H00000000"
+
+    def test_reveal_hides_words_not_spoken_yet(self, tmp_path):
+        content = self._render(tmp_path, reveal=True)
+        events = [l for l in content.splitlines() if l.startswith("Dialogue:")]
+        # First word active: the two after it are invisible; last word: none.
+        assert events[0].count("\\alpha&HFF&") == 2
+        assert events[2].count("\\alpha&HFF&") == 0
+        assert "\\alpha" not in self._render(tmp_path)
+
+    def test_shadow_without_outline_is_the_clean_look(self, tmp_path):
+        content = self._render(tmp_path, border_width=0, shadow=2)
+        fields = next(l for l in content.splitlines() if l.startswith("Style: Default,")).split(",")
+        assert (fields[16], fields[17]) == ("0", "2")   # Outline, Shadow
+        # Without a shadow, "no border" keeps the 1px floor it always had.
+        fields = next(l for l in self._render(tmp_path, border_width=0).splitlines()
+                      if l.startswith("Style: Default,")).split(",")
+        assert (fields[16], fields[17]) == ("1", "0")
+
+    def test_max_chars_one_shows_one_word_at_a_time(self, tmp_path):
+        content = self._render(tmp_path, max_chars=1)
+        events = [l for l in content.splitlines() if l.startswith("Dialogue:")]
+        assert len(events) == 3
+        assert all(" " not in e.split(",,", 1)[1].replace("{\\r}", "") for e in events)
 
     def test_karaoke_merges_fragments_too(self, tmp_path):
         from subtitles import generate_ass
@@ -330,3 +376,61 @@ class TestFilterQuoting:
     def test_plain_path_untouched(self):
         from subtitles import _escape_ffmpeg_filter_value
         assert _escape_ffmpeg_filter_value("/out/subs_0_123.ass") == "/out/subs_0_123.ass"
+
+
+class TestBurnWithMark:
+    """Free plan: the served wm_ copy comes out of the caption burn's decode."""
+
+    def _run(self, monkeypatch, tmp_path, returncode=0, stderr=b"", write=True):
+        import subtitles as m
+        captured = {}
+
+        def fake_run(cmd, **kw):
+            captured["cmd"] = cmd
+            if write:
+                for i, a in enumerate(cmd):
+                    if a.endswith(".mp4") and cmd[i - 1] != "-i":
+                        open(a, "wb").write(b"x" * 10)
+            return subprocess.CompletedProcess(cmd, returncode, b"", stderr)
+        monkeypatch.setattr(m.subprocess, "run", fake_run)
+        monkeypatch.setattr(m.subprocess, "check_output", lambda *a, **k: b"1080x1920\n")
+        srt = tmp_path / "subs.ass"
+        srt.write_text("stub", encoding="utf-8")
+        out, wm = str(tmp_path / "subtitled.mp4"), str(tmp_path / "wm_subtitled.mp4")
+        made = []
+
+        def make_filter(vw, vh, video, logo, out):
+            made.append((vw, vh, video, logo, out))
+            return f"{logo}null[wm];{video}[wm]overlay=54:768{out}"
+        m.burn_subtitles("in.mp4", str(srt), out, mark=("logo.png", make_filter, wm))
+        return captured["cmd"], made, out, wm
+
+    def test_two_outputs_from_one_decode(self, monkeypatch, tmp_path):
+        cmd, made, out, wm = self._run(monkeypatch, tmp_path)
+        assert made == [(1080, 1920, "[sm]", "[1:v]", "[m]")]
+        assert cmd[cmd.index("logo.png") - 1] == "-i"
+        assert ",split=2[s][sm];" in cmd[cmd.index("-filter_complex") + 1]
+        assert cmd.index(out) < cmd.index(wm) and cmd[-1] == wm
+        assert "-vf" not in cmd
+
+    def test_crash_after_both_outputs_finished_is_kept(self, monkeypatch, tmp_path):
+        self._run(monkeypatch, tmp_path, returncode=-11,
+                  stderr=b"muxing overhead: 0.1%\nmuxing overhead: 0.1%\n")
+
+    def test_crash_before_the_copy_finished_fails(self, monkeypatch, tmp_path):
+        import pytest
+        with pytest.raises(Exception, match="FFmpeg failed"):
+            self._run(monkeypatch, tmp_path, returncode=-11, stderr=b"muxing overhead: 0.1%\n")
+
+    def test_without_mark_the_command_is_unchanged(self, monkeypatch, tmp_path):
+        import subtitles as m
+        captured = {}
+        monkeypatch.setattr(m.subprocess, "run",
+                            lambda cmd, **kw: captured.setdefault("cmd", cmd) and
+                            subprocess.CompletedProcess(cmd, 0, b"", b""))
+        srt = tmp_path / "subs.ass"
+        srt.write_text("stub", encoding="utf-8")
+        m.burn_subtitles("in.mp4", str(srt), "out.mp4")
+        cmd = captured["cmd"]
+        assert cmd[:5] == ["ffmpeg", "-y", "-i", "in.mp4", "-vf"]
+        assert cmd[5:8] == [cmd[5], "-c:a", "copy"] and cmd[-1] == "out.mp4"

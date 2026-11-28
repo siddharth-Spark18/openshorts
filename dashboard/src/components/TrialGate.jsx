@@ -12,7 +12,7 @@ export default function TrialGate({ toolName = 'this' }) {
         <div className="text-ink2 lowercase leading-relaxed min-w-0">
           <span className="font-medium text-ink">Preview mode.</span>{' '}
           Sign in with <span className="font-medium text-ink">Google</span> to use {toolName} free —
-          20 min/month, no credit card. <span className="text-muted">Or run it free by self-hosting.</span>
+          first video up to 60 min, then 20 min/month, no credit card. <span className="text-muted">Or run it free by self-hosting.</span>
         </div>
       </div>
       <button

@@ -284,6 +284,25 @@ class TestPerformRecut:
         assert events == [("reframe", "vertical"), ("watermark",)]
         assert served == clean
 
+    def test_source_render_trims_the_source_subtitle_band(self, tmp_path, monkeypatch):
+        # A re-render from the source must trim the source's own burned-in
+        # subtitles again, or they come back under our captions.
+        seen = {}
+
+        def fake_render_clip(i, o, f, **kwargs):
+            seen.update(kwargs)
+            with open(o, "wb") as fh:
+                fh.write(b"x")
+            return True
+
+        monkeypatch.setattr(recut, "_main_attr",
+                            lambda name: fake_render_clip)
+        recut.perform_recut(
+            input_path="source.mp4", segments=[_seg(5, 15)],
+            output_dir=str(tmp_path), clean_name="t_clip_1.mp4",
+            reframe=True, runner=self._touching_runner, subtitle_band=0.79)
+        assert seen["subtitle_band"] == 0.79
+
     def test_renderer_failure_raises_and_cleans_up(self, tmp_path):
         with pytest.raises(RuntimeError):
             recut.perform_recut(

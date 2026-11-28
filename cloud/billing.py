@@ -8,19 +8,20 @@ Design (matches the Stripe implementation planner for this use case):
   every handler upserts the full object rather than applying deltas.
 """
 import asyncio
+import re
 from datetime import datetime, timezone
 
 import httpx
 import stripe
-from fastapi import APIRouter, Request, HTTPException
+from fastapi import APIRouter, Request, HTTPException, Response
 from pydantic import BaseModel
 from sqlalchemy import select
 
 from .config import (settings, PLAN_MINUTES, TRIAL_DAYS, SUBSCRIPTION_LOOKUP_KEYS,
                      TOPUP_LOOKUP_KEYS, new_subscriber_label)
-from . import analytics, config, database
+from . import analytics, config, database, evidence
 from .models import User, Subscription, CreditTopup, StripeEvent, SignupAttribution
-from .auth import get_current_user_required
+from .auth import get_current_user_required, get_session_user_required
 
 router = APIRouter()
 
@@ -128,8 +129,11 @@ async def _blocking_sub_status(user_id):
 # Endpoints
 # --------------------------------------------------------------------------- #
 @router.get("/api/billing/plans")
-async def list_plans():
+async def list_plans(response: Response):
     cat = await get_catalog()
+    # The same catalog for everyone, asked for by every pricing view: the
+    # browser may reuse it for a few minutes.
+    response.headers["Cache-Control"] = "public, max-age=300"
     return {"plans": cat["plans"], "topups": cat["topups"]}
 
 
@@ -138,17 +142,22 @@ async def list_plans():
 # them, and it is the express request for immediate performance that art. 16(m)
 # of the consumer-rights directive wants before we start spending minutes
 # inside the 14-day withdrawal window. Without it a withdrawal on day 13 is
-# a full refund of a plan that was already used.
+# a full refund of a plan that was already used. Kept to one short sentence:
+# it sits right above the pay button, for every buyer, not only EU ones.
 CONSENT_MESSAGE = (
-    "I accept the Terms of Service and the Privacy Policy, and I ask OpenShorts "
-    "to start the service immediately. EU consumers: you keep your 14-day right "
-    "of withdrawal, but you accept that we may charge for the minutes already "
-    "processed when you withdraw."
+    "I accept the Terms and Privacy Policy and ask OpenShorts to start now. "
+    "EU: if you withdraw within 14 days, minutes already used are charged."
 )
+
+_SOURCE_RE = re.compile(r"^[a-z0-9_]{1,40}$")
 
 
 class CheckoutRequest(BaseModel):
     price_id: str
+    # The surface that opened the checkout (wall, watermark, pricing_email_...).
+    # Saved on the session so Stripe-side data can be split by origin, and used
+    # to send whoever cancels back to where they came from.
+    source: str = ""
 
 
 @router.post("/api/billing/checkout")
@@ -168,6 +177,10 @@ async def create_checkout(body: CheckoutRequest, request: Request):
             raise HTTPException(status_code=409, detail=(
                 "Your last payment didn't go through, so we can't start a new plan "
                 "yet. Update your card under Manage billing and it resumes right away."))
+        if blocked == config.ON_HOLD:
+            raise HTTPException(status_code=409, detail=(
+                "Your plan is paused. Restart it from your account page "
+                "(Account → Restart now) to get your minutes back."))
         if blocked:
             raise HTTPException(
                 status_code=409,
@@ -175,13 +188,23 @@ async def create_checkout(body: CheckoutRequest, request: Request):
 
     customer_id = await ensure_stripe_customer(user.id, user.email)
     fe = settings.frontend_url
+    source = body.source if _SOURCE_RE.match(body.source or "") else ""
+    # Back from Stripe without paying: the pricing page for its own clicks, the
+    # app (their clips) for everything opened from inside it.
+    if not source or source.startswith("pricing"):
+        cancel_url = f"{fe}/#/pricing?checkout=cancel"
+    else:
+        cancel_url = f"{fe}/#app?checkout=cancel"
     kwargs = dict(
         mode=mode,
         customer=customer_id,
         line_items=[{"price": body.price_id, "quantity": 1}],
         client_reference_id=str(user.id),
         success_url=f"{fe}/#/account?checkout=success",
-        cancel_url=f"{fe}/#/pricing?checkout=cancel",
+        cancel_url=cancel_url,
+        # Stripe's default 24 h expiry and the code field for everyone: the 1 h
+        # expiry and the code field only for win-back recipients coincided with
+        # fewer completed checkouts, so both went back to the defaults.
         allow_promotion_codes=True,
         # Business customers need their legal name and VAT on the invoice to
         # deduct the tax, and this is the only place they can ever type them:
@@ -197,16 +220,24 @@ async def create_checkout(body: CheckoutRequest, request: Request):
         # that already converts at ~1%.
         tax_id_collection={"enabled": True},
         customer_update={"name": "auto", "address": "auto"},
+        # Recovery makes Stripe hand the checkout.session.expired webhook a URL
+        # that reopens the same cart, which cloud/lifecycle.py mails once.
+        after_expiration={"recovery": {"enabled": True, "allow_promotion_codes": True}},
         metadata={
             "user_id": str(user.id),
             "kind": entry["kind"],
             "minutes": str(entry.get("minutes", "")),
+            "plan": str(entry.get("plan") or ""),
+            "source": source,
         },
     )
     # Dead while TRIAL_DAYS == 0 (trials retired in favor of the free plan);
     # kept as the documented grandfathering mechanism.
     if mode == "subscription" and TRIAL_DAYS > 0:
         kwargs["subscription_data"] = {"trial_period_days": TRIAL_DAYS}
+    evidence.record_event(
+        user_id=user.id, email=user.email, kind="checkout", method="stripe_checkout",
+        request=request, meta={k: kwargs["metadata"][k] for k in ("plan", "kind", "minutes")})
     consent = dict(
         consent_collection={"terms_of_service": "required"},
         custom_text={"terms_of_service_acceptance": {"message": CONSENT_MESSAGE}},
@@ -242,7 +273,7 @@ async def end_trial(request: Request):
     Used when a trialing user hits the trial minute cap and chooses to
     activate their plan right away. The subscription webhook flips status→active
     (and thus the full ``minutes_per_period`` allowance) once Stripe confirms."""
-    user = await get_current_user_required(request)
+    user = await get_session_user_required(request, "API keys cannot manage billing. Sign in to the dashboard.")
     async with database.session() as session:
         sub = (await session.execute(
             select(Subscription).where(Subscription.user_id == user.id)
@@ -260,7 +291,7 @@ async def end_trial(request: Request):
 
 @router.post("/api/billing/portal")
 async def create_portal(request: Request):
-    user = await get_current_user_required(request)
+    user = await get_session_user_required(request, "API keys cannot manage billing. Sign in to the dashboard.")
     customer_id = await ensure_stripe_customer(user.id, user.email)
     session = await asyncio.to_thread(lambda: stripe.billing_portal.Session.create(
         customer=customer_id, return_url=f"{settings.frontend_url}/#/account",
@@ -323,7 +354,7 @@ async def list_invoices(request: Request):
     """Legal invoices for the signed-in user: ``{"invoices": [{doc_number,
     doc_date, total, currency, status, public_url, pdf_url}]}``. Free users
     (no Stripe customer yet) get an empty list, not an error."""
-    user = await get_current_user_required(request)
+    user = await get_session_user_required(request, "API keys cannot manage billing. Sign in to the dashboard.")
     if not settings.agentledger_api_key:
         raise HTTPException(status_code=503, detail="Billing backend not configured")
     async with database.session() as session:
@@ -357,6 +388,9 @@ async def list_invoices(request: Request):
 async def stripe_webhook(request: Request):
     payload = await request.body()
     sig = request.headers.get("stripe-signature", "")
+    if not settings.stripe_webhook_secret:
+        # An empty secret is an HMAC anyone can compute: refuse instead.
+        raise HTTPException(status_code=503, detail="Webhook not configured")
     try:
         event = stripe.Webhook.construct_event(payload, sig, settings.stripe_webhook_secret)
     except Exception:
@@ -368,6 +402,9 @@ async def stripe_webhook(request: Request):
             return {"ok": True, "dedup": True}
 
     await handle_event(event)
+    # A plan or a top-up may have changed: nobody's remembered snapshot stands.
+    from .auth import forget_current_user
+    forget_current_user()
 
     async with database.session() as s:
         async with s.begin():
@@ -384,7 +421,12 @@ async def handle_event(event: dict):
     obj = event["data"]["object"]
     created = _ts(event["created"])
 
-    if etype == "checkout.session.completed" and obj.get("mode") == "payment":
+    if (etype in ("checkout.session.completed", "checkout.session.async_payment_succeeded")
+            and obj.get("mode") == "payment"
+            and obj.get("payment_status") in (None, "paid", "no_payment_required")):
+        # A delayed method (bank debit) completes the session unpaid and
+        # reports the money later in async_payment_succeeded; credit then.
+        # _apply_topup is idempotent per checkout session.
         await _apply_topup(obj)
     elif etype in ("customer.subscription.created", "customer.subscription.updated"):
         await _upsert_subscription(obj, created)
@@ -398,6 +440,12 @@ async def handle_event(event: dict):
         await _track_invoice_revenue(obj)
     elif etype == "charge.refunded":
         await _track_refund(obj)
+    elif etype == "checkout.session.expired":
+        from . import lifecycle
+        try:
+            await lifecycle.on_checkout_expired(obj)
+        except Exception as e:  # an email must never make Stripe retry the event
+            print(f"⚠️  Checkout recovery email failed: {e}")
 
 
 async def _user_id_for_customer(session, customer_id):
@@ -452,10 +500,10 @@ async def _apply_topup(session_obj: dict):
     total = session_obj.get("amount_total")
     if total:
         amount_txt = f" ({_money(total, session_obj.get('currency'))})"
-    from .alerts import send_admin_alert
+    from .alerts import send_admin_alert, user_ref
     await send_admin_alert(
         f"💰 Top-up purchased{amount_txt}",
-        f"{buyer_email or 'A user'} bought +{minutes} minutes.",
+        f"{user_ref(user_id)} bought +{minutes} minutes.",
     )
     # Mirror the sale into OpenPanel, on the same profile the browser identifies.
     analytics.track_revenue(
@@ -491,6 +539,50 @@ def _sub_period(sub_obj: dict):
     return start, end
 
 
+LIVE_STATUSES = ("active", "trialing")
+
+
+def became_live(prev_status, now_status) -> bool:
+    """The transition that turns a free account into a paid one."""
+    return now_status in LIVE_STATUSES and prev_status not in LIVE_STATUSES
+
+
+async def _unmark_after_upgrade(user_id):
+    try:
+        from . import videos
+        await videos.unmark_user_library(user_id)
+    except Exception as e:
+        print(f"⚠️  Could not unmark the library of {user_id} after upgrade: {e}")
+
+
+# app.py hands us ``(user_id, priority)``: move that user's waiting jobs up.
+_local_reprioritize = None
+
+
+def register_local_reprioritize(fn):
+    global _local_reprioritize
+    _local_reprioritize = fn
+
+
+async def _reprioritize_waiting_jobs(user_id, plan):
+    """A live plan dispatches at ``PLAN_PRIORITY[plan]``: the videos this user
+    already has in the queue get it too ("paid plans skip the line"). Called on
+    every live upsert, not only the free -> paid one: it is idempotent and also
+    covers an upgrade between paid plans and a renewal that arrives after the
+    period had lapsed. Top-ups do not call it: a new job of a pack buyer gets
+    no better priority either (``user.plan`` stays free), and packs never
+    promise to skip the queue. The callback reads and rewrites manifests in a
+    worker thread, off the event loop. Never raises: Stripe must get its 200."""
+    if _local_reprioritize is None or plan not in config.PLAN_PRIORITY:
+        return
+    try:
+        got = _local_reprioritize(user_id, config.PLAN_PRIORITY[plan])
+        if asyncio.iscoroutine(got):
+            await got
+    except Exception as e:
+        print(f"⚠️  Could not reprioritize the queued jobs of {user_id}: {e}")
+
+
 async def _upsert_subscription(sub_obj: dict, event_created: datetime):
     price_id = _sub_price_id(sub_obj)
     info = plan_info_for_price(price_id)
@@ -505,7 +597,16 @@ async def _upsert_subscription(sub_obj: dict, event_created: datetime):
 
     async with database.session() as s:
         async with s.begin():
-            user_id = await _user_id_for_customer(s, sub_obj.get("customer"))
+            # Lock the user, not just their subscription row: for a first
+            # subscription there is no row yet, so FOR UPDATE on it locks
+            # nothing, and Checkout's created + updated (sent within ms of each
+            # other) both INSERT, the second one hitting the UNIQUE(user_id).
+            # NO KEY UPDATE serializes webhooks of the same user without
+            # blocking inserts elsewhere that only reference users by FK.
+            user_id = (await s.execute(
+                select(User.id).where(User.stripe_customer_id == sub_obj.get("customer"))
+                .with_for_update(key_share=True)
+            )).scalar_one_or_none()
             if not user_id:
                 return
             row = (await s.execute(
@@ -522,7 +623,8 @@ async def _upsert_subscription(sub_obj: dict, event_created: datetime):
             # sub's update would otherwise overwrite the good row. Only let another
             # subscription take over when the stored one is no longer live.
             if row and row.stripe_subscription_id != sub_obj["id"]:
-                stored_live = row.status in ("active", "trialing", "past_due", "unpaid")
+                stored_live = row.status in ("active", "trialing", "past_due", "unpaid",
+                                             config.ON_HOLD)
                 incoming_live = sub_obj.get("status") in ("active", "trialing", "past_due")
                 if stored_live and not incoming_live:
                     return
@@ -534,14 +636,20 @@ async def _upsert_subscription(sub_obj: dict, event_created: datetime):
             # Purchase signals: brand-new subscription, and trial -> paid conversion.
             is_new_sub = row is None
             prev_status = row.status if row else None
-            buyer_email = (await s.execute(
-                select(User.email).where(User.id == user_id)
-            )).scalar_one_or_none()
             end_dt = _ts(end)
+            # A month on hold from the cancel flow keeps Stripe's status
+            # 'active'; the hold window in the metadata says which period is
+            # the skipped one (config.subscription_status).
+            now_status = config.subscription_status(sub_obj, start)
+            meta = sub_obj.get("metadata") or {}
+            hold = {}
+            if "hold_from" in meta or "hold_until" in meta:
+                hold = {k: (_ts(int(meta[k])) if str(meta.get(k) or "").isdigit() else None)
+                        for k in ("hold_from", "hold_until")}
             values = dict(
                 stripe_subscription_id=sub_obj["id"],
                 stripe_price_id=price_id,
-                plan=plan, interval=interval, status=sub_obj["status"],
+                plan=plan, interval=interval, status=now_status, **hold,
                 minutes_per_period=minutes,
                 current_period_start=_ts(start),
                 current_period_end=end_dt,
@@ -561,35 +669,50 @@ async def _upsert_subscription(sub_obj: dict, event_created: datetime):
     # in the 30 days to 16-sep-2026), and the ones that do pay are announced
     # by the 'Payment received' alert on invoice.paid, which carries the
     # amount; a second message here would just be noise.
-    now_status = sub_obj["status"]
+    if became_live(prev_status, now_status):
+        # The clips this user already made on the free plan lose their
+        # watermark now (cloud/videos): the upgrade modal promised exactly
+        # that. Fire-and-forget: Stripe must get its 200 whatever R2 does.
+        asyncio.create_task(_unmark_after_upgrade(user_id))
+    if now_status in LIVE_STATUSES:
+        await _reprioritize_waiting_jobs(user_id, plan)
     label = new_subscriber_label(now_status) if is_new_sub else None
     if label:
-        from .alerts import send_admin_alert
+        from .alerts import send_admin_alert, user_ref
         await send_admin_alert(
             "🎉 New subscriber",
-            f"{buyer_email or 'A user'} started the {plan} ({interval}) plan.\nStatus: {label}.",
+            f"{user_ref(user_id)} started the {plan} ({interval}) plan.\nStatus: {label}.",
         )
     elif prev_status == "trialing" and now_status == "active":
-        from .alerts import send_admin_alert
+        from .alerts import send_admin_alert, user_ref
         await send_admin_alert(
             "💳 Trial converted to paid",
-            f"{buyer_email or 'A user'} is now a paying {plan} ({interval}) subscriber. 🎉",
+            f"{user_ref(user_id)} is now a paying {plan} ({interval}) subscriber. 🎉",
         )
 
     # Churn alert to the admin the moment a subscription is set to cancel.
     if just_canceled:
-        from .alerts import send_admin_alert
+        from .alerts import send_admin_alert, user_ref
         from .config import VIDEO_RETENTION_GRACE_DAYS
+        # Cancelled in the Stripe portal, not the dashboard flow (which flips
+        # the row itself and sends its own alert). The portal's reason, if it
+        # asked for one, is the only feedback there is. The comment is free
+        # text and stays out of Telegram (alerts.user_ref).
+        feedback = (sub_obj.get("cancellation_details") or {}).get("feedback")
         await send_admin_alert(
             "🔻 Subscription canceled",
-            f"A {plan} subscriber just canceled.\n"
-            f"Access continues until {end_dt:%Y-%m-%d}. Google-authed users then "
-            f"drop to the free plan (clips expire after 7 days); others keep their "
-            f"videos {VIDEO_RETENTION_GRACE_DAYS} more days before deletion.",
+            f"A {plan} subscriber just canceled in the Stripe portal"
+            f"{f' (reason: {feedback})' if feedback else ''}.\n"
+            f"Access continues until {end_dt:%Y-%m-%d}, and the library is kept "
+            f"{VIDEO_RETENTION_GRACE_DAYS} more days after that. Accounts that fall "
+            f"back to the free plan then follow its 7-day clip expiry.",
         )
 
 
-async def _set_subscription_status(sub_obj: dict, status: str, event_created: datetime):
+async def _set_subscription_status(sub_obj: dict, status: str, event_created: datetime,
+                                   only_from: frozenset | None = None):
+    """Returns ``(user_id, plan, previous_status)`` when it changed the row,
+    else None."""
     async with database.session() as s:
         async with s.begin():
             row = (await s.execute(
@@ -601,15 +724,53 @@ async def _set_subscription_status(sub_obj: dict, status: str, event_created: da
                 return
             if row.last_event_at and event_created < row.last_event_at:
                 return
+            if only_from is not None and row.status not in only_from:
+                return
+            prev = row.status
             row.status = status
             row.last_event_at = event_created
+            return row.user_id, row.plan, prev
+
+
+def _invoice_subscription_id(invoice_obj: dict) -> str | None:
+    """Since API 2025-03-31 the invoice no longer carries ``subscription``; it
+    lives under ``parent.subscription_details``. Read both."""
+    sub = invoice_obj.get("subscription")
+    if not sub:
+        details = (invoice_obj.get("parent") or {}).get("subscription_details") or {}
+        sub = details.get("subscription")
+    if isinstance(sub, dict):
+        sub = sub.get("id")
+    return sub or None
+
+
+# An invoice event only moves a live subscription between active and past_due.
+# A failed first charge leaves the row ``incomplete`` (Stripe expires it, and the
+# user must be able to retry checkout), and paying an old invoice never revives
+# a canceled one: ``customer.subscription.*`` stays the source of truth for those.
+_INVOICE_STATUS_FROM = {
+    "past_due": frozenset({"active", "trialing"}),
+    "active": frozenset({"past_due", "unpaid"}),
+}
 
 
 async def _set_subscription_status_by_invoice(invoice_obj: dict, status: str, event_created: datetime):
-    sub_id = invoice_obj.get("subscription")
+    sub_id = _invoice_subscription_id(invoice_obj)
     if not sub_id:
         return
-    await _set_subscription_status({"id": sub_id}, status, event_created)
+    if status == "past_due" and invoice_obj.get("billing_reason") == "subscription_create":
+        return
+    changed = await _set_subscription_status({"id": sub_id}, status, event_created,
+                                             only_from=_INVOICE_STATUS_FROM[status])
+    if changed and status in LIVE_STATUSES:
+        # Paying a past_due/unpaid invoice is a renewal after a lapse: while it
+        # lapsed new jobs were queued and rendered as free, so the same promise
+        # as a new subscription applies (subscription.updated may come later,
+        # or not at all for this transition).
+        user_id, plan, prev = changed
+        if became_live(prev, status):
+            asyncio.create_task(_unmark_after_upgrade(user_id))
+        await _reprioritize_waiting_jobs(user_id, plan)
 
 
 async def _notify_invoice_paid(invoice_obj: dict):
@@ -626,18 +787,18 @@ async def _notify_invoice_paid(invoice_obj: dict):
         "subscription_update": "plan change",
     }.get(reason, reason or "payment")
 
-    email = None
+    payer_id = None
     async with database.session() as s:
         cust = invoice_obj.get("customer")
         if cust:
-            email = (await s.execute(
-                select(User.email).where(User.stripe_customer_id == cust)
+            payer_id = (await s.execute(
+                select(User.id).where(User.stripe_customer_id == cust)
             )).scalar_one_or_none()
 
-    from .alerts import send_admin_alert
+    from .alerts import send_admin_alert, user_ref
     await send_admin_alert(
         f"💵 Payment received: {money}",
-        f"{email or 'A customer'} — {kind}.",
+        f"{user_ref(payer_id) if payer_id else 'A customer'} — {kind}.",
     )
 
 
@@ -687,7 +848,7 @@ async def _track_invoice_revenue(invoice_obj: dict):
             return
         user_id, email = user
         plan = interval = None
-        sub_id = invoice_obj.get("subscription")
+        sub_id = _invoice_subscription_id(invoice_obj)
         if sub_id:
             sub = (await s.execute(
                 select(Subscription.plan, Subscription.interval).where(

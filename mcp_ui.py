@@ -15,26 +15,16 @@ One template, three data paths, because the ecosystem hasn't converged:
      from resources/read and push render data after the iframe reports ready.
 
 The iframe cannot fetch anything (host CSP), so the video previews use the
-clips' absolute URLs and everything else is inline.
+clips' absolute URLs and everything else is inline. Those URLs are on
+PUBLIC_API_URL, which ``widget_meta`` declares as a media domain: without it
+ChatGPT's sandbox blocks the <video> loads and the previews stay black.
 """
+import hashlib
 import json
+import os
+from urllib.parse import urlsplit
 
-CLIP_PICKER_URI = "ui://openshorts/clip-picker"
 MIME_TYPE = "text/html;profile=mcp-app"
-
-RESOURCES = [
-    {
-        "uri": CLIP_PICKER_URI,
-        "name": "clip-picker",
-        "title": "OpenShorts clip picker",
-        "description": (
-            "Interactive picker for a job's finished clips: preview each 9:16 "
-            "clip, select the keepers and publish them to TikTok, Instagram or "
-            "YouTube without leaving the conversation."
-        ),
-        "mimeType": MIME_TYPE,
-    },
-]
 
 # Kept as a plain string with a token instead of an f-string: the JS is full of
 # braces and escaping them all is how bugs get in.
@@ -59,6 +49,7 @@ padding:8px;cursor:pointer}
 .card .t{margin-top:6px;font-size:12px;color:var(--ink);line-height:1.3;
 display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
 .card .d{font-size:11px;color:var(--muted);margin-top:2px}
+.card .open{display:block;font-size:11px;color:var(--brass);margin-top:4px}
 .bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:12px}
 .chip{border:1px solid var(--rule);border-radius:999px;padding:4px 12px;font-size:12px;
 cursor:pointer;user-select:none;color:var(--muted)}
@@ -77,12 +68,17 @@ button:disabled{opacity:.4;cursor:default}
   <span class="chip on" data-p="tiktok">TikTok</span>
   <span class="chip on" data-p="instagram">Instagram</span>
   <span class="chip" data-p="youtube">YouTube</span>
+  <span class="chip" data-p="facebook">Facebook</span>
+  <span class="chip" data-p="linkedin">LinkedIn</span>
+  <span class="chip" data-p="threads">Threads</span>
+  <span class="chip" data-p="bluesky">Bluesky</span>
   <button id="pub" disabled>Publish selected</button>
 </div>
 <div class="msg" id="msg"></div>
 <script>
 var inline = __OPENSHORTS_DATA__;
 var state = null;
+var rendered = null;
 var selected = {};
 
 function callTool(name, params) {
@@ -106,6 +102,12 @@ function refreshButton() {
 }
 
 function render(data) {
+  // ChatGPT fires openai:set_globals on every height, theme or layout change.
+  // Rebuilding the grid each time recreated the <video> elements, which then
+  // restarted their load forever and never showed a frame.
+  var key = JSON.stringify(data);
+  if (key === rendered) return;
+  rendered = key;
   state = data;
   var clips = data.clips || [];
   document.getElementById('hd').textContent =
@@ -121,6 +123,27 @@ function render(data) {
       v.src = clip.video_url;
       v.muted = true; v.controls = true; v.playsInline = true; v.preload = 'metadata';
       card.appendChild(v);
+      // Some hosts sandbox media; when the preview can't load, the clip is
+      // still one click away.
+      var fallback = function () {
+        if (card.querySelector('.open')) return;
+        var a = document.createElement('a');
+        a.className = 'open';
+        a.href = clip.video_url; a.target = '_blank'; a.rel = 'noopener';
+        a.textContent = 'Open clip ↗';
+        a.title = 'preview state ' + v.readyState + '/' + v.networkState +
+          (v.error ? ' error ' + v.error.code : '');
+        a.addEventListener('click', function (ev) {
+          ev.stopPropagation();
+          if (window.openai && window.openai.openExternal) {
+            ev.preventDefault();
+            window.openai.openExternal({href: clip.video_url});
+          }
+        });
+        card.appendChild(a);
+      };
+      v.addEventListener('error', fallback);
+      setTimeout(function () { if (v.readyState < 1) fallback(); }, 8000);
     }
     var t = document.createElement('div');
     t.className = 't';
@@ -182,6 +205,38 @@ else if (!fromOpenai()) {
 </body>
 </html>
 """
+
+# Hosts cache a template by its URI (ChatGPT kept rendering the first version it
+# saw), so the URI carries a hash of the HTML: any change is a new template.
+CLIP_PICKER_BASE = "ui://openshorts/clip-picker"
+CLIP_PICKER_URI = (CLIP_PICKER_BASE + "-"
+                   + hashlib.sha256(_TEMPLATE.encode()).hexdigest()[:10])
+
+RESOURCES = [
+    {
+        "uri": CLIP_PICKER_URI,
+        "name": "clip-picker",
+        "title": "OpenShorts clip picker",
+        "description": (
+            "Interactive picker for a job's finished clips: preview each 9:16 "
+            "clip, select the keepers and publish them to TikTok, Instagram, "
+            "YouTube, Facebook, LinkedIn, Threads or Bluesky without leaving the "
+            "conversation."
+        ),
+        "mimeType": MIME_TYPE,
+    },
+]
+
+
+def widget_meta() -> dict:
+    """CSP for the picker in both host dialects (ChatGPT Apps SDK, MCP Apps)."""
+    parts = urlsplit(os.environ.get("PUBLIC_API_URL", ""))
+    domains = [f"{parts.scheme}://{parts.netloc}"] if parts.scheme and parts.netloc else []
+    return {
+        "openai/widgetCSP": {"connect_domains": [], "resource_domains": domains},
+        "openai/widgetPrefersBorder": True,
+        "ui": {"csp": {"connectDomains": [], "resourceDomains": domains}},
+    }
 
 
 def clip_picker_html(data=None) -> str:

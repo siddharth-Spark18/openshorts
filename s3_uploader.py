@@ -190,10 +190,36 @@ def list_all_clips(bucket_name=None, limit=50, force_refresh=False):
 
     return all_clips[:limit] if limit else all_clips
 
-def upload_actor_to_s3(file_path, description=""):
+# Actors generated for a signed-in user are theirs: the prompt that made them
+# names the product they are holding. They live under a prefix the public
+# gallery never lists, with a random key, and are handed out as presigned
+# URLs (SigV4 caps those at 7 days). The shared ``avatars/`` gallery keeps the
+# images that were published there before, minus the product half of their
+# description.
+PRIVATE_ACTOR_PREFIX = "private/actors/"
+ACTOR_URL_TTL_SECONDS = int(os.environ.get("ACTOR_URL_TTL_SECONDS", str(7 * 24 * 3600)))
+
+import re as _re
+_HOLDING_RE = _re.compile(r"\s*\(holding .*\)\s*$", _re.DOTALL)
+
+
+def public_actor_description(description):
+    """The gallery caption without the "(holding <product>)" part."""
+    return _HOLDING_RE.sub("", description or "").strip()
+
+
+def _presign(s3_client, bucket_name, key, ttl=None):
+    return s3_client.generate_presigned_url(
+        'get_object', Params={'Bucket': bucket_name, 'Key': key},
+        ExpiresIn=int(ttl or ACTOR_URL_TTL_SECONDS))
+
+
+def upload_actor_to_s3(file_path, description="", owner_tag=None):
     """
-    Upload an actor image to the public S3 bucket.
-    Returns the public URL or None on failure.
+    Upload an actor image. With ``owner_tag`` (cloud: an opaque per-user tag)
+    it goes to the owner's private prefix and the return is a presigned URL;
+    without one (self-host) to the public gallery, as before.
+    Returns the URL or None on failure.
     """
     bucket_name = os.environ.get('AWS_S3_PUBLIC_BUCKET', 'my-public-bucket')
     region = os.environ.get('AWS_REGION', 'eu-west-3')
@@ -203,10 +229,12 @@ def upload_actor_to_s3(file_path, description=""):
         return None
 
     import uuid
-    unique_id = str(uuid.uuid4())[:8]
     filename = os.path.basename(file_path)
     name, ext = os.path.splitext(filename)
-    s3_key = f"avatars/{name}_{unique_id}{ext}"
+    if owner_tag:
+        s3_key = f"{PRIVATE_ACTOR_PREFIX}{owner_tag}/{uuid.uuid4().hex}{ext}"
+    else:
+        s3_key = f"avatars/{name}_{str(uuid.uuid4())[:8]}{ext}"
 
     try:
         # Skip broken/tiny files
@@ -218,34 +246,64 @@ def upload_actor_to_s3(file_path, description=""):
             file_path, bucket_name, s3_key,
             ExtraArgs={'ContentType': 'image/png'},
         )
-        public_url = f"https://{bucket_name}.s3.{region}.amazonaws.com/{s3_key}"
+        if owner_tag:
+            url = _presign(s3_client, bucket_name, s3_key)
+        else:
+            url = f"https://{bucket_name}.s3.{region}.amazonaws.com/{s3_key}"
 
         # Save metadata JSON alongside the image
         if description:
             import datetime
             meta_key = s3_key.rsplit('.', 1)[0] + '.json'
-            meta = json.dumps({
+            meta = {
                 "description": description,
-                "url": public_url,
                 "created_at": datetime.datetime.utcnow().isoformat() + "Z",
-            }, ensure_ascii=False)
+            }
+            if not owner_tag:
+                meta["url"] = url
             s3_client.put_object(
                 Bucket=bucket_name, Key=meta_key,
-                Body=meta.encode('utf-8'),
+                Body=json.dumps(meta, ensure_ascii=False).encode('utf-8'),
                 ContentType='application/json',
             )
 
-        logger.info(f"Uploaded actor to S3: {public_url}")
-        return public_url
+        logger.info(f"Uploaded actor to S3: {s3_key}")
+        return url
     except Exception as e:
         logger.error(f"Failed to upload actor to S3: {e}")
         return None
 
 
-def list_actor_gallery():
+def _list_actor_prefix(s3_client, bucket_name, prefix):
+    """{base_key: {'image': obj, 'meta_key': key}} under one prefix."""
+    paginator = s3_client.get_paginator('list_objects_v2')
+    all_objects = {}
+    for page in paginator.paginate(Bucket=bucket_name, Prefix=prefix):
+        for obj in page.get('Contents', []):
+            key = obj['Key']
+            base = key.rsplit('.', 1)[0]
+            entry = all_objects.setdefault(base, {})
+            if key.lower().endswith(('.png', '.jpg', '.jpeg', '.webp')):
+                entry['image'] = obj
+            elif key.endswith('.json'):
+                entry['meta_key'] = key
+    return all_objects
+
+
+def _read_description(s3_client, bucket_name, meta_key):
+    try:
+        meta_resp = s3_client.get_object(Bucket=bucket_name, Key=meta_key)
+        return json.loads(meta_resp['Body'].read().decode('utf-8')).get('description', '')
+    except Exception:
+        return ''
+
+
+def list_actor_gallery(owner_tag=None):
     """
-    List all actor images from the public S3 bucket.
-    Returns list with URLs and descriptions, newest first.
+    The shared actor gallery (public images, product stripped from their
+    captions) plus, with ``owner_tag``, the caller's own private actors as
+    presigned URLs (full caption: it is their own prompt). Newest first, the
+    caller's own ahead of the shared ones.
     """
     bucket_name = os.environ.get('AWS_S3_PUBLIC_BUCKET', 'my-public-bucket')
     region = os.environ.get('AWS_REGION', 'eu-west-3')
@@ -255,46 +313,38 @@ def list_actor_gallery():
         return []
 
     try:
-        paginator = s3_client.get_paginator('list_objects_v2')
-        pages = paginator.paginate(Bucket=bucket_name, Prefix='avatars/')
-
-        all_objects = {}
-        for page in pages:
-            for obj in page.get('Contents', []):
-                key = obj['Key']
-                base = key.rsplit('.', 1)[0]
-                if base not in all_objects:
-                    all_objects[base] = {}
-                if key.lower().endswith(('.png', '.jpg', '.jpeg', '.webp')):
-                    all_objects[base]['image'] = obj
-                elif key.endswith('.json'):
-                    all_objects[base]['meta_key'] = key
-
-        images = []
-        for base, data in all_objects.items():
+        own = []
+        if owner_tag:
+            for base, data in _list_actor_prefix(
+                    s3_client, bucket_name, f"{PRIVATE_ACTOR_PREFIX}{owner_tag}/").items():
+                if 'image' not in data:
+                    continue
+                obj = data['image']
+                own.append({
+                    "url": _presign(s3_client, bucket_name, obj['Key']),
+                    "key": obj['Key'].rsplit('/', 1)[-1],
+                    "created_at": obj['LastModified'].isoformat(),
+                    "description": (_read_description(s3_client, bucket_name, data['meta_key'])
+                                    if 'meta_key' in data else ""),
+                    "mine": True,
+                })
+        shared = []
+        for base, data in _list_actor_prefix(s3_client, bucket_name, 'avatars/').items():
             if 'image' not in data:
                 continue
             obj = data['image']
             key = obj['Key']
-            public_url = f"https://{bucket_name}.s3.{region}.amazonaws.com/{key}"
-            entry = {
-                "url": public_url,
+            shared.append({
+                "url": f"https://{bucket_name}.s3.{region}.amazonaws.com/{key}",
                 "key": key,
                 "created_at": obj['LastModified'].isoformat(),
-                "description": "",
-            }
-            # Try to read metadata JSON
-            if 'meta_key' in data:
-                try:
-                    meta_resp = s3_client.get_object(Bucket=bucket_name, Key=data['meta_key'])
-                    meta = json.loads(meta_resp['Body'].read().decode('utf-8'))
-                    entry['description'] = meta.get('description', '')
-                except Exception:
-                    pass
-            images.append(entry)
-
-        images.sort(key=lambda x: x['created_at'], reverse=True)
-        return images
+                "description": (public_actor_description(
+                    _read_description(s3_client, bucket_name, data['meta_key']))
+                    if 'meta_key' in data else ""),
+            })
+        own.sort(key=lambda x: x['created_at'], reverse=True)
+        shared.sort(key=lambda x: x['created_at'], reverse=True)
+        return own + shared
 
     except Exception as e:
         logger.error(f"Failed to list actor gallery: {e}")

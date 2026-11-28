@@ -64,7 +64,7 @@ function placeTip(rect, tipW, tipH, vw, vh) {
  *
  * QA: #app?tutorial=1
  */
-export default function ClipTutorial({ phase, jobStatus, onStart, onSkip, onDismissCelebrate }) {
+export default function ClipTutorial({ phase, jobStatus, errorText, onStart, onSkip, onDismissCelebrate }) {
   const [step, setStep] = useState(0);
   const [spot, setSpot] = useState(null);
 
@@ -149,7 +149,7 @@ export default function ClipTutorial({ phase, jobStatus, onStart, onSkip, onDism
         <p className="eyebrow mb-2">First clips</p>
         <p className={`text-sm leading-relaxed ${jobStatus === 'error' ? 'text-danger' : 'text-muted'}`}>
           {jobStatus === 'error'
-            ? 'That run failed. Try another video — other tools stay locked until one job finishes.'
+            ? `${errorText ? `That video could not be clipped: ${errorText}` : 'That run failed.'} Try another video. Other tools unlock once one job finishes.`
             : 'Hang on — Clip Generator is finding the moments and cutting vertical shorts.'}
         </p>
       </div>

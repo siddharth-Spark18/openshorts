@@ -65,6 +65,30 @@ class TestInsetBox:
         assert w >= 200 and h >= 120
 
 
+class TestFaceDetections:
+    """A face box grown like a torso gave a box that started below the
+    forehead (Excel walkthrough, 17-oct-2026)."""
+
+    def test_a_face_in_the_corner_keeps_the_whole_head(self):
+        face = [1054, 497, 128, 128]          # measured, 1280x720
+        x, y, w, h = inset_box(face, 1280, 720, face=True)
+        assert y <= 497 - 0.3 * 128
+        assert y + h == 720
+        assert w >= 3 * 128 - 1
+
+    def test_a_face_box_gives_a_webcam_shaped_box(self):
+        _x, _y, w, h = inset_box([1088, 458, 96, 96], 1280, 720, face=True)
+        assert abs(w / h - INSET_ASPECT) < 0.05
+
+    def test_face_and_body_detections_agree(self):
+        # Same webcam, one sample found the face and the next only the body:
+        # the boxes must land on the same inset for stable_box to agree.
+        by_face = inset_box([77, 845, 125, 125], 1920, 1080, face=True)
+        by_body = inset_box([0, 838, 231, 96], 1920, 1080)
+        cx = lambda b: b[0] + b[2] / 2.0
+        assert abs(cx(by_face) - cx(by_body)) <= 1920 * 0.05
+
+
 class TestUsable:
     def test_rejects_a_speck(self):
         assert not usable((0, 0, 40, 20), 1080)

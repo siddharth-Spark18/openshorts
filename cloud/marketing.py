@@ -1,12 +1,13 @@
-"""Opting out of the one email we send that is a commercial communication.
+"""Opting out of the emails we send that are commercial communications.
 
-Every other message OpenShorts sends is a service notice: a sign-in link, "your
+Most messages OpenShorts sends are service notices: a sign-in link, "your
 clips are ready", "your free clips are deleted tomorrow", "your account has been
-deleted". ``send_out_of_minutes_email`` is not — it leads with a price and a
-Buy button, which makes it a comunicación comercial under LSSI art. 21. Art.
-21.2 permits it to an existing customer for a similar product, but only if
-*every single message* offers a simple, free way to refuse — and until now it
-offered none: no footer link and no ``List-Unsubscribe`` header.
+deleted". ``send_out_of_minutes_email`` and the lifecycle emails
+(cloud/lifecycle.py) are not — they sell a plan, which makes them a
+comunicación comercial under LSSI art. 21. Art. 21.2 permits them to an
+existing customer for a similar product, but only if *every single message*
+offers a simple, free way to refuse: ``emails.send_commercial_email`` adds the
+footer link and the ``List-Unsubscribe`` header, and skips opted-out accounts.
 
 The link has to work with no session (the reader is in their mail client, not
 the app) and must never expire, so it carries an HMAC of the user id keyed on

@@ -17,7 +17,23 @@ export class QuotaError extends Error {
     this.minutesRemaining = detail?.minutes_remaining;
     // Minutes of the source the server offers to clip instead (0 = no offer).
     this.partialMinutes = Number(detail?.partial_minutes) || 0;
+    // The server's reason: 'quota_exceeded', 'no_plan', or 'free_queue_full'
+    // (the free queue's brake refused the submission; nothing was spent).
+    this.code = detail?.error || 'quota_exceeded';
   }
+}
+
+// A 402 caught outside the main clip flow (thumbnails, clip editor, autopilot):
+// ask the app shell to open the quota wall instead of a dead-end error. `source`
+// tags CheckoutStarted so each surface can be measured.
+export const QUOTA_WALL_EVENT = 'os:quota-wall';
+export function openQuotaWall(err, source) {
+  try {
+    window.dispatchEvent(new CustomEvent(QUOTA_WALL_EVENT, {
+      detail: { required: err?.minutesRequired, remaining: err?.minutesRemaining, source,
+                code: err?.code },
+    }));
+  } catch (_) { /* ignore */ }
 }
 
 // Drop-in fetch wrapper. Always attaches the bearer token when present.

@@ -6,10 +6,14 @@ import pytest
 from clip_selection import (
     build_transcript_windows,
     clip_count_targets,
+    dedupe_overlapping,
+    score_batches,
+    shortlist_target,
     snap_clip_to_words,
     compact_words,
     lookup_model_prices,
     trim_to_best,
+    vision_segments,
 )
 
 
@@ -215,3 +219,209 @@ class TestTrimToBest:
     def test_max_clips_is_never_below_one(self):
         shorts = [self._clip(0, 10), self._clip(50, 20)]
         assert len(trim_to_best(shorts, 0)) == 1
+
+
+class TestDedupeOverlapping:
+    """Two picks from one window can cover the same seconds with different
+    edges; the DIVERSITY rule in the prompt is not a guarantee."""
+
+    @staticmethod
+    def _clip(start, end, score):
+        return {"start": start, "end": end, "predicted_score": score}
+
+    def test_keeps_the_better_scored_of_two_overlapping(self):
+        a, b = self._clip(10, 40, 70), self._clip(20, 50, 85)  # 20 s shared of 30 s
+        assert dedupe_overlapping([a, b]) == [b]
+        assert dedupe_overlapping([b, a]) == [b]
+
+    def test_small_overlap_keeps_both_in_input_order(self):
+        # 5 s shared of 30 s: under the ratio, both survive, order untouched
+        # (the detail pass already hands clips back in transcript order).
+        a, b = self._clip(10, 40, 70), self._clip(35, 65, 85)
+        assert dedupe_overlapping([a, b]) == [a, b]
+
+    def test_a_third_shared_counts_as_a_repeat(self):
+        # 25 s shared of 59 s: two clips of the same punchline.
+        a, b = self._clip(175.9, 234.5, 78), self._clip(209.7, 269.4, 70)
+        assert dedupe_overlapping([a, b]) == [a]
+
+    def test_tie_keeps_the_earlier(self):
+        a, b = self._clip(10, 40, 80), self._clip(15, 45, 80)
+        assert dedupe_overlapping([a, b]) == [a]
+
+    def test_disjoint_untouched(self):
+        clips = [self._clip(0, 30, 50), self._clip(30, 60, 60), self._clip(100, 130, 40)]
+        assert dedupe_overlapping(clips) == clips
+
+
+class TestScoreBatches:
+    """The scoring pass must be able to fill the shortlist it is aiming for.
+
+    Regression for 22-sep-2026: a 9:10 source built 9 windows, was batched
+    8 + 1 against a prompt capped at "up to 3 windows", and shortlisted 4 of
+    a target of 8 — which halved the clip floor downstream.
+    """
+
+    @staticmethod
+    def _windows(n):
+        return [{"id": f"w{i}", "start": i * 60, "end": i * 60 + 90, "text": "t"}
+                for i in range(n)]
+
+    def test_every_window_is_scored_exactly_once_and_in_order(self):
+        # The shortlist is the global top N of the scores, so a window that
+        # never reaches the model can never be picked.
+        for n in (1, 2, 7, 8, 9, 17, 38):
+            batches = score_batches(self._windows(n), 8)
+            seen = [w["id"] for batch in batches for w in batch]
+            assert seen == [w["id"] for w in self._windows(n)]
+
+    def test_the_nine_window_case_has_no_tail_of_one(self):
+        # The measured job split 9 into 8 + 1, and a batch of 1 cannot be
+        # filtered: window_009 entered the shortlist by arithmetic.
+        assert [len(b) for b in score_batches(self._windows(9), 8)] == [5, 4]
+
+    def test_batches_are_near_equal_and_within_the_size_limit(self):
+        for n in (9, 16, 17, 38, 100):
+            sizes = [len(b) for b in score_batches(self._windows(n), 8)]
+            assert max(sizes) <= 8
+            assert max(sizes) - min(sizes) <= 1
+            assert sum(sizes) == n
+
+    def test_batch_count_is_never_worse_than_the_naive_walk(self):
+        # Balancing must not cost extra Gemini calls.
+        for n in range(1, 60):
+            naive = -(-n // 8)
+            assert len(score_batches(self._windows(n), 8)) == naive
+
+    def test_degenerate_input_does_not_crash(self):
+        assert score_batches([], 8) == []
+        assert score_batches(None, 8) == []
+        assert [len(b) for b in score_batches(self._windows(2), 0)] == [1, 1]
+
+
+class TestShortlistTarget:
+    def test_scales_with_duration(self):
+        assert shortlist_target(60) == 3          # floor
+        assert shortlist_target(9 * 60) == 8      # the measured job
+        assert shortlist_target(30 * 60) == 10    # one detail call reads this many
+        # Past half an hour it follows the length (it stopped at 10 until
+        # 20-nov-2026, so five hours gave the clips of a quarter of an hour).
+        assert shortlist_target(60 * 60) == 20
+        assert shortlist_target(3 * 60 * 60) == 60
+        assert shortlist_target(5 * 60 * 60) == shortlist_target(12 * 60 * 60) == 100
+
+    def test_degenerate_input_does_not_crash(self):
+        assert shortlist_target(None) == 3
+        assert shortlist_target("nonsense") == 3
+
+
+# --- a long source gives clips in proportion to its length ------------------ #
+
+def _windows(n):
+    return [{"id": f"window_{i + 1:03d}", "start": i * 90.0} for i in range(n)]
+
+
+@pytest.fixture
+def unpinned(monkeypatch):
+    for name in ("CLIP_TARGET_MIN", "CLIP_TARGET_MAX", "CLIP_LONG_SECONDS_PER_CLIP",
+                 "CLIP_MAX_PER_JOB"):
+        monkeypatch.delenv(name, raising=False)
+    return monkeypatch
+
+
+@pytest.mark.parametrize("minutes,low,high", [
+    (10, 6, 12), (30, 6, 12),            # the fixed band, untouched
+    (60, 12, 24), (120, 24, 48),         # one clip per five minutes at least
+    (300, 60, 60), (900, 60, 60),        # and no more than a job delivers
+])
+def test_the_clip_count_follows_the_length_of_the_source(unpinned, minutes, low, high):
+    from clip_selection import detail_plan, length_floor
+    shortlist = _windows(shortlist_target(minutes * 60))
+    groups, bands, lo, hi = detail_plan(shortlist)
+    assert (lo, hi) == (low, high)
+    assert lo >= length_floor(minutes * 60)
+    assert sum(len(g) for g in groups) == len(shortlist)
+    assert all(len(g) <= 10 for g in groups)
+    assert len(bands) == len(groups)
+
+
+def test_a_long_shortlist_is_read_in_stretches_of_the_video(unpinned):
+    from clip_selection import detail_groups
+    ranked = list(reversed(_windows(25)))          # as it arrives: best score first
+    groups = detail_groups(ranked)
+    assert [len(g) for g in groups] == [9, 8, 8]
+    starts = [w["start"] for g in groups for w in g]
+    assert starts == sorted(starts)                # video order, each group one stretch
+    # One call's worth is one group, in the order it came (what it always was).
+    assert detail_groups(ranked[:10]) == [ranked[:10]]
+    assert detail_groups([]) == []
+
+
+def test_a_pinned_count_is_never_added_to(unpinned):
+    from clip_selection import detail_plan, length_floor
+    unpinned.setenv("CLIP_TARGET_MIN", "2")        # the free plan's cap, or the user's number
+    unpinned.setenv("CLIP_TARGET_MAX", "2")
+    assert length_floor(5 * 3600) == 0
+    assert shortlist_target(5 * 3600) == 10
+    assert detail_plan(_windows(10))[2:] == (2, 2)
+
+
+def test_the_length_rule_can_be_switched_off_and_the_cap_moved(unpinned):
+    from clip_selection import length_floor
+    assert length_floor(30 * 60) == 0 and length_floor(35 * 60) == 7
+    assert length_floor(5 * 3600) == 60
+    unpinned.setenv("CLIP_MAX_PER_JOB", "40")
+    assert length_floor(5 * 3600) == 40
+    unpinned.setenv("CLIP_LONG_SECONDS_PER_CLIP", "0")
+    assert length_floor(5 * 3600) == 0 and shortlist_target(5 * 3600) == 10
+
+
+def test_silent_footage_follows_the_length_too(unpinned):
+    from clip_selection import vision_targets
+    # Half an hour, one stretch: the classic 3-15.
+    assert vision_targets(1800, 1, 3, 15) == (3, 15, 3, 15)
+    # Two hours in three stretches: 24-48 in all, 8-16 from each.
+    assert vision_targets(7200, 3, 3, 15) == (8, 16, 24, 48)
+    # Five hours in eight: the job's most, spread over them.
+    assert vision_targets(5 * 3600, 8, 3, 15) == (8, 8, 60, 60)
+    unpinned.setenv("CLIP_TARGET_MAX", "4")
+    assert vision_targets(5 * 3600, 8, 3, 4) == (1, 4, 3, 4)
+
+
+# --- vision_segments: silent footage longer than the model window ---------- #
+
+def test_vision_segments_short_source_is_one_stretch():
+    assert vision_segments(1800, 2400, 8) == [(0.0, 1800.0)]
+
+
+def test_vision_segments_split_near_equal_without_a_tiny_tail():
+    segs = vision_segments(2460, 2400, 8)  # 41 min: two halves, not 40 + 1
+    assert len(segs) == 2
+    assert segs[0] == (0.0, 1230.0) and segs[1] == (1230.0, 2460.0)
+
+
+def test_vision_segments_cover_the_whole_source_contiguously():
+    segs = vision_segments(8 * 3600, 2400, 20)
+    assert segs[0][0] == 0.0 and segs[-1][1] == 8 * 3600
+    assert all(a[1] == b[0] for a, b in zip(segs, segs[1:]))
+    assert max(e - s for s, e in segs) <= 2400
+
+
+def test_vision_segments_are_capped_but_still_span_the_whole_source():
+    # 8-hour stream wants 12 stretches at the 40-min default; the budget is 8.
+    segs = vision_segments(8 * 3600, 2400, 8)
+    assert len(segs) == 8                       # budget respected
+    assert segs[0][0] == 0.0                    # samples from the first second
+    assert segs[-1][1] == 8 * 3600              # ...to the last — not just the head
+    assert all(e - s <= 2400 for s, e in segs)  # each still fits the token window
+    # The windows are in order and non-overlapping (gaps between them are the
+    # price of the fixed budget), and together they reach across the whole
+    # stream rather than tiling only its first 5.3 hours.
+    assert all(a[1] <= b[0] for a, b in zip(segs, segs[1:]))
+    watched = sum(e - s for s, e in segs)
+    assert segs[-1][1] - segs[0][0] > watched   # genuinely sampled with gaps
+
+
+def test_vision_segments_single_budget_watches_the_opening():
+    # A one-stretch budget can only see `seg` of a long source: take the start.
+    assert vision_segments(8 * 3600, 2400, 1) == [(0.0, 2400.0)]

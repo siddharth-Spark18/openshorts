@@ -4,6 +4,7 @@ Pure helpers for the Gemini clip-selection pipeline.
 Standard-library only so both main.py and gemini_worker.py can import it and
 the logic stays unit-testable without the heavy video dependencies.
 """
+import math
 
 # USD per 1M tokens (input, output incl. thinking), from ai.google.dev pricing.
 MODEL_PRICES = {
@@ -67,6 +68,175 @@ def clip_count_targets(n_windows):
     return low, max(low, high)
 
 
+# --- A long source gives clips in proportion to its length -----------------
+# The count used to stop growing at twelve minutes of source: the shortlist
+# was capped at 10 windows, so a five-hour video came back with the same 6-12
+# clips as a quarter of an hour, while the minutes charged for it grew with
+# every minute of it.
+
+DETAIL_GROUP = 10            # windows one detail call reads
+
+
+def _env_number(name, default):
+    import os
+    try:
+        return max(0.0, float(os.environ.get(name, "") or default))
+    except ValueError:
+        return float(default)
+
+
+def max_clips_per_job():
+    """The most clips one job delivers (``CLIP_MAX_PER_JOB``, 60)."""
+    return max(1, int(_env_number("CLIP_MAX_PER_JOB", 60)))
+
+
+def targets_pinned():
+    """Whether the count was set from outside (``CLIP_TARGET_MIN`` / ``MAX``:
+    the user's own number, or the free plan's cap): then nothing here adds to it."""
+    import os
+    return bool(os.environ.get("CLIP_TARGET_MIN") or os.environ.get("CLIP_TARGET_MAX"))
+
+
+def length_floor(video_duration):
+    """The clips a source this long gives at least: one per
+    ``CLIP_LONG_SECONDS_PER_CLIP`` (300, five minutes; 0 turns it off), up to
+    ``max_clips_per_job``. 0 while the fixed band already covers the source
+    (half an hour is six clips either way) or when the count is pinned."""
+    try:
+        seconds = float(video_duration or 0)
+    except (TypeError, ValueError):
+        return 0
+    per = _env_number("CLIP_LONG_SECONDS_PER_CLIP", 300)
+    if per <= 0 or targets_pinned():
+        return 0
+    n = int(seconds // per)
+    return min(max_clips_per_job(), n) if n > 6 else 0
+
+
+def shortlist_target(video_duration):
+    """How many scored windows the detail pass should get.
+
+    Scales with duration, floored at 3 so a short source still gets a choice.
+    Up to half an hour it stops at 10. Past that it follows ``length_floor``:
+    five windows for every three clips of the floor, which is the share of a
+    group of ten the detail pass is asked to turn into clips
+    (``clip_count_targets``), so the floor is reachable without making every
+    shortlisted window yield one. ``score_batches`` exists to make this number
+    reachable.
+    """
+    try:
+        seconds = float(video_duration or 0)
+    except (TypeError, ValueError):
+        seconds = 0.0
+    base = max(3, min(10, int(seconds // 90) + 2))
+    return max(base, math.ceil(length_floor(seconds) * 5 / 3))
+
+
+def detail_groups(shortlist):
+    """The shortlist in the groups the detail pass reads, one call each.
+
+    A shortlist one call can read (``DETAIL_GROUP`` windows) is one group, as
+    it always was and in the order it came. A longer one (a long source) goes
+    in video order in near-equal groups: each call then covers one stretch of
+    the video, asked for its own 6-12 clips, so the clips come from all of it
+    and the total follows the length."""
+    shortlist = list(shortlist or [])
+    if len(shortlist) <= DETAIL_GROUP:
+        return [shortlist] if shortlist else []
+
+    def start(w):
+        try:
+            return float(w.get("start") or 0)
+        except (AttributeError, TypeError, ValueError):
+            return 0.0
+    return score_batches(sorted(shortlist, key=start), DETAIL_GROUP)
+
+
+def detail_plan(shortlist):
+    """``(groups, bands, min_clips, max_clips)`` for the detail pass: each
+    group with its own ``clip_count_targets`` band, and the job's totals. One
+    group: exactly its band. Several: the sum, the ceiling never past
+    ``max_clips_per_job``."""
+    groups = detail_groups(shortlist)
+    if not groups:
+        low, high = clip_count_targets(0)
+        return [], [], low, high
+    bands = [clip_count_targets(len(g)) for g in groups]
+    if len(groups) == 1:
+        return groups, bands, bands[0][0], bands[0][1]
+    cap = max_clips_per_job()
+    low = min(cap, sum(b[0] for b in bands))
+    high = max(low, min(cap, sum(b[1] for b in bands)))
+    return groups, bands, low, high
+
+
+def vision_targets(video_duration, n_segments, low, high):
+    """``(min per stretch, max per stretch, job minimum, job maximum)`` for the
+    vision pass (footage with no speech), from its classic ``low``-``high``.
+
+    It has no scoring windows, so a long source's count comes straight from
+    ``length_floor``: at least that many clips, at most twice (never past
+    ``max_clips_per_job``), spread over the stretches the model watches.
+    Without a floor (a short source, a pinned count) it is what it was: every
+    stretch may return up to ``high`` and the job keeps the best ``high``."""
+    n = max(1, int(n_segments or 1))
+    floor = length_floor(video_duration)
+    if not floor:
+        return max(1, math.ceil(low / n)), high, low, high
+    job_low = max(low, floor)
+    job_high = max(high, job_low, min(max_clips_per_job(), 2 * floor))
+    per_low = max(1, math.ceil(job_low / n))
+    return per_low, max(per_low, math.ceil(job_high / n)), job_low, job_high
+
+
+def score_batches(windows, batch_size):
+    """Split ``windows`` into near-equal scoring batches.
+
+    Two things were wrong with the old ``range(0, n, batch_size)`` walk plus a
+    prompt that said "choose up to 3 windows from this batch".
+
+    The cap made the shortlist unreachable. Its real ceiling was
+    ``3 * n_batches``, not ``shortlist_target``: measured 22-sep-2026 on a
+    9:10 source, 9 windows batched 8 + 1 returned 3 + 1 = 4 windows against a
+    target of 8. ``clip_count_targets`` then derives the clip floor from that
+    halved shortlist, so the detail pass was asked for 4-8 clips instead of
+    6-12 and the job delivered 4 (3 in prod on the same video). Every source
+    under ~30 minutes was starved the same way, which is the mechanism behind
+    "95% of jobs deliver 3 clips or fewer" — the clip count the retention
+    curve hangs on (see clip_count_targets). The prompt now scores every
+    window it is given and the shortlist is the global top ``target``, so the
+    selection happens where the scores can actually be compared.
+
+    Per-batch selection also threw away the ranking it was computing: a batch
+    holding five great moments could only contribute three, while a batch of
+    filler still contributed its own three.
+
+    The remainder was its own bug: a trailing batch of one window came back
+    with that window whatever its score, because a cap of 3 cannot filter a
+    batch of 1 — the tail of the video entered the shortlist by arithmetic
+    rather than merit (``window_009`` did exactly that on the measured run).
+    Near-equal batches keep that from happening and also keep each score
+    comparable, since a window judged alone is judged against nothing.
+    """
+    windows = list(windows or [])
+    n = len(windows)
+    if not n:
+        return []
+    size = max(1, int(batch_size or 1))
+    n_batches = max(1, -(-n // size))       # ceil
+    base, extra = divmod(n, n_batches)
+
+    out = []
+    start = 0
+    for index in range(n_batches):
+        take = base + (1 if index < extra else 0)
+        batch = windows[start:start + take]
+        start += take
+        if batch:
+            out.append(batch)
+    return out
+
+
 def trim_to_best(shorts, max_clips):
     """Cut an over-long detail-pass result down to ``max_clips`` BY SCORE.
 
@@ -100,6 +270,52 @@ def trim_to_best(shorts, max_clips):
     indexed = list(enumerate(shorts))
     best = sorted(indexed, key=score, reverse=True)[:max_clips]
     return [item for _, item in sorted(best, key=lambda pair: pair[0])]
+
+
+def vision_segments(video_duration, segment_seconds, max_segments):
+    """Split a silent source into near-equal ``(start, end)`` stretches for
+    the vision pass, each at most ``segment_seconds`` long.
+
+    The vision pass sends Gemini the footage itself at ~300 tokens/second, so
+    an hour (~1.08M tokens) no longer fits a 1M-token window and a silent
+    multi-hour capture failed at the model. Near-equal stretches, not fixed
+    ones: a 41-minute source split at 40 minutes would leave a one-minute
+    tail that the prompt has to fill with 3+ clips. A source that fits in one
+    stretch returns one stretch, so short videos take the single-upload path
+    unchanged.
+
+    When the source needs more stretches than ``max_segments`` allows (a
+    10-hour stream wants 15 at the 40-minute default, the budget is 8), the
+    kept stretches are spread evenly across the WHOLE timeline rather than
+    taken from the head. The old code sized each stretch to tile the source
+    (``step = duration / n``) but then returned only the first ``n_kept`` of
+    them, so a 10-hour capture had only its first ~5.3 hours ever looked at
+    and the best moments in the back half could not be found. Spacing the
+    budgeted stretches from the first second to the last keeps each one inside
+    the token window (still ``<= seg``) while sampling the entire stream; the
+    gaps between them are the price of the fixed budget, logged by the caller.
+    """
+    duration = max(0.0, float(video_duration or 0))
+    seg = max(60.0, float(segment_seconds))
+    if duration <= seg:
+        return [(0.0, round(duration, 3))]
+    n = int(math.ceil(duration / seg))
+    n_kept = max(1, min(n, int(max_segments)))
+    if n_kept >= n:
+        # The budget covers the whole source: near-equal tiles, no gaps.
+        step = duration / n
+        return [(round(i * step, 3), round(min(duration, (i + 1) * step), 3))
+                for i in range(n)]
+    if n_kept == 1:
+        return [(0.0, round(seg, 3))]
+    # Budget-limited: anchor the first stretch at 0 and the last at the end,
+    # spacing the rest evenly, so the sampled windows span start to finish.
+    start_step = (duration - seg) / (n_kept - 1)
+    out = []
+    for i in range(n_kept):
+        start = min(max(0.0, i * start_step), duration - seg)
+        out.append((round(start, 3), round(min(duration, start + seg), 3)))
+    return out
 
 
 def clip_duration_bounds():
@@ -194,6 +410,48 @@ def build_transcript_windows(transcript_result, video_duration,
             "text": str(transcript_result.get("text", "") or ""),
         })
     return windows
+
+
+def dedupe_overlapping(shorts, ratio=0.25):
+    """Drop clips that overlap an already-kept clip by ``ratio`` of the
+    shorter one, keeping the higher ``predicted_score`` (earlier on a tie).
+
+    0.25, not 0.5: two clips sharing 25 s of 59 s (42%) both survived the old
+    bar and the same punchline came out twice in one batch.
+
+    The detail prompt's DIVERSITY rule is the only thing that stopped two
+    clips from sharing the same seconds, and a rule is not a guarantee: two
+    picks from one window can cover the same moment with different edges,
+    and the user then downloads the same short twice. Survivors come back in
+    transcript order, like ``trim_to_best``.
+    """
+    def _score(c):
+        try:
+            return float(c.get("predicted_score") or 0)
+        except (TypeError, ValueError, AttributeError):
+            return 0.0
+
+    def _span(c):
+        try:
+            return float(c.get("start", 0)), float(c.get("end", 0))
+        except (TypeError, ValueError, AttributeError):
+            return 0.0, 0.0
+
+    indexed = list(enumerate(shorts))
+    kept = []
+    for idx, clip in sorted(indexed, key=lambda p: (-_score(p[1]), p[0])):
+        s, e = _span(clip)
+        clash = False
+        for _, other in kept:
+            os_, oe = _span(other)
+            overlap = min(e, oe) - max(s, os_)
+            shorter = max(1e-6, min(e - s, oe - os_))
+            if overlap > 0 and overlap / shorter >= ratio:
+                clash = True
+                break
+        if not clash:
+            kept.append((idx, clip))
+    return [c for _, c in sorted(kept, key=lambda p: p[0])]
 
 
 def snap_clip_to_words(start, end, words, video_duration,

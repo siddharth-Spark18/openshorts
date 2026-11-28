@@ -16,3 +16,11 @@ mailinator.com
 mohmal.com
 temp-mail.org
 yopmail.com
+# Sep-2026 free-minute farm: ~100 rotating front domains (airychen.com,
+# meonvr.com, findize.com, ...) all MX to these two hosts; 567 accounts.
+wabblywabble.com
+wallywatts.com
+# Fronts forexzig.com, fxzig.com, denipl.net -> mx2.den.yt
+den.yt
+# Fronts aminating.com, mailshan.com, draughtier.com -> temp-mail-pro.com
+temp-mail-pro.com

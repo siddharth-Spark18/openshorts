@@ -89,11 +89,52 @@ class TestResumeScan:
         assert app_module._read_manifest("j1")["attempts"] == 0
 
     def test_poison_job_is_dropped_and_refundable(self, out):
-        _manifest(out, "bad", attempts=app_module.MAX_RESUME_ATTEMPTS)
+        _manifest(out, "bad", attempts=app_module.MAX_RESUME_ATTEMPTS,
+                  instance="other", heartbeat=time.time() - 600)   # it was running
         keep = app_module._resume_interrupted_jobs()
         assert "bad" not in app_module.jobs
         assert keep == set()
         assert app_module._read_manifest("bad") is None
+
+
+class TestQueuedVideosSurviveDeploys:
+    """A video that only waited in the queue has crashed nothing: resuming it
+    after a deploy must not use up its attempts. Counting every resume
+    dropped long-queued videos once a few deploys had gone by."""
+
+    def test_never_run_job_survives_many_deploys(self, out, monkeypatch):
+        _manifest(out, "waiting")
+        for _ in range(app_module.MAX_RESUME_ATTEMPTS + 3):
+            monkeypatch.setattr(app_module, "job_queue", asyncio.PriorityQueue())
+            app_module.jobs.clear()
+            keep = app_module._resume_interrupted_jobs()
+            assert keep == {"res-waiting"}
+            assert app_module.jobs["waiting"]["status"] == "queued"
+        assert app_module._read_manifest("waiting")["attempts"] == 0
+
+    def test_manifest_already_at_the_limit_but_never_run_is_resumed(self, out):
+        # What production had: attempts used up by deploys alone, no heartbeat.
+        _manifest(out, "w", attempts=app_module.MAX_RESUME_ATTEMPTS)
+        assert app_module._resume_interrupted_jobs() == {"res-w"}
+        assert app_module.jobs["w"]["status"] == "queued"
+
+    def test_a_run_that_keeps_dying_is_still_dropped(self, out, monkeypatch):
+        _manifest(out, "crashy")
+        for i in range(app_module.MAX_RESUME_ATTEMPTS + 1):
+            monkeypatch.setattr(app_module, "job_queue", asyncio.PriorityQueue())
+            app_module.jobs.clear()
+            # Resumed a while ago, it started running, then its instance died
+            # mid-run (heartbeat stale): one more attempt each time.
+            m = app_module._read_manifest("crashy")
+            if m is None:
+                break
+            now = time.time()
+            m.update(resumed_at=now - 1000 if "resumed_at" in m else None,
+                     instance="other", heartbeat=now - 600, run_started=now - 700)
+            (out / "crashy" / app_module._RESUME_FILE).write_text(json.dumps(m))
+            app_module._resume_interrupted_jobs()
+        assert app_module._read_manifest("crashy") is None
+        assert "crashy" not in app_module.jobs
 
 
 class TestDrain:
@@ -261,7 +302,7 @@ def test_dispatch_waits_while_deployment_is_paused(monkeypatch):
         monkeypatch.setattr(app_module, "_running_jobs", set())
         monkeypatch.setattr(app_module, "_draining", False)
         monkeypatch.setattr(app_module, "_deployment_paused", lambda: paused["value"])
-        monkeypatch.setattr(app_module, "_touch_manifest", lambda _: None)
+        monkeypatch.setattr(app_module, "_touch_manifest", lambda *args, **kwargs: None)
 
         async def run(_):
             started.set()
@@ -279,3 +320,119 @@ def test_dispatch_waits_while_deployment_is_paused(monkeypatch):
             pass
 
     asyncio.run(exercise())
+
+class TestSharedGpu:
+    """The new instance must not stack a full set of jobs on top of the ones
+    the draining instance is still running on the same GPU."""
+
+    def test_counts_only_fresh_jobs_of_other_instances(self, out):
+        now = time.time()
+        _manifest(out, "a", instance="old", heartbeat=now - 5)
+        _manifest(out, "b", instance="old", heartbeat=now - 5)
+        _manifest(out, "c", instance="old", heartbeat=now - 600)   # stale
+        _manifest(out, "d", instance="me", heartbeat=now - 5)      # ours
+        _manifest(out, "e")                                         # queued, no heartbeat
+        (out / "no-manifest").mkdir()
+        assert app_module._jobs_busy_elsewhere(now) == 2
+
+    def test_waits_while_the_gpu_is_full(self, out, monkeypatch):
+        monkeypatch.setattr(app_module, "MAX_CONCURRENT_JOBS", 3)
+        monkeypatch.setattr(app_module, "SHARED_GPU_WAIT_SECONDS", 0.01)
+        busy = {"n": 3}
+        monkeypatch.setattr(app_module, "_jobs_busy_elsewhere", lambda now=None: busy["n"])
+        monkeypatch.setattr(app_module, "_gpu_free_mb", lambda: None)
+        calls = {"n": 0}
+        real_sleep = asyncio.sleep
+
+        async def fake_sleep(sec):
+            calls["n"] += 1
+            if calls["n"] == 3:
+                busy["n"] = 1     # the old instance finished two jobs
+            await real_sleep(0)
+        monkeypatch.setattr(app_module.asyncio, "sleep", fake_sleep)
+        asyncio.run(app_module._wait_for_shared_gpu())
+        assert calls["n"] == 3
+
+    def test_no_wait_when_alone(self, out, monkeypatch):
+        monkeypatch.setattr(app_module, "MAX_CONCURRENT_JOBS", 3)
+        monkeypatch.setattr(app_module, "_running_jobs", {"x", "y"})
+        monkeypatch.setattr(app_module, "_jobs_busy_elsewhere", lambda now=None: 0)
+        monkeypatch.setattr(app_module, "_gpu_free_mb", lambda: 20000)
+
+        async def boom(sec):
+            raise AssertionError("should not wait")
+        monkeypatch.setattr(app_module.asyncio, "sleep", boom)
+        asyncio.run(app_module._wait_for_shared_gpu())
+
+
+class TestGpuHasRoom:
+    def test_count_limit(self, out, monkeypatch):
+        monkeypatch.setattr(app_module, "MAX_CONCURRENT_JOBS", 8)
+        assert not app_module.gpu_has_room(5, 3, 20000)
+
+    def test_needs_free_vram_when_something_runs(self, out, monkeypatch):
+        monkeypatch.setattr(app_module, "MAX_CONCURRENT_JOBS", 8)
+        monkeypatch.setattr(app_module, "GPU_MIN_FREE_MB", 4500)
+        assert not app_module.gpu_has_room(3, 0, 1200)
+        assert app_module.gpu_has_room(3, 0, 6000)
+
+    def test_idle_card_always_starts(self, out, monkeypatch):
+        monkeypatch.setattr(app_module, "GPU_MIN_FREE_MB", 4500)
+        assert app_module.gpu_has_room(0, 0, 100)
+
+    def test_no_nvidia_smi_falls_back_to_count(self, out, monkeypatch):
+        monkeypatch.setattr(app_module, "MAX_CONCURRENT_JOBS", 8)
+        assert app_module.gpu_has_room(4, 0, None)
+
+
+class TestDeployGeneration:
+    """18-nov-2026: the old container of a deploy, killed by the kernel while it
+    drained, was restarted by Docker, wrote the marker at boot, and the new
+    container drained for good on reading it: nobody started jobs."""
+
+    def test_the_generation_comes_from_the_container_name(self):
+        gen = app_module._deploy_generation
+        assert gen({"COOLIFY_CONTAINER_NAME": "abc-20261118T204041"}) == "20261118T204041"
+        assert gen({"DEPLOY_GENERATION": "x9", "COOLIFY_CONTAINER_NAME": "a-20261118T204041"}) == "x9"
+        assert gen({}) == ""
+
+    def test_an_older_deploy_in_the_marker_does_not_drain_us(self, out, monkeypatch):
+        monkeypatch.setattr(app_module, "DEPLOY_GENERATION", "20261118T204041")
+        (out / app_module._INSTANCE_MARKER).write_text("oldhost 20261118T194736")
+        assert app_module._check_instance_marker() is False
+        assert app_module._draining is False
+        assert app_module._read_instance_marker() == app_module.INSTANCE_ID   # taken back
+
+    def test_a_marker_from_before_generations_is_an_older_deploy(self, out, monkeypatch):
+        monkeypatch.setattr(app_module, "DEPLOY_GENERATION", "20261118T204041")
+        (out / app_module._INSTANCE_MARKER).write_text("oldhost")
+        assert app_module._check_instance_marker() is False
+        assert app_module._draining is False
+
+    def test_a_newer_deploy_still_drains_us(self, out, monkeypatch):
+        monkeypatch.setattr(app_module, "DEPLOY_GENERATION", "20261118T194736")
+        (out / app_module._INSTANCE_MARKER).write_text("newhost 20261118T204041")
+        assert app_module._newer_deploy_holds_marker() is True
+        assert app_module._check_instance_marker() is True
+        assert app_module._draining is True
+
+    def test_without_generations_the_last_writer_wins_as_before(self, out, monkeypatch):
+        monkeypatch.setattr(app_module, "DEPLOY_GENERATION", "")
+        (out / app_module._INSTANCE_MARKER).write_text("other")
+        assert app_module._newer_deploy_holds_marker() is False
+        assert app_module._check_instance_marker() is True
+
+    def test_the_marker_line_keeps_older_code_draining(self, out, monkeypatch):
+        monkeypatch.setattr(app_module, "DEPLOY_GENERATION", "20261118T204041")
+        app_module._write_instance_marker()
+        line = (out / app_module._INSTANCE_MARKER).read_text()
+        assert line == f"{app_module.INSTANCE_ID} 20261118T204041"
+        # Code from before reads the whole line as an id that is not its own.
+        assert line.strip() != app_module.INSTANCE_ID
+
+    def test_a_restarted_old_instance_keeps_the_new_ones_reservations(self, out):
+        _manifest(out, "j1")
+        m = json.loads((out / "j1" / app_module._RESUME_FILE).read_text())
+        m["reservation_id"] = "res-9"
+        (out / "j1" / app_module._RESUME_FILE).write_text(json.dumps(m))
+        assert app_module._manifest_reservation_ids() == {"res-9"}

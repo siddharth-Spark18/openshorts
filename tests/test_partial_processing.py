@@ -66,6 +66,42 @@ class TestPlanPartialMinutes:
         assert app_module.plan_partial_minutes(45, 20.0, "lots") == (45, None)
 
 
+class TestFreeOverflow:
+    """A free source past the balance never meets the wall: the first video
+    (<= FIRST_VIDEO_MAX_MINUTES) is clipped whole for the balance, any other
+    is clipped to the first N minutes."""
+
+    @pytest.fixture(autouse=True)
+    def _cap(self, monkeypatch):
+        monkeypatch.setattr(config, "FIRST_VIDEO_MAX_MINUTES", 60)
+
+    def test_first_video_up_to_the_cap_is_granted_whole(self):
+        assert app_module.free_overflow("free", 50, 20.0, None, False) == (20, None)
+        assert app_module.free_overflow("free", 60, 20.0, None, False) == (20, None)
+        # The grant charges the floored balance, which lands at zero.
+        assert app_module.free_overflow("free", 45, 17.6, None, False) == (17, None)
+
+    def test_first_video_past_the_cap_is_clipped_to_the_balance(self):
+        assert app_module.free_overflow("free", 61, 20.0, None, False) == (None, 20.0)
+
+    def test_later_videos_are_clipped_to_the_balance(self):
+        grant, max_minutes = app_module.free_overflow("free", 50, 20.0, None, True)
+        assert grant is None and max_minutes == 20.0
+        # ...which plan_partial_minutes turns into the usual first-N cut.
+        assert app_module.plan_partial_minutes(50, 20.0, max_minutes) == (
+            20, {"processed_minutes": 20, "total_minutes": 50})
+
+    def test_untouched_cases(self):
+        # Fits the balance, a paid plan, or the client already named a cut.
+        assert app_module.free_overflow("free", 15, 20.0, None, False) == (None, None)
+        assert app_module.free_overflow("starter", 50, 20.0, None, False) == (None, None)
+        assert app_module.free_overflow("free", 50, 20.0, 10, False) == (None, 10)
+
+    def test_grant_can_be_disabled(self, monkeypatch):
+        monkeypatch.setattr(config, "FIRST_VIDEO_MAX_MINUTES", 0)
+        assert app_module.free_overflow("free", 50, 20.0, None, False) == (None, 20.0)
+
+
 # --------------------------------------------------------------------------- #
 # Endpoint: max_minutes reaches the reservation, the cut reaches the job
 # --------------------------------------------------------------------------- #
@@ -106,7 +142,7 @@ def dirs(tmp_path, monkeypatch):
 def _stub_reservation(monkeypatch, partial):
     seen = {}
 
-    async def _reserve(request, url, input_path, job_id, max_minutes=None):
+    async def _reserve(request, url, input_path, job_id, max_minutes=None, **_kw):
         seen["max_minutes"] = max_minutes
         return 7, 1, "res-1", "free", partial
     monkeypatch.setattr(app_module, "reserve_process_minutes", _reserve)
@@ -206,3 +242,21 @@ class TestCapSourceDuration:
         main.cap_source_duration(path, 3)
         assert os.path.getsize(path) == before
         assert 149 <= self._seconds(path) <= 151
+
+
+class TestFirstVideoIpFingerprint:
+    """The per-network limit keys on an HMAC of the IP, never the IP."""
+
+    def test_stable_and_not_the_ip(self, monkeypatch):
+        from cloud import metering
+        monkeypatch.setenv("JWT_SECRET", "s3cret")
+        a = metering.ip_fingerprint("203.0.113.7")
+        assert a == metering.ip_fingerprint("203.0.113.7")
+        assert "203.0.113.7" not in a and len(a) == 64
+        assert a != metering.ip_fingerprint("203.0.113.8")
+
+    def test_unknown_ip_has_no_fingerprint(self):
+        from cloud import metering
+        assert metering.ip_fingerprint("") == ""
+        assert metering.ip_fingerprint("unknown") == ""
+        assert metering.ip_fingerprint(None) == ""

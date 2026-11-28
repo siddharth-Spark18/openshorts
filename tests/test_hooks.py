@@ -61,8 +61,14 @@ class TestHookStyles:
 
     def test_expected_style_names(self):
         assert set(HOOK_STYLES) == {
-            "classic", "dark", "yellow", "red", "outline", "outline_yellow",
+            "pill", "classic", "dark", "yellow", "red", "outline", "outline_yellow",
         }
+
+    def test_pill_is_one_box_per_line_in_the_bundled_sans(self):
+        look = HOOK_STYLES["pill"]
+        assert look["pills"] is True
+        assert look["font"].endswith("Montserrat-ExtraBold.ttf")
+        assert os.path.exists(look["font"]), "the pill font must ship with the repo"
 
     def test_boxed_styles_have_opaque_box_and_shadow(self):
         for name in ("classic", "dark", "yellow", "red"):
@@ -124,3 +130,18 @@ class TestCreateHookImage:
         out = str(tmp_path / "hook_fallback.png")
         path, w, h = create_hook_image("Hola", 500, out, style="nope")
         assert os.path.exists(path) and w > 0 and h > 0
+
+
+def test_pill_hook_image_stacks_one_box_per_line(tmp_path):
+    """Two lines of text -> two rows of box pixels with a boxless column
+    beside the shorter one (it is its own pill, not one shared card)."""
+    from hooks import create_hook_image
+    from PIL import Image
+    out = tmp_path / "pill.png"
+    path, w, h = create_hook_image("una frase bastante larga para partirse en dos lineas",
+                                   600, str(out), style="pill")
+    img = Image.open(path).convert("RGBA")
+    assert (img.width, img.height) == (w, h)
+    alpha_rows = [any(img.getpixel((x, y))[3] > 200 for x in range(0, img.width, 4))
+                  for y in range(img.height)]
+    assert sum(alpha_rows) > 0

@@ -11,15 +11,221 @@ from fastapi import APIRouter, HTTPException, Request
 from sqlalchemy import select, delete
 
 from .config import settings, VIDEO_RETENTION_GRACE_DAYS, FREE_CLIP_RETENTION_DAYS
-from . import database, storage, metering
+from . import database, storage, metering, media_redirect
 from .models import UserVideo, Subscription, Project, User, ClipExpiryWarning
 from .auth import get_current_user_required
+
+import clean_twin
+import watermarked
 
 router = APIRouter()
 
 
 def _clip_title(clip) -> str:
     return clip.get("title") or clip.get("video_title_for_youtube_short") or "Short"
+
+
+_HOOK_CHAIN_RE = re.compile(r'^subtitled_\d+_((?:hooked_\d+_|hook_).+)$')
+
+
+def _canonical_name(base_name, clip_index):
+    return f"{base_name}_clip_{clip_index + 1}.mp4" if base_name else None
+
+
+def _twins_to_archive(served, base_name, clip_index):
+    """The files that must ride to R2 next to a served clip file, in order.
+
+    * its clean twin when it is a free-plan ``wm_`` copy (an upgrade re-points
+      at it: ``unmark_user_library``), unless that twin is the canonical,
+      which the caller archives on its own;
+    * the ``hooked_`` intermediate of a captioned hook chain, resolved on the
+      clean name, or a restored project's caption restyle cannot walk back to
+      the hook-only file and would silently drop or stack layers.
+    """
+    out = []
+    clean = watermarked.clean_name(served)
+    canonical = _canonical_name(base_name, clip_index)
+    if clean != served and clean != canonical:
+        out.append(clean)
+    m = _HOOK_CHAIN_RE.match(clean)
+    if m and m.group(1) != canonical:
+        out.append(m.group(1))
+    return out
+
+
+def _archived_twins(output_dir, served, base_name, clip_index):
+    """The files of ``_twins_to_archive`` that are on disk, and for a clean
+    twin kept as a recipe (clean_twin.py) the recipe's files instead: a
+    restored project, or an upgrade after the working files are gone, can
+    still encode it."""
+    out = []
+    for name in _twins_to_archive(served, base_name, clip_index):
+        if os.path.exists(os.path.join(output_dir, name)):
+            out.append(name)
+        else:
+            out += [n for n in clean_twin.archive_names(output_dir, name) if n not in out]
+    return out
+
+
+def _superseded_names(prev, original_file, new_filename, base_name, clip_index):
+    """R2 objects an edit leaves behind: the previous served file and, when
+    that was a ``wm_`` copy, its clean twin. Never the pristine original (or
+    its twin), never the canonical, never the file just written."""
+    if not prev:
+        return []
+    keep = {new_filename, watermarked.clean_name(new_filename),
+            original_file or "", watermarked.clean_name(original_file or ""),
+            _canonical_name(base_name, clip_index) or ""}
+    out = []
+    for name in (prev, watermarked.clean_name(prev)):
+        if name and name not in keep and name not in out:
+            out.append(name)
+    return out
+
+
+def unmarked_clip_state(state):
+    """Pure half of ``unmark_user_library``: the project state with every
+    ``wm_`` name replaced by its clean twin, plus ``[(index, wm, clean)]`` for
+    the clips whose served file changed."""
+    new_state = dict(state or {"v": 1, "clips": []})
+    changes, clips = [], []
+    for c in new_state.get("clips", []):
+        c = dict(c)
+        served = c.get("server_file") or ""
+        if watermarked.is_marked(served):
+            clean = watermarked.clean_name(served)
+            changes.append((c.get("index"), served, clean))
+            c["server_file"] = clean
+        original = c.get("original_file") or ""
+        if watermarked.is_marked(original):
+            c["original_file"] = watermarked.clean_name(original)
+        clips.append(c)
+    new_state["clips"] = clips
+    return new_state, changes
+
+
+# app.py owns the working files and the in-memory job table; like the erasure
+# purge (cloud/account.py) it registers a callback at startup rather than being
+# imported from here.
+_local_unmark = None
+
+
+def register_local_unmark(fn):
+    """Let app.py hand us a ``(job_id, clip_index, clean_filename)`` callback."""
+    global _local_unmark
+    _local_unmark = fn
+
+
+# app.py encodes a clean twin kept as a recipe (clean_twin.py) and uploads it:
+# ``async (user_id, project, clean_filename) -> bool``.
+_clean_render = None
+
+
+def register_clean_render(fn):
+    global _clean_render
+    _clean_render = fn
+
+
+async def _clean_size(user_id, proj, clean):
+    """Size of ``clean`` in R2, encoding it from its recipe first if it is
+    not there (a free clip from CLEAN_LAZY); None when it cannot be had."""
+    clean_key = storage.job_key(user_id, proj.job_id, clean)
+    try:
+        size = await asyncio.to_thread(storage.object_size, clean_key)
+    except Exception as e:
+        print(f"⚠️  R2 head failed for {clean_key}: {e}")
+        return None
+    if size is None and _clean_render is not None and await _clean_render(user_id, proj, clean):
+        try:
+            size = await asyncio.to_thread(storage.object_size, clean_key)
+        except Exception as e:
+            print(f"⚠️  R2 head failed for {clean_key}: {e}")
+            return None
+    return size
+
+
+async def unmark_user_library(user_id, job_id=None) -> int:
+    """After an upgrade: serve every clip this user has through its clean twin.
+
+    The free plan burns the mark into a ``wm_`` copy and archives the clean
+    final next to it (``_twins_to_archive``), or since 25-nov-2026 a recipe
+    for it that is encoded here (``_clean_size``), so losing the mark is a
+    re-pointing: the history row and the project state move to
+    the twin, the marked object is deleted, and app.py is told so a dashboard
+    that is open on the job follows. A clip whose twin is not in R2 keeps its
+    marked file: a dead link would be worse than the mark. Returns the number
+    of clips re-pointed. ``job_id`` limits it to that job (a free job that
+    finished after its owner paid, ``app._unmark_if_owner_paid``).
+    """
+    if not settings.r2_configured:
+        return 0
+    async with database.session() as s:
+        # Newest first: the job a dashboard is open on gets its clean files
+        # first when twins have to be encoded (clean_twin.py).
+        q = select(Project).where(Project.user_id == user_id).order_by(
+            Project.created_at.desc())
+        if job_id is not None:
+            q = q.where(Project.job_id == str(job_id))
+        projects = list((await s.execute(q)).scalars())
+    done = 0
+    for proj in projects:
+        new_state, changes = unmarked_clip_state(proj.state)
+        if not changes:
+            continue
+        applied = []
+        for index, wm_name, clean in changes:
+            size = await _clean_size(user_id, proj, clean)
+            if size is None:
+                continue
+            applied.append((index, wm_name, clean,
+                            storage.job_key(user_id, proj.job_id, clean), size))
+        if not applied:
+            continue
+        # The pristine original of an edited clip is a free clip's served file
+        # too: its twin is what "back to the original" opens once unmarked.
+        served = {clean for _i, _wm, clean, _k, _s in applied}
+        for c in (proj.state or {}).get("clips", []):
+            original = c.get("original_file") or ""
+            if (watermarked.is_marked(original)
+                    and watermarked.clean_name(original) not in served):
+                await _clean_size(user_id, proj, watermarked.clean_name(original))
+        applied_idx = {a[0] for a in applied}
+        # Clips whose twin is missing keep their marked entry.
+        prior = {c.get("index"): c for c in (proj.state or {}).get("clips", [])}
+        new_state["clips"] = [
+            c if c.get("index") in applied_idx else dict(prior.get(c.get("index"), c))
+            for c in new_state["clips"]]
+        async with database.session() as s:
+            async with s.begin():
+                row = (await s.execute(
+                    select(Project).where(Project.id == proj.id)
+                )).scalar_one_or_none()
+                if row is not None:
+                    row.state = new_state
+                for index, _wm, _clean, clean_key, size in applied:
+                    vid = (await s.execute(
+                        select(UserVideo).where(UserVideo.user_id == user_id,
+                                                UserVideo.job_id == proj.job_id,
+                                                UserVideo.clip_index == index)
+                    )).scalars().first()
+                    if vid is not None:
+                        vid.r2_key, vid.size_bytes = clean_key, size
+        for index, wm_name, clean, _key, _size in applied:
+            try:
+                await asyncio.to_thread(
+                    storage.delete_key, storage.job_key(user_id, proj.job_id, wm_name))
+            except Exception as e:
+                print(f"⚠️  Could not delete marked R2 object {wm_name}: {e}")
+            if _local_unmark is not None:
+                try:
+                    _local_unmark(proj.job_id, index, clean)
+                except Exception as e:
+                    print(f"⚠️  Local unmark failed for {proj.job_id}: {e}")
+            done += 1
+        media_redirect.forget(proj.job_id)
+    if done:
+        print(f"🏷️  Watermark removed from {done} clip(s) of user {user_id} after upgrade.")
+    return done
 
 
 async def archive_job(user_id, job_id, clips, output_dir, attestation=None):
@@ -67,8 +273,9 @@ async def archive_job(user_id, job_id, clips, output_dir, attestation=None):
         # one (captioned/recut): it is the editable master — the clip editor's
         # fast path and /api/subtitle re-styles cut from it, so a project
         # restored after a redeploy is only editable if it comes back too.
-        # Restore downloads every key under the job prefix, so no change is
-        # needed on that side; the free-retention purge deletes by prefix.
+        # Restore downloads every key under the job prefix (except the
+        # archived source, cloud/source_archive.py), so no change is needed on
+        # that side; the free-retention purge deletes by prefix.
         if base_name:
             clean = f"{base_name}_clip_{i + 1}.mp4"
             clean_path = os.path.join(output_dir, clean)
@@ -79,19 +286,16 @@ async def archive_job(user_id, job_id, clips, output_dir, attestation=None):
                 except Exception as e:
                     print(f"⚠️  R2 upload failed for {clean_key}: {e}")
 
-        # A captioned hook is a chain (subtitled_<ts>_hooked_<ts>_<clean>):
-        # the hooked_ intermediate must come back too, or a restored project's
-        # caption restyle cannot walk back to the hook-only file and would
-        # silently drop or stack layers.
-        m = re.match(r'^subtitled_\d+_((?:hooked_\d+_|hook_).+)$', filename)
-        if m:
-            mid_path = os.path.join(output_dir, m.group(1))
-            if os.path.exists(mid_path):
-                mid_key = storage.job_key(user_id, job_id, m.group(1))
-                try:
-                    await asyncio.to_thread(storage.upload_file, mid_path, mid_key)
-                except Exception as e:
-                    print(f"⚠️  R2 upload failed for {mid_key}: {e}")
+        # Free plan: the served file is the wm_ copy of the final one, and the
+        # clean final rides along so an upgrade can re-point at it without a
+        # render (unmark_user_library). The canonical is handled just above.
+        for twin_name in _archived_twins(output_dir, filename, base_name, i):
+            twin_key = storage.job_key(user_id, job_id, twin_name)
+            try:
+                await asyncio.to_thread(storage.upload_file,
+                                        os.path.join(output_dir, twin_name), twin_key)
+            except Exception as e:
+                print(f"⚠️  R2 upload failed for {twin_key}: {e}")
 
     if not uploaded:
         return
@@ -145,6 +349,7 @@ async def archive_job(user_id, job_id, clips, output_dir, attestation=None):
                     proj.metadata_r2_key = metadata_r2_key
                     proj.state = state
                     proj.size_bytes = total
+    media_redirect.forget(job_id)
     print(f"☁️  Archived {len(uploaded)} clip(s) to R2 for user {user_id}.")
 
 
@@ -163,21 +368,21 @@ async def archive_clip_edit(user_id, job_id, clip_index, output_dir, new_filenam
     new_key = storage.job_key(user_id, job_id, new_filename)
     await asyncio.to_thread(storage.upload_file, local_path, new_key)
 
-    # Same chain rule as archive_job: a captioned hook needs its hooked_
-    # intermediate archived too, or the restored project cannot re-style.
-    m = re.match(r'^subtitled_\d+_((?:hooked_\d+_|hook_).+)$', new_filename)
-    if m:
-        mid_path = os.path.join(output_dir, m.group(1))
-        if os.path.exists(mid_path):
-            try:
-                await asyncio.to_thread(
-                    storage.upload_file, mid_path,
-                    storage.job_key(user_id, job_id, m.group(1)))
-            except Exception as e:
-                print(f"⚠️  R2 upload failed for hook intermediate of {job_id}: {e}")
-
     metadata_r2_key = None
     meta_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
+    base_name = (os.path.basename(meta_files[0]).replace("_metadata.json", "")
+                 if meta_files else None)
+
+    # Same chain rule as archive_job: a captioned hook needs its hooked_
+    # intermediate archived too, or the restored project cannot re-style; and
+    # a wm_ copy needs its clean twin, or an upgrade cannot drop the mark.
+    for twin_name in _archived_twins(output_dir, new_filename, base_name, clip_index):
+        try:
+            await asyncio.to_thread(
+                storage.upload_file, os.path.join(output_dir, twin_name),
+                storage.job_key(user_id, job_id, twin_name))
+        except Exception as e:
+            print(f"⚠️  R2 upload failed for {twin_name} of {job_id}: {e}")
     if meta_files:
         metadata_r2_key = storage.job_key(user_id, job_id, os.path.basename(meta_files[0]))
         try:
@@ -188,7 +393,7 @@ async def archive_clip_edit(user_id, job_id, clip_index, output_dir, new_filenam
             metadata_r2_key = None
 
     size = os.path.getsize(local_path)
-    superseded_key = None
+    superseded = []
     async with database.session() as s:
         async with s.begin():
             proj = (await s.execute(
@@ -203,8 +408,10 @@ async def archive_clip_edit(user_id, job_id, clip_index, output_dir, new_filenam
                              "active_layers": None}
                     clips_state.append(entry)
                 prev = entry.get("server_file")
-                if prev and prev not in (entry.get("original_file"), new_filename):
-                    superseded_key = storage.job_key(user_id, job_id, prev)
+                superseded = [
+                    storage.job_key(user_id, job_id, name) for name in
+                    _superseded_names(prev, entry.get("original_file"), new_filename,
+                                      base_name, clip_index)]
                 entry["server_file"] = new_filename
                 state["clips"] = clips_state
                 proj.state = state
@@ -220,7 +427,10 @@ async def archive_clip_edit(user_id, job_id, clip_index, output_dir, new_filenam
             else:
                 s.add(UserVideo(user_id=user_id, job_id=job_id, clip_index=clip_index,
                                 r2_key=new_key, size_bytes=size))
-    if superseded_key and superseded_key != new_key:
+    media_redirect.forget(job_id)
+    for superseded_key in superseded:
+        if superseded_key == new_key:
+            continue
         try:
             await asyncio.to_thread(storage.delete_key, superseded_key)
         except Exception as e:
@@ -364,6 +574,10 @@ async def purge_free_expired():
     Paid libraries are durable; the free plan keeps R2 storage bounded (and the
     limited retention is an upgrade lever). Only rows whose owner is currently
     on the free plan are touched — a user who upgraded keeps everything.
+
+    A plan that ended keeps its library VIDEO_RETENTION_GRACE_DAYS more
+    (Terms, section 13: "deleted 7 days after it ends"); only after that does
+    the account's library follow the free per-clip expiry.
     """
     from datetime import datetime, timezone
     cutoff = datetime.now(timezone.utc) - timedelta(days=FREE_CLIP_RETENTION_DAYS)
@@ -384,6 +598,8 @@ async def purge_free_expired():
     for user_id, items in by_user.items():
         async with database.session() as s:
             if not await metering.is_free_user(s, user_id):
+                continue
+            if await metering.in_paid_grace(s, user_id, VIDEO_RETENTION_GRACE_DAYS):
                 continue
         try:
             for v in items["videos"]:
@@ -449,6 +665,10 @@ async def warn_free_expiring():
         async with database.session() as s:
             if not await metering.is_free_user(s, user_id):
                 continue
+            # Not about to be deleted: the plan's grace still covers them, and
+            # a warning recorded now would never be sent again.
+            if await metering.in_paid_grace(s, user_id, VIDEO_RETENTION_GRACE_DAYS):
+                continue
             user = await s.get(User, user_id)
         if not user or not user.email:
             continue
@@ -484,6 +704,11 @@ async def _sweeper_loop():
             await purge_stale_magic_tokens()
             from .account import purge_stale_deletion_records
             await purge_stale_deletion_records()
+            from .evidence import purge_stale_events
+            await purge_stale_events()
+            # Paid jobs' source videos past SOURCE_ARCHIVE_DAYS (once a day).
+            from .source_archive import purge_expired_sources
+            await purge_expired_sources()
         except asyncio.CancelledError:
             break
         except Exception as e:

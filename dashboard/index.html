@@ -21,8 +21,8 @@
   <!-- Title and description are kept under 60 and 160 characters (measured, not
        eyeballed): Google truncates past roughly that width, and a truncated
        description is a worse answer than a shorter deliberate one. -->
-  <title>OpenShorts - Free Open Source AI Clip Generator (MIT)</title>
-    <meta name="description" content="Open source AI clip generator: turn long videos into 9:16 shorts for TikTok, Reels and Shorts. Self-host free under MIT, or cloud from $12/month." />
+  <title>OpenShorts: Free AI Clip Maker &amp; Clipping Tool, Open Source</title>
+  <meta name="description" content="Paste a YouTube link and get 9:16 clips with captions in minutes. Free plan, paid from $12/mo, or self-host free under MIT. Open source, no lock-in." />
   <meta name="author" content="OpenShorts" />
   <meta name="robots" content="index, follow, max-image-preview:large, max-snippet:-1, max-video-preview:-1" />
   <!-- Canonical must match the host actually served. The apex redirects to www,
@@ -33,7 +33,7 @@
   <meta property="og:type" content="website" />
   <meta property="og:url" content="https://www.openshorts.app/" />
   <meta property="og:title"
-    content="OpenShorts - Open Source AI Clip Generator" />
+    content="OpenShorts: Free AI Clip Maker &amp; Clipping Tool, Open Source" />
   <meta property="og:description"
     content="Turn long videos into viral 9:16 shorts, or generate UGC videos with AI actors. Self-host free under MIT, or use the cloud from $12/month with 20 free minutes." />
   <meta property="og:image" content="https://www.openshorts.app/og-image.png" />
@@ -46,7 +46,7 @@
   <meta name="twitter:card" content="summary_large_image" />
   <meta name="twitter:url" content="https://www.openshorts.app/" />
   <meta name="twitter:title"
-    content="OpenShorts - Open Source AI Clip Generator" />
+    content="OpenShorts: Free AI Clip Maker &amp; Clipping Tool, Open Source" />
   <meta name="twitter:description"
     content="Self-host free under MIT with no watermark and no cap, or use OpenShorts Cloud from $12/month." />
   <meta name="twitter:image" content="https://www.openshorts.app/og-image.png" />
@@ -72,13 +72,13 @@
         {
           "@type": "WebPage",
           "@id": "https://www.openshorts.app/#webpage",
-          "name": "OpenShorts - Open Source AI Clip Generator",
+          "name": "OpenShorts: Free AI Clip Maker & Clipping Tool, Open Source",
           "description": "Open source AI clip generator that turns long videos into viral 9:16 clips for TikTok, Instagram Reels and YouTube Shorts. Free and self-hostable under MIT, or hosted from $12/month.",
           "url": "https://www.openshorts.app/",
           "isPartOf": { "@id": "https://www.openshorts.app/#website" },
           "about": { "@id": "https://www.openshorts.app/#software" },
           "datePublished": "2024-06-01",
-          "dateModified": "2026-07-27",
+          "dateModified": "2026-10-28",
           "inLanguage": "en-US",
           "speakable": {
             "@type": "SpeakableSpecification",
@@ -104,7 +104,7 @@
             "AI viral moment detection with Google Gemini 3.1 Flash-Lite",
             "Smart 9:16 vertical cropping with MediaPipe face tracking and YOLOv8 fallback",
             "Automatic subtitle generation with word-level timestamps",
-            "AI voice dubbing in 30+ languages via ElevenLabs",
+            "AI voice dubbing in 30+ languages with your own ElevenLabs key",
             "Local video file upload and YouTube link ingest",
             "Hook text overlays with styled fonts",
             "AI-generated video effects via FFmpeg",
@@ -181,10 +181,42 @@
             },
             {
               "@type": "Question",
-              "name": "Is OpenShorts free? What is the catch?",
+              "name": "Is OpenShorts really free?",
               "acceptedAnswer": {
                 "@type": "Answer",
-                "text": "Both answers are true of different editions, so the distinction matters. OpenShorts self-hosted is free and open source under the MIT licence: you run it with Docker on your own machine, bring your own API keys, and there is no watermark, no usage cap and no subscription. What it costs you is hardware and time, because on a typical CPU an 8-minute video takes 5 to 8 minutes to process, and you need your own Google Gemini API key, whose free tier covers 1,500 requests per day. OpenShorts Cloud is the hosted service: an NVIDIA GPU clips that same 8-minute video in about 50 seconds, the API keys are included, and auto-posting to TikTok, Instagram and YouTube is already wired up. Cloud has a free plan of 20 minutes per month with a watermark and no credit card, and paid plans from $12 per month for 100 minutes with no watermark, up to $59 per month. So it is free if you run it yourself, and paid above 20 minutes a month if you want it hosted."
+                "text": "Self-hosting is free under the MIT licence, with no watermark and no cap; OpenShorts Cloud has a free plan (your first video up to 60 minutes, then 20 minutes a month, watermarked) and paid plans from $12/month. Both are true of different editions, so the distinction matters. OpenShorts self-hosted is free and open source under the MIT licence: you run it with Docker on your own machine, bring your own API keys, and there is no watermark, no usage cap and no subscription. What it costs you is hardware and time, because on a typical CPU an 8-minute video takes 5 to 8 minutes to process, and you need your own Google Gemini API key, whose free tier covers 1,500 requests per day. OpenShorts Cloud is the hosted service: an NVIDIA GPU clips that same 8-minute video in about 50 seconds, the API keys are included, and auto-posting to TikTok, Instagram and YouTube is already wired up. Cloud has a free plan of 20 minutes per month with a watermark and no credit card, and paid plans from $12 per month for 100 minutes with no watermark, up to $59 per month. So it is free if you run it yourself, and paid above 20 minutes a month if you want it hosted."
+              }
+            },
+            {
+              "@type": "Question",
+              "name": "Do the clips have a watermark?",
+              "acceptedAnswer": {
+                "@type": "Answer",
+                "text": "Only on the free Cloud plan. Clips made on the free plan of OpenShorts Cloud carry a small watermark; every paid plan, from $12/month, has none, and upgrading removes the mark from the clips you already made. The self-hosted edition, free under MIT, never adds one."
+              }
+            },
+            {
+              "@type": "Question",
+              "name": "Do I need a credit card to start?",
+              "acceptedAnswer": {
+                "@type": "Answer",
+                "text": "No. The free plan of OpenShorts Cloud needs no credit card: your first video is clipped free up to 60 minutes, then you get 20 free minutes every month, with a watermark. You only add a card if you choose a paid plan, from $12/month."
+              }
+            },
+            {
+              "@type": "Question",
+              "name": "How many clips do I get from one video?",
+              "acceptedAnswer": {
+                "@type": "Answer",
+                "text": "Between 3 and 15, each 15 to 60 seconds long. The AI scores every moment of the video and keeps the ones that hold up as standalone clips, so the number depends on the source, not on a fixed quota."
+              }
+            },
+            {
+              "@type": "Question",
+              "name": "Can I clip someone else's YouTube video?",
+              "acceptedAnswer": {
+                "@type": "Answer",
+                "text": "Only if you own it or have the rights or permission to use it. Before a video is processed, OpenShorts asks you to confirm you own the content or have the rights to it, and you are responsible for what you submit. Fair use depends on the country and on how the clip is used, so it is never guaranteed; reuploading someone else's video without permission is copyright infringement, and platforms remove it and strike the account. Clip your own videos, channels you manage, or footage you have licensed."
               }
             },
             {
@@ -221,10 +253,18 @@
             },
             {
               "@type": "Question",
+              "name": "How does OpenShorts compare to Opus Clip?",
+              "acceptedAnswer": {
+                "@type": "Answer",
+                "text": "Both do AI viral moment detection and smart vertical cropping. OpenShorts is MIT-licensed and can be self-hosted, so the source video never leaves your machine, and it adds voice dubbing into 30+ languages (with your own ElevenLabs key) plus an AI UGC generator with lip-synced actors. Opus Clip is closed source and cloud only, starting at $15/month as of October 2026, and it ships a larger caption-style library. OpenShorts Cloud starts at $12/month, and self-hosting is free. Full comparison at /alternatives/opus-clip."
+              }
+            },
+            {
+              "@type": "Question",
               "name": "Can OpenShorts add subtitles and translate videos?",
               "acceptedAnswer": {
                 "@type": "Answer",
-                "text": "Yes. Subtitles are generated with faster-whisper at word-level timestamps and burned into the video with FFmpeg. For translation, ElevenLabs AI dubbing translates the audio into more than 30 languages while preserving the original speaker's voice characteristics, and the dubbed audio is then automatically re-transcribed so the burned-in subtitles are in the target language rather than the original."
+                "text": "Yes. Subtitles are generated with faster-whisper at word-level timestamps and burned into the video with FFmpeg. For translation, ElevenLabs AI dubbing (with your own ElevenLabs API key) translates the audio into more than 30 languages while preserving the original speaker's voice characteristics, and the dubbed audio is then automatically re-transcribed so the burned-in subtitles are in the target language rather than the original."
               }
             },
             {

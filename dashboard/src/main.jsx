@@ -7,6 +7,8 @@ import { capture as captureAttribution } from './lib/attribution'
 import PricingPage from './components/PricingPage'
 import AccountPage from './components/AccountPage'
 import LoginModal from './components/LoginModal'
+import { readPendingPlan } from './lib/pendingPlan'
+import { track } from './lib/analytics'
 import { applyConsent } from './lib/consent'
 import CookieBanner from './components/CookieBanner'
 
@@ -30,7 +32,22 @@ function PageShell({ title, children }) {
 }
 
 function PricingView() {
+  const { isSignedIn, loading } = useAuth();
+  // A plan picked on the landing while signed out lands here: ask for the
+  // sign-in straight away instead of a second click on the same plan.
   const [showLogin, setShowLogin] = useState(false);
+  // Back from Stripe without paying (cancel_url of a checkout opened here):
+  // straight to the plans, not the top of the page, and the query dropped so
+  // a reload does not count it twice.
+  useEffect(() => {
+    if (!window.location.hash.includes('checkout=cancel')) { window.scrollTo(0, 0); return; }
+    track('CheckoutCanceled', { props: { back_to: 'pricing' } });
+    try { window.history.replaceState(null, '', '#/pricing'); } catch (_) { /* ignore */ }
+    requestAnimationFrame(() => document.getElementById('pricing-plans')?.scrollIntoView());
+  }, []);
+  useEffect(() => {
+    if (!loading && !isSignedIn && readPendingPlan()) setShowLogin(true);
+  }, [loading, isSignedIn]);
   return (
     <PageShell>
       <PricingPage onRequireLogin={() => setShowLogin(true)} />
@@ -47,9 +64,24 @@ function AccountView() {
   return <PageShell><AccountPage /></PageShell>;
 }
 
+// Direct sign-in page (#/login), the URL handed to app-directory reviewers:
+// the sign-in form opens straight away and a signed-in visitor goes to the app.
+function LoginView() {
+  const { isSignedIn, loading } = useAuth();
+  const toApp = () => { window.location.hash = '#app'; };
+  useEffect(() => {
+    if (!loading && isSignedIn) toApp();
+  }, [loading, isSignedIn]);
+  return (
+    <PageShell>
+      {!loading && !isSignedIn && <LoginModal onClose={toApp} />}
+    </PageShell>
+  );
+}
+
 // Landing spot after an account is erased. Its own view because the session is
 // gone: sending the user to #/account would bounce them to pricing with no
-// explanation, and "openshorts_skip_landing" would send them into the app.
+// explanation.
 function DeletedView() {
   return (
     <div className="min-h-screen bg-paper text-ink2 flex items-center justify-center p-6">
@@ -78,10 +110,15 @@ function Root() {
     if (hash.startsWith('#/account')) return 'account';
     if (hash.startsWith('#/deleted')) return 'deleted';
     if (hash.startsWith('#/pricing')) return 'pricing';
+    if (hash.startsWith('#/login')) return 'login';
     if (hash === '#legal') return 'legal';
-    // #landing = explicit landing view (app logo); section anchors keep the landing mounted
-    if (['#landing', '#features', '#how-it-works', '#pricing', '#comparison', '#faq'].includes(hash)) return 'landing';
-    if (hash === '#app' || hash.startsWith('#app?') || localStorage.getItem('openshorts_skip_landing') === '1') return 'app';
+    // The app lives at #app (and #app?tab=… deep links). Everything else,
+    // including a bare / and the section anchors (#features, #pricing…) and
+    // #landing, is the landing page. There is deliberately no "returning
+    // visitor" shortcut into the app: the static fallback is the landing, so
+    // swapping it for the app after hydration made / jump a second after load,
+    // and the logo of every page has to reach the landing.
+    if (hash === '#app' || hash.startsWith('#app?') || hash === '#/app') return 'app';
     return 'landing';
   };
 
@@ -94,13 +131,13 @@ function Root() {
   }, []);
 
   const handleLaunchApp = () => {
-    localStorage.setItem('openshorts_skip_landing', '1');
     window.location.hash = '#app';
     setView('app');
   };
 
   if (view === 'legal') return <Legal />;
   if (view === 'pricing') return <PricingView />;
+  if (view === 'login') return <LoginView />;
   if (view === 'account') return <AccountView />;
   if (view === 'oauth') return <OAuthConsent />;
   if (view === 'deleted') return <DeletedView />;

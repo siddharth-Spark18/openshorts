@@ -40,6 +40,15 @@ class TestResourceSurface:
         assert "__OPENSHORTS_DATA__" not in content["text"]
         assert "var inline = null;" in content["text"]
 
+    def test_template_declares_the_video_host_as_media_domain(self, monkeypatch):
+        # Without it ChatGPT's widget sandbox blocks the <video> previews.
+        monkeypatch.setenv("PUBLIC_API_URL", "https://api.example.com/")
+        meta = _run(_req("resources/read", {"uri": mcp_ui.CLIP_PICKER_URI}))["result"]["contents"][0]["_meta"]
+        assert meta["openai/widgetCSP"]["resource_domains"] == ["https://api.example.com"]
+        assert meta["ui"]["csp"]["resourceDomains"] == ["https://api.example.com"]
+        monkeypatch.delenv("PUBLIC_API_URL")
+        assert mcp_ui.widget_meta()["openai/widgetCSP"]["resource_domains"] == []
+
     def test_resources_read_accepts_per_call_uris(self):
         resp = _run(_req("resources/read", {"uri": mcp_ui.CLIP_PICKER_URI + "/job42"}))
         assert resp["result"]["contents"][0]["uri"].endswith("/job42")
@@ -100,3 +109,17 @@ class TestTemplateSafety:
             # No external fetches: host CSPs block them and the picker must
             # render anyway. (Clip video URLs are data, not template.)
             assert marker not in html
+
+    def test_render_is_skipped_for_unchanged_data(self):
+        # Repeated openai:set_globals must not rebuild the <video> elements.
+        html = mcp_ui.clip_picker_html()
+        assert "if (key === rendered) return;" in html
+
+    def test_template_uri_changes_with_the_html(self):
+        # Hosts cache templates by URI: a new HTML must get a new URI.
+        import hashlib
+        h = hashlib.sha256(mcp_ui._TEMPLATE.encode()).hexdigest()[:10]
+        assert mcp_ui.CLIP_PICKER_URI == mcp_ui.CLIP_PICKER_BASE + "-" + h
+        # The pre-versioning URI still resolves for hosts that cached it.
+        resp = _run(_req("resources/read", {"uri": mcp_ui.CLIP_PICKER_BASE}))
+        assert "result" in resp

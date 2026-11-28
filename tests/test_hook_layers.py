@@ -62,6 +62,53 @@ class TestLayerChain:
         assert _strip_burned_hook(str(tmp_path), no_captions) == CLEAN
 
 
+class TestHookedOnDemand:
+    """The job keeps a recipe instead of encoding the hooked-only picture
+    (hooks.materialize); stripping the captions encodes it when needed."""
+
+    def _recipe(self, tmp_path, monkeypatch):
+        import hooks
+        _touch(tmp_path, CLEAN)
+        _touch(tmp_path, CAPTIONED_HOOKED)
+        json_path, png_path = hooks.recipe_paths(str(tmp_path), HOOKED)
+        _touch(tmp_path, os.path.basename(png_path))
+        with open(json_path, "w") as f:
+            f.write('{"source": "%s", "x": 0, "y": 0, "duration": 5}' % CLEAN)
+        made = []
+
+        def fake(output_dir, name):
+            made.append(name)
+            _touch(output_dir, name)
+            return True
+        monkeypatch.setattr(hooks, "materialize", fake)
+        return made
+
+    def test_stripping_captions_encodes_the_missing_hooked_picture(self, tmp_path, monkeypatch):
+        made = self._recipe(tmp_path, monkeypatch)
+        assert _strip_burned_captions(str(tmp_path), CAPTIONED_HOOKED) == HOOKED
+        assert made == [HOOKED] and os.path.exists(tmp_path / HOOKED)
+
+    def test_replacing_the_hook_never_encodes_it(self, tmp_path, monkeypatch):
+        made = self._recipe(tmp_path, monkeypatch)
+        no_captions = _strip_burned_captions(str(tmp_path), CAPTIONED_HOOKED, materialize=False)
+        assert no_captions == HOOKED and made == []
+        assert _strip_burned_hook(str(tmp_path), no_captions) == CLEAN
+
+    def test_a_failed_encode_keeps_the_current_file(self, tmp_path, monkeypatch):
+        import hooks
+        self._recipe(tmp_path, monkeypatch)
+        monkeypatch.setattr(hooks, "materialize", lambda *a: False)
+        assert _strip_burned_captions(str(tmp_path), CAPTIONED_HOOKED) == CAPTIONED_HOOKED
+
+    def test_without_a_recipe_nothing_changes(self, tmp_path):
+        _touch(tmp_path, CAPTIONED_HOOKED)
+        assert _strip_burned_captions(str(tmp_path), CAPTIONED_HOOKED) == CAPTIONED_HOOKED
+
+    def test_the_recipe_is_not_a_clip(self, tmp_path, monkeypatch):
+        self._recipe(tmp_path, monkeypatch)
+        assert _canonical_clip_file(str(tmp_path), "base", 0) == CAPTIONED_HOOKED
+
+
 class TestCanonicalClipFile:
     def test_captioned_hook_chain_resolves(self, tmp_path):
         now = time.time()

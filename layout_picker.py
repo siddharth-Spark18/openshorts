@@ -43,6 +43,7 @@ by hand wins: this only ever ADDS, so an explicit choice is never overridden.
 """
 import json
 import os
+import threading
 
 # AUTO_LAYOUT=1 decides and applies. AUTO_LAYOUT=shadow decides, logs, and
 # applies NOTHING: the render is byte-for-byte what it would have been.
@@ -69,10 +70,28 @@ DECISION_FLAGS = {
 
 VALID = set(DECISION_FLAGS)
 
+# On for every video the picker sees, whatever it answers. These modules decide
+# per SCENE with their own guards (split_layout: only scenes already GENERAL, two
+# faces of a real size side by side in the same frame for half the samples, at
+# least 2.5 s; active_speaker: both mouths move). The video-level "split" answer
+# is the wrong gate for them: an edited podcast cuts between close-ups and a wide
+# two-shot, the sampled frames are mostly close-ups, the model rightly answers
+# "none", and every two-shot rendered GENERAL, two small people floating in a
+# blurred strip. On such a podcast the per-scene check stacks the 39 s two-shot
+# and leaves the close-ups on TRACK.
+PER_SCENE_FLAGS = ["split_layout", "active_speaker"]
+
 
 def _module_flags(decision):
     """Modules to enable for a decision, ignoring anything unrecognised."""
     return DECISION_FLAGS.get(str(decision or "none").strip().lower(), [])
+
+
+def _flags_to_enable(decision):
+    """PER_SCENE_FLAGS plus whatever this decision adds, without repeats."""
+    flags = list(PER_SCENE_FLAGS)
+    flags += [f for f in _module_flags(decision) if f not in flags]
+    return flags
 
 
 def apply(decision):
@@ -80,7 +99,8 @@ def apply(decision):
 
     Deliberately additive: an operator who set SPLIT_LAYOUT=1 for a job wants
     stacking regardless of what the model thinks, and a model that says "none"
-    must not quietly undo that.
+    must not quietly undo that. PER_SCENE_FLAGS go on for every decision,
+    including "none" and a failed call.
     """
     import active_speaker
     import screencast_layout
@@ -91,7 +111,7 @@ def apply(decision):
                "active_speaker": active_speaker}
 
     touched = []
-    for name in _module_flags(decision):
+    for name in _flags_to_enable(decision):
         module = modules.get(name)
         if module is not None and not getattr(module, "ENABLED", False):
             module.ENABLED = True
@@ -99,32 +119,105 @@ def apply(decision):
     return touched
 
 
+def _encode_frame(frame, width):
+    import cv2
+
+    h, w = frame.shape[:2]
+    scaled = cv2.resize(frame, (width, max(2, int(h * width / w))),
+                        interpolation=cv2.INTER_AREA)
+    ok, buf = cv2.imencode(".jpg", scaled, [cv2.IMWRITE_JPEG_QUALITY, 80])
+    return buf.tobytes() if ok else None
+
+
+def _ffmpeg_frames(video_path, n):
+    """The same evenly spread frames, decoded by the ffmpeg CLI.
+
+    OpenCV's bundled FFmpeg has no software AV1 decoder, so on the AV1 sources
+    YouTube often serves every read failed ("Failed to get pixel format") and
+    the picker fell back to the default layout for the whole video (prod,
+    25-sep-2026). The system ffmpeg decodes AV1 with libdav1d.
+    """
+    import subprocess
+
+    import cv2
+    import numpy as np
+
+    try:
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=nw=1:nk=1", video_path],
+            capture_output=True, text=True, timeout=60)
+        duration = float(probe.stdout.strip())
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return []
+    frames = []
+    for i in range(n):
+        try:
+            r = subprocess.run(
+                ["ffmpeg", "-v", "error", "-ss", f"{i * duration / n:.3f}",
+                 "-i", video_path, "-frames:v", "1", "-c:v", "png",
+                 "-f", "image2pipe", "-"],
+                capture_output=True, timeout=120)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        frame = cv2.imdecode(np.frombuffer(r.stdout, np.uint8), cv2.IMREAD_COLOR)
+        if frame is not None:
+            frames.append(frame)
+    return frames
+
+
+_sampled = {"key": None, "frames": None}
+_sampled_lock = threading.Lock()
+
+
+def _sample_key(video_path, n, width):
+    try:
+        st = os.stat(video_path)
+    except OSError:
+        return None
+    return (os.path.realpath(video_path), st.st_size, st.st_mtime_ns, n, width)
+
+
 def sample_frames(video_path, n=None, width=None):
-    """JPEG bytes for ``n`` frames spread evenly across the video."""
+    """JPEG bytes for ``n`` frames spread evenly across the video.
+
+    The last answer is kept: the layout choice and the burned-subtitle check
+    ask for the same frames of the same source one after the other, and each
+    is a seek into a long-GOP file (12 samples of a 1080p60 source: 15 CPU-s).
+    """
     import cv2
 
     n = n or SAMPLE_FRAMES
     width = width or SAMPLE_WIDTH
+    key = _sample_key(video_path, n, width)
+    with _sampled_lock:
+        if key is not None and _sampled["key"] == key:
+            return list(_sampled["frames"])
+    out = _sample_frames(video_path, n, width, cv2)
+    if key is not None and out:
+        with _sampled_lock:
+            _sampled["key"], _sampled["frames"] = key, list(out)
+    return out
+
+
+def _sample_frames(video_path, n, width, cv2):
     cap = cv2.VideoCapture(video_path)
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     out = []
     try:
-        if total <= 0:
-            return out
-        for i in range(n):
-            cap.set(cv2.CAP_PROP_POS_FRAMES, int(i * total / n))
-            ok, frame = cap.read()
-            if not ok:
-                continue
-            h, w = frame.shape[:2]
-            scaled = cv2.resize(frame, (width, max(2, int(h * width / w))),
-                                interpolation=cv2.INTER_AREA)
-            ok, buf = cv2.imencode(".jpg", scaled,
-                                   [cv2.IMWRITE_JPEG_QUALITY, 80])
-            if ok:
-                out.append(buf.tobytes())
+        if total > 0:
+            for i in range(n):
+                cap.set(cv2.CAP_PROP_POS_FRAMES, int(i * total / n))
+                ok, frame = cap.read()
+                if not ok:
+                    continue
+                jpg = _encode_frame(frame, width)
+                if jpg:
+                    out.append(jpg)
     finally:
         cap.release()
+    if not out and os.path.exists(video_path):
+        out = [j for j in (_encode_frame(f, width) for f in _ffmpeg_frames(video_path, n)) if j]
     return out
 
 
@@ -189,7 +282,7 @@ def pick_and_apply(video_path, video_duration):
         # One greppable line per job. Deliberately not routed through the
         # analytics module: that one is opt-in and host-scoped, and a shadow
         # run has to work on any deployment, including self-hosted.
-        would = _module_flags(decision)
+        would = _flags_to_enable(decision)
         print(f"[layout-shadow] decision={decision} "
               f"would_enable={','.join(would) if would else 'none'} "
               f"duration={video_duration:.0f}s")

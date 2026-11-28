@@ -1,7 +1,9 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { Loader2, Check, Zap, Clock } from 'lucide-react';
 import { apiJson } from '../lib/api';
 import { track } from '../lib/analytics';
+import { useBackFromStripe } from '../lib/backFromStripe';
+import { useAuth } from '../contexts/AuthContext';
 import Modal from './ui/Modal';
 
 // Opens when a job hits a 402 (quota exceeded). This is the highest-intent
@@ -42,17 +44,64 @@ const PLAN_BLURBS = {
 // single free minute and pasted a 21-90 min video (93 of 99 sampled,
 // 16-sep-2026): they are being asked to pay before seeing one clip. The offer
 // turns that wall into a first run; the plans stay the way to the whole video.
+// source: the surface that opened it, when it is not the wall or the generic
+// upsell (WatermarkModal passes 'watermark'), so CheckoutStarted can be split
+// by origin. highlight: the plan put forward; the watermark notice asked about
+// the cheapest way out, so it opens on starter instead of creator.
+// context 'queue_full': the free queue's brake refused the submission (402
+// free_queue_full; nothing was reserved or spent). Its own events
+// (QueueFullSeen / QueueFullCheckout / QueueFullDismissed, plus the shared
+// CheckoutStarted/Redirected with source 'queue_full') keep it out of the quota
+// wall's numbers. The copy never says why the queue is full for this user.
+// context 'post_wall': a free account used its few free posts (402
+// post_requires_plan). Posting is what is being sold, so the cards lead with it
+// and the one-time packs are hidden: minutes do not unlock posting.
+// A subscriber who hits the wall (plan minutes used before the renewal) cannot
+// buy a second plan: the checkout refuses it. Their wall leads with the one-time
+// packs, open and as the main action, names the day the plan's minutes come
+// back, and shows no plan cards.
+// partialJob: { processed_minutes, total_minutes } of the job on screen when the
+// "clip the whole video" banner opened it, so the copy talks about the rest of
+// that video instead of the watermark.
 export default function TopUpModal({ onClose, required, remaining, partialMinutes = 0, onPartial = null,
-                                     context = 'wall' }) {
+                                     context = 'wall', source: sourceOverride = null,
+                                     highlight: highlightPlan = 'creator', partialJob = null }) {
   const [plans, setPlans] = useState([]);
   const [topups, setTopups] = useState([]);
+  const { plan: accountPlan, me } = useAuth();
   const [showTopups, setShowTopups] = useState(false);
   const [busyPrice, setBusyPrice] = useState(null);
+  // Same-tick guard against a double click before the buttons re-render.
+  const inFlightRef = useRef(false);
+  useBackFromStripe(() => { inFlightRef.current = false; setBusyPrice(null); });
   const isUpsell = context === 'upsell';
+  const isQueueFull = context === 'queue_full';
+  // 'connect_wall': a free account tried to connect its socials (402
+  // connect_requires_plan). Same offer as the post wall, its own words.
+  const isConnectWall = context === 'connect_wall';
+  const isPostWall = context === 'post_wall' || isConnectWall;
+  // Opened from a video waiting in line (App's queue notice): the reason to
+  // pay here is the wait, not the watermark.
+  const fromQueue = isUpsell && sourceOverride === 'queue';
+  const source = sourceOverride || (isUpsell ? 'upsell' : isQueueFull ? 'queue_full'
+    : isConnectWall ? 'connect_wall' : isPostWall ? 'post_wall' : 'wall');
+  const seenEvent = isUpsell ? 'UpsellModalSeen' : isQueueFull ? 'QueueFullSeen'
+    : isConnectWall ? 'ConnectWallSeen' : isPostWall ? 'PostWallSeen' : 'QuotaWallSeen';
+  const checkoutEvent = isUpsell ? 'UpsellModalCheckout' : isQueueFull ? 'QueueFullCheckout'
+    : isConnectWall ? 'ConnectWallCheckout' : isPostWall ? 'PostWallCheckout' : 'QuotaWallCheckout';
+  // Out of plan minutes with a live plan: packs first (see the header comment).
+  const packsFirst = !isUpsell && !isQueueFull && !isPostWall && !!accountPlan && accountPlan !== 'free';
+  const renewsOn = (() => {
+    if (!me?.period_end) return null;
+    try {
+      return new Date(me.period_end).toLocaleDateString('en-US', { month: 'long', day: 'numeric' });
+    } catch (_) { return null; }
+  })();
 
   useEffect(() => {
-    track(isUpsell ? 'UpsellModalSeen' : 'QuotaWallSeen',
-          { props: { required: required ?? null, remaining: remaining ?? null } });
+    track(seenEvent,
+          { props: { required: required ?? null, remaining: remaining ?? null, source,
+                     account_plan: accountPlan || null, packs_first: packsFirst ? '1' : '0' } });
     apiJson('/api/billing/plans')
       .then((d) => {
         const monthly = (d.plans || []).filter((p) => p.interval === 'month');
@@ -73,12 +122,14 @@ export default function TopUpModal({ onClose, required, remaining, partialMinute
   // Stripe and abandoned" were indistinguishable. CheckoutStarted (click, same
   // meaning as PricingSection's) → CheckoutRedirected (we hold a Stripe URL) →
   // CheckoutFailed (we don't) separates them.
-  const source = isUpsell ? 'upsell' : 'wall';
 
   const buy = async (entry, kind) => {
+    if (inFlightRef.current) return;
+    inFlightRef.current = true;
     setBusyPrice(entry.price_id);
-    const props = { kind, plan: entry.plan || null, minutes: entry.minutes, source };
-    track(isUpsell ? 'UpsellModalCheckout' : 'QuotaWallCheckout', { props });
+    const props = { kind, plan: entry.plan || null, minutes: entry.minutes, source,
+                    account_plan: accountPlan || null };
+    track(checkoutEvent, { props });
     track('CheckoutStarted', { props });
     // Same stash PricingSection sets, so a plan bought from the modal also
     // carries its price into the Subscribed goal (AccountPage reads it back).
@@ -94,12 +145,13 @@ export default function TopUpModal({ onClose, required, remaining, partialMinute
     try {
       const { url } = await apiJson('/api/billing/checkout', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ price_id: entry.price_id }),
+        body: JSON.stringify({ price_id: entry.price_id, source }),
       });
       track('CheckoutRedirected', { props });
       window.location.href = url;
     } catch (e) {
       track('CheckoutFailed', { props: { ...props, reason: String(e?.detail || e?.message || 'unknown').slice(0, 120) } });
+      inFlightRef.current = false;
       setBusyPrice(null);
       alert(e?.detail || 'Could not start checkout.');
     }
@@ -109,24 +161,69 @@ export default function TopUpModal({ onClose, required, remaining, partialMinute
     style: 'currency', currency: (c || 'usd').toUpperCase(), maximumFractionDigits: 0,
   }).format((a || 0) / 100);
 
-  const blockedByLength = typeof required === 'number' && typeof remaining === 'number';
-  const partialOffer = !isUpsell && partialMinutes > 0 && typeof onPartial === 'function';
+  // A video longer than the minutes left. With under a minute left the 402
+  // comes before the probe (no duration yet, minutes_required is a floor of 1),
+  // so that case reads as "out of minutes", not "this video is 1 min long".
+  const blockedByLength = typeof required === 'number' && typeof remaining === 'number'
+    && remaining >= 1 && required > remaining;
+  const partialOffer = !isUpsell && !isQueueFull && !isPostWall && partialMinutes > 0 && typeof onPartial === 'function';
   const remainingShown = Math.max(0, Math.round((remaining || 0) * 10) / 10);
 
   return (
-    <Modal isOpen onClose={onClose} eyebrow="UPGRADE"
-           title={isUpsell ? 'Keep your clips forever' : 'Your video is ready to clip'} size="xl">
+    <Modal isOpen onClose={onClose} eyebrow={packsFirst ? 'ADD MINUTES' : 'UPGRADE'}
+           title={isQueueFull ? 'The free queue is full right now'
+             : isConnectWall ? 'Post your clips to your socials'
+             : isPostWall ? 'Keep posting to your socials'
+             : isUpsell
+             ? (partialJob ? 'Clip the whole video' : fromQueue ? 'Skip the line' : 'Keep your clips forever')
+             : (blockedByLength ? 'Your video is ready to clip' : "You've used this month's minutes")}
+           size="xl">
       {/* Goal-gradient framing: they're one step from the thing they came for. */}
       <p className="text-muted text-sm mb-5">
-        {isUpsell
-          ? <>Every clip comes out <b className="text-ink font-medium">ready to post</b> and stays in your
-              library for good. On the free plan they carry a watermark and are deleted after 7 days.</>
+        {isConnectWall
+          ? <>Connecting your social accounts is part of the paid plans: every clip goes to{' '}
+              <b className="text-ink font-medium">TikTok, Instagram, YouTube</b> and the rest of your
+              accounts, scheduled or right away, with no watermark.</>
+          : isPostWall
+          ? <>You have used the free posts that come with the free plan. Posting is part of the
+              paid plans: every clip goes to <b className="text-ink font-medium">TikTok, Instagram,
+              YouTube</b> and the rest of your accounts, scheduled or right away, with no watermark.</>
+          : isQueueFull
+          ? <>Come back later, or skip the line with a plan: paid videos go to the{' '}
+              <b className="text-ink font-medium">front of the queue</b>. Nothing was charged and your
+              free minutes are still yours.</>
+          : isUpsell
+          ? (partialJob
+            ? <>These clips come from the first <b className="text-ink font-medium">{partialJob.processed_minutes} min</b>{' '}
+                of a {partialJob.total_minutes}-min video. A plan gives you the minutes to clip{' '}
+                <b className="text-ink font-medium">all of it</b>, with no watermark, and the clips you already
+                made lose the mark on the spot.</>
+            : fromQueue
+            ? <>Paid videos go to the <b className="text-ink font-medium">front of the queue</b> and are
+                usually ready in minutes. Subscribe and the video you have in line{' '}
+                <b className="text-ink font-medium">moves up right away</b>, with no watermark.</>
+            : <>Every clip comes out <b className="text-ink font-medium">ready to post</b> and stays in your
+                library for good. On the free plan they carry a watermark and are deleted after 7 days;
+                upgrade now and the clips you already made <b className="text-ink font-medium">lose the mark on the spot</b>.</>)
           : blockedByLength
             ? <>This video is <b className="text-ink font-medium">{required} min</b> long and you have{' '}
-                <b className="text-ink font-medium">{remainingShown} min</b> this month. Pick a plan and the
-                whole video starts rendering right away.</>
-            : <>You've used your free minutes for this month. Pick a plan and keep clipping right away.</>}
+                <b className="text-ink font-medium">{remainingShown} min</b> left this month.{' '}
+                {packsFirst ? 'Add minutes with a one-time pack' : 'Pick a plan'} and clip the whole video.</>
+            : packsFirst
+            ? <>Your <span className="capitalize">{accountPlan}</span> minutes come back{' '}
+                <b className="text-ink font-medium">{renewsOn ? `on ${renewsOn}` : 'at your next renewal'}</b>.
+                Add minutes with a one-time pack and keep clipping now.</>
+            : <>Your minutes come back {renewsOn ? `on ${renewsOn}` : 'next month'}. Pick a plan to keep clipping now.</>}
       </p>
+
+      {isQueueFull && (
+        <div className="mb-5 flex justify-end">
+          <button onClick={() => { track('QueueFullDismissed', { props: { source } }); onClose(); }}
+                  disabled={busyPrice !== null} className="btn-ghost whitespace-nowrap">
+            I'll come back later
+          </button>
+        </div>
+      )}
 
       {partialOffer && (
         <div className="mb-5 card p-4 flex flex-col sm:flex-row sm:items-center gap-3">
@@ -142,15 +239,41 @@ export default function TopUpModal({ onClose, required, remaining, partialMinute
         </div>
       )}
 
-      <div className="grid sm:grid-cols-3 gap-3">
+      {packsFirst && (
+        <div className="grid sm:grid-cols-2 gap-3">
+          {topups.map((t) => (
+            <div key={t.price_id} className="card p-5 flex flex-col">
+              <div className="mb-1 flex items-baseline gap-1.5">
+                <span className="font-display text-3xl text-ink tabular-nums">+{t.minutes}</span>
+                <span className="readout">min</span>
+              </div>
+              <p className="text-sm text-ink2 mb-4 flex-1">
+                {fmt(t.amount, t.currency)}, one-time. Added to your account as soon as you pay, on top of your plan.
+              </p>
+              <button onClick={() => buy(t, 'topup')} disabled={busyPrice !== null} className="w-full btn-primary">
+                {busyPrice === t.price_id
+                  ? <Loader2 size={18} className="animate-spin" />
+                  : `Add ${t.minutes} min for ${fmt(t.amount, t.currency)}`}
+              </button>
+            </div>
+          ))}
+          {topups.length === 0 && (
+            <div className="sm:col-span-2 flex justify-center py-8">
+              <Loader2 className="animate-spin text-brass" />
+            </div>
+          )}
+        </div>
+      )}
+
+      {!packsFirst && <div className="grid sm:grid-cols-3 gap-3">
         {plans.map((entry) => {
-          const highlight = entry.plan === 'creator';
+          const highlight = entry.plan === highlightPlan;
           return (
             <div key={entry.price_id}
                  className={`relative card p-5 flex flex-col ${highlight ? 'border-brass' : ''}`}>
               {highlight && (
                 <span className="absolute -top-3 left-1/2 -translate-x-1/2 badge-float">
-                  Most popular
+                  {entry.plan === 'creator' ? 'Most popular' : 'Removes the mark'}
                 </span>
               )}
               <h3 className="font-display lowercase text-lg text-ink">{entry.plan}</h3>
@@ -160,6 +283,12 @@ export default function TopUpModal({ onClose, required, remaining, partialMinute
                 <span className="readout">/mo</span>
               </div>
               <ul className="space-y-1.5 text-sm text-ink2 mb-4 flex-1">
+                {isPostWall && (
+                  <li className="flex items-start gap-2">
+                    <Check size={15} className="text-ok shrink-0 mt-0.5" />
+                    <span><b>Post every clip</b> to your socials</span>
+                  </li>
+                )}
                 <li className="flex items-start gap-2">
                   <Check size={15} className="text-ok shrink-0 mt-0.5" />
                   <span><b>{entry.minutes} min</b> every month ({Math.round(entry.minutes / 20)}× your free quota)</span>
@@ -192,10 +321,11 @@ export default function TopUpModal({ onClose, required, remaining, partialMinute
             <Loader2 className="animate-spin text-brass" />
           </div>
         )}
-      </div>
+      </div>}
 
-      {/* Secondary escape hatch: one-time packs, deliberately de-emphasized. */}
-      <div className="mt-4 text-center">
+      {/* Secondary escape hatch: one-time packs, deliberately de-emphasized.
+          Not on the post wall: a pack adds minutes, it does not unlock posting. */}
+      {!isPostWall && !packsFirst && <div className="mt-4 text-center">
         {!showTopups ? (
           <button onClick={() => setShowTopups(true)}
                   className="text-xs text-muted underline underline-offset-2 lowercase hover:text-ink2">
@@ -219,7 +349,7 @@ export default function TopUpModal({ onClose, required, remaining, partialMinute
             )}
           </div>
         )}
-      </div>
+      </div>}
     </Modal>
   );
 }

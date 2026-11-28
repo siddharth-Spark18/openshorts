@@ -726,7 +726,8 @@ def generate_thumbnail(api_key, title, session_id, face_image_path=None, bg_imag
 # Description
 # ---------------------------------------------------------------------------
 
-def generate_youtube_description(api_key, title, transcript_segments, language, video_duration):
+def generate_youtube_description(api_key, title, transcript_segments, language, video_duration,
+                                 max_chars=200000):
     """
     Uses Gemini to generate a YouTube description with chapter markers from transcript segments.
     Returns: { "description": "full description text with chapters" }
@@ -742,7 +743,8 @@ def generate_youtube_description(api_key, title, transcript_segments, language, 
         timestamp = f"{mins}:{secs:02d}"
         formatted_segments.append(f"[{timestamp}] {seg.get('text', '').strip()}")
 
-    segments_text = "\n".join(formatted_segments)
+    # Bounded: the source length is capped upstream, this caps the prompt.
+    segments_text = "\n".join(formatted_segments)[:max_chars]
 
     # Format total duration
     dur_mins = int(video_duration // 60)

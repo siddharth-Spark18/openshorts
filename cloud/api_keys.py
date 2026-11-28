@@ -48,11 +48,19 @@ def looks_like_key(token: str) -> bool:
 
 
 async def user_id_for_key(raw: str) -> Optional[object]:
-    """Resolve a raw ``osk_`` token to its owner's user id, or None.
+    """Resolve a raw ``osk_`` token to its owner's user id, or None."""
+    principal = await key_principal(raw)
+    return principal[0] if principal else None
+
+
+async def key_principal(raw: str) -> Optional[tuple]:
+    """``(user_id, scope)`` for a live ``osk_`` token, or None. ``scope`` is
+    what the key may reach (cloud/scopes.py); None is the whole API.
 
     Refreshes ``last_used_at`` at most every LAST_USED_REFRESH so status polls
     don't turn every request into a DB write.
     """
+    from . import scopes
     if not looks_like_key(raw):
         return None
     token_hash = hash_key(raw)
@@ -65,7 +73,7 @@ async def user_id_for_key(raw: str) -> Optional[object]:
                 return None
             if row.last_used_at is None or _now() - row.last_used_at > LAST_USED_REFRESH:
                 row.last_used_at = _now()
-            return row.user_id
+            return row.user_id, scopes.effective(row.scope, row.name)
 
 
 # --------------------------------------------------------------------------- #
@@ -144,4 +152,6 @@ async def revoke_key(key_id: str, request: Request):
                 raise HTTPException(status_code=404, detail="Key not found")
             if row.revoked_at is None:
                 row.revoked_at = _now()
+    from . import owner_cache
+    owner_cache.forget_user(user.id)
     return {"ok": True}

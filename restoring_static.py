@@ -19,10 +19,18 @@ restorer) instead of failing.
 from typing import Awaitable, Callable, Optional
 
 from starlette.exceptions import HTTPException
+from starlette.responses import RedirectResponse
 from starlette.staticfiles import StaticFiles
 
 Restorer = Callable[[str], Awaitable[bool]]
 Guard = Callable[[str], bool]
+# Raises (HTTPException) when the caller may not have this path. Gets the
+# ASGI scope so it can read the query string, cookies and headers. May return
+# a word for what let the caller in, which the redirector is handed.
+Authorizer = Callable[[str, dict], Awaitable[Optional[str]]]
+# A link where the caller can fetch this very file from somewhere better than
+# this process, or None to serve it here. Asked only once the caller is allowed.
+Redirector = Callable[[str, dict, Optional[str]], Awaitable[Optional[str]]]
 
 
 class RestoringStaticFiles(StaticFiles):
@@ -35,25 +43,45 @@ class RestoringStaticFiles(StaticFiles):
     ``*_metadata.json`` carrying the full transcript of the user's video.
     Verified served, unauthenticated, on 7-sep-2026.
 
-    This is only the path half of media_auth: the clips themselves, and the
-    untouched source video sitting in the same directory, are still public to
-    anyone who has the job id. Closing that needs the capability tokens the
-    module was written for, which is a bigger change (request handlers, an
-    /api/media-token endpoint, and the dashboard appending the token to every
-    media URL) and must ship with its frontend half.
+    ``authorize`` is the caller half (``app._authorize_media``): a signed
+    link, the owner's media token, or the owner's own credentials. It runs
+    after the guard and before the filesystem and the restorer, so a stranger
+    holding a job id can neither read its files nor make us pull them back
+    from storage.
+
+    ``redirect`` (``app._media_redirect``) runs last of the three: an allowed
+    caller is sent to the archived copy when there is one, so neither the
+    bytes nor a restore of the whole job go through this process.
     """
 
     def __init__(self, *args, restorer: Optional[Restorer] = None,
-                 guard: Optional[Guard] = None, **kwargs):
+                 guard: Optional[Guard] = None,
+                 authorize: Optional[Authorizer] = None,
+                 redirect: Optional[Redirector] = None, **kwargs):
         super().__init__(*args, **kwargs)
         self.restorer = restorer
         self.guard = guard
+        self.authorize = authorize
+        self.redirect = redirect
 
     async def get_response(self, path: str, scope):
         # Before the filesystem: a refused path must look exactly like a
         # missing one, or the 404-vs-403 difference confirms the file is there.
         if self.guard is not None and not self.guard(path):
             raise HTTPException(status_code=404)
+        granted = None
+        if self.authorize is not None:
+            granted = await self.authorize(path, scope)
+        if self.redirect is not None:
+            try:
+                target = await self.redirect(path, scope, granted)
+            except Exception:
+                target = None
+            if target:
+                # Never stored: the answer depends on who asks and how (a
+                # script's fetch is served here), and on the job's state.
+                return RedirectResponse(target, status_code=307,
+                                        headers={"Cache-Control": "no-store"})
         try:
             return await super().get_response(path, scope)
         except HTTPException as exc:
@@ -68,4 +96,9 @@ class RestoringStaticFiles(StaticFiles):
                 restored = False
             if not restored:
                 raise
+            # The guard may read the job directory (a free job's clean twins
+            # are refused by a marker file that only exists once the files
+            # are back), so the verdict before the restore is not final.
+            if self.guard is not None and not self.guard(path):
+                raise HTTPException(status_code=404)
             return await super().get_response(path, scope)

@@ -4,7 +4,8 @@ The app fetches user-supplied URLs server-side (yt-dlp downloads, SaaS landing
 page scraping, actor-image download). Without a guard, a caller can point those
 at internal services or the cloud metadata endpoint (169.254.169.254) to read
 instance credentials. ``assert_public_url`` rejects non-HTTP(S) schemes and any
-host that resolves to a private / loopback / link-local / reserved address.
+host that resolves to anything but a globally routable address (private,
+loopback, link-local, reserved, and the 100.64.0.0/10 range Tailscale uses).
 """
 from __future__ import annotations
 
@@ -37,18 +38,32 @@ class UnsafeURLError(ValueError):
 
 
 def _ip_is_public(ip: str) -> bool:
+    """True only for globally routable unicast addresses.
+
+    ``is_global`` rather than a list of ``is_private``/``is_loopback``/...:
+    that list missed 100.64.0.0/10 (carrier-grade NAT), which is exactly the
+    range Tailscale hands out, so a job URL could reach every host on the
+    tailnet (SSH on the other servers, the Coolify API) from the API
+    container. An allowlist of "global" fails closed on any range nobody
+    thought to name. IPv6 forms that carry an IPv4 address inside (mapped
+    ``::ffff:a.b.c.d``, 6to4, Teredo, NAT64) are judged by that IPv4 address.
+    """
     try:
-        addr = ipaddress.ip_address(ip)
+        addr = ipaddress.ip_address(str(ip).split("%", 1)[0])
     except ValueError:
         return False
-    return not (
-        addr.is_private
-        or addr.is_loopback
-        or addr.is_link_local
-        or addr.is_reserved
-        or addr.is_multicast
-        or addr.is_unspecified
-    )
+    if addr.version == 6:
+        embedded = addr.ipv4_mapped or addr.sixtofour
+        if embedded is None and addr.teredo:
+            embedded = addr.teredo[1]
+        if embedded is None and addr in _NAT64:
+            embedded = ipaddress.IPv4Address(int(addr) & 0xFFFFFFFF)
+        if embedded is not None and not _ip_is_public(str(embedded)):
+            return False
+    return bool(addr.is_global) and not addr.is_multicast
+
+
+_NAT64 = ipaddress.ip_network("64:ff9b::/96")
 
 
 def assert_public_url(url: str) -> str:
@@ -83,7 +98,10 @@ def assert_public_url(url: str) -> str:
 
     try:
         infos = socket.getaddrinfo(host, parsed.port or None, proto=socket.IPPROTO_TCP)
-    except socket.gaierror as e:
+    except (socket.gaierror, UnicodeError) as e:
+        # UnicodeError: the idna codec refuses the name before any lookup
+        # (a label over 63 characters, an empty label). Same answer as a
+        # name that does not resolve, not a 500.
         raise UnsafeURLError(f"Could not resolve host {host!r}: {e}")
 
     resolved = {info[4][0] for info in infos}

@@ -40,14 +40,25 @@ class TestApply:
     def test_apply_switches_the_right_module_on(self, monkeypatch):
         mods = fake_modules(monkeypatch)
         touched = apply("screencast")
-        assert touched == ["screencast_layout"]
+        assert "screencast_layout" in touched
         assert mods["screencast_layout"].ENABLED is True
-        assert mods["split_layout"].ENABLED is False
 
-    def test_apply_none_touches_nothing(self, monkeypatch):
+    def test_apply_none_still_enables_the_per_scene_two_shot_check(self, monkeypatch):
+        # An edited podcast samples as close-ups ("none") but has wide
+        # two-shots; split_layout's own per-scene guards decide those.
         mods = fake_modules(monkeypatch)
-        assert apply("none") == []
-        assert not any(m.ENABLED for m in mods.values())
+        assert set(apply("none")) == {"split_layout", "active_speaker"}
+        assert mods["split_layout"].ENABLED is True
+        assert mods["active_speaker"].ENABLED is True
+        assert mods["screencast_layout"].ENABLED is False
+
+    def test_a_failed_pick_still_enables_the_per_scene_check(self, monkeypatch):
+        mods = fake_modules(monkeypatch)
+        monkeypatch.setattr(layout_picker, "ENABLED", True)
+        monkeypatch.setattr(layout_picker, "SHADOW", False)
+        monkeypatch.setattr(layout_picker, "pick", lambda *a, **k: "none")
+        layout_picker.pick_and_apply("v.mp4", 60)
+        assert mods["split_layout"].ENABLED is True
 
     def test_apply_never_disables_an_explicit_choice(self, monkeypatch):
         # An operator who set SPLIT_LAYOUT=1 gets stacking even if the model
@@ -57,7 +68,8 @@ class TestApply:
         assert mods["split_layout"].ENABLED is True
 
     def test_already_enabled_modules_are_not_reported_as_touched(self, monkeypatch):
-        fake_modules(monkeypatch, screencast_layout=True)
+        fake_modules(monkeypatch, screencast_layout=True, split_layout=True,
+                     active_speaker=True)
         assert apply("screencast") == []
 
     def test_split_enables_both_modules(self, monkeypatch):
@@ -146,3 +158,43 @@ class TestShadowMode:
         assert "[layout-shadow]" in out
         assert "decision=split" in out
         assert "would_enable=split_layout,active_speaker" in out
+
+
+def test_sample_frames_falls_back_to_ffmpeg_when_opencv_reads_nothing(tmp_path, monkeypatch):
+    """AV1 sources: OpenCV's bundled FFmpeg reads no frame, the CLI does."""
+    import numpy as np
+
+    src = tmp_path / "av1.mp4"
+    src.write_bytes(b"not a video OpenCV can open")
+    frame = np.full((360, 640, 3), 120, dtype=np.uint8)
+    monkeypatch.setattr(layout_picker, "_ffmpeg_frames", lambda path, n: [frame] * n)
+
+    out = layout_picker.sample_frames(str(src), n=3, width=320)
+
+    assert len(out) == 3
+    assert all(j[:2] == b"\xff\xd8" for j in out)  # JPEG
+
+
+def test_the_same_frames_of_a_source_are_sampled_once(tmp_path, monkeypatch):
+    """The layout choice and the burned-subtitle check ask one after the other."""
+    import numpy as np
+
+    src = tmp_path / "source.mp4"
+    src.write_bytes(b"not a video OpenCV can open")
+    reads = []
+
+    def frames(path, n):
+        reads.append(path)
+        return [np.full((360, 640, 3), 120, dtype=np.uint8)] * n
+
+    monkeypatch.setattr(layout_picker, "_ffmpeg_frames", frames)
+    monkeypatch.setattr(layout_picker, "_sampled", {"key": None, "frames": None})
+    first = layout_picker.sample_frames(str(src))
+    again = layout_picker.sample_frames(str(src))
+    assert len(reads) == 1 and again == first and again is not first
+    layout_picker.sample_frames(str(src), n=3)              # other frames: read again
+    assert len(reads) == 2
+    src.write_bytes(b"another file under the same name")    # the file changed: read again
+    layout_picker.sample_frames(str(src), n=3)
+    assert len(reads) == 3
+    assert layout_picker.sample_frames(str(tmp_path / "gone.mp4")) == []

@@ -1,5 +1,6 @@
 import argparse
 import json
+import mimetypes
 import os
 import sys
 from typing import List, Optional
@@ -39,6 +40,10 @@ class DetailClipModel(BaseModel):
     video_description_for_instagram: str
     video_title_for_youtube_short: str
     viral_hook_text: str
+    # One sentence on what makes THIS moment a clip, shown under the score in
+    # the dashboard. Defaulted so a small local model that skips it does not
+    # fail schema validation and lose the clip.
+    why: str = ""
 
 
 class DetailResponse(BaseModel):
@@ -166,57 +171,61 @@ confidence is 0..1. why is at most 12 words.
 """
 
 
-class WideContentRangeModel(BaseModel):
-    start: float
-    end: float
-    what: str
-    width_fraction: float
+class ShotContentModel(BaseModel):
+    shot: int
+    kind: str
+    focus_left: float
+    focus_right: float
+    presenter_cam: bool
 
 
-class WideContentResponse(BaseModel):
-    ranges: List[WideContentRangeModel]
+class ShotContentResponse(BaseModel):
+    shots: List[ShotContentModel]
 
 
-WIDE_CONTENT_PROMPT_TEMPLATE = """
-You are preparing a landscape video to be re-framed to a vertical 9:16 crop.
-The crop keeps a tall centre strip and THROWS AWAY the left and right sides.
+# One still per SHOT of a clip, asked as a closed choice (same lesson as
+# LAYOUT_CHOICE_PROMPT: a decision between named options is stable, a free
+# measurement is not). It replaced a whole-video prompt that asked for time
+# ranges and a width_fraction: that one uploaded the source (a 37-min 1440p
+# tutorial is ~670k tokens and a GB-sized upload to get a few numbers back) and
+# was never actually called by the pipeline. The focus box is the one number
+# still asked for, and it only positions a crop: being 10% off moves the window
+# a little, it never changes which layout a shot gets. presenter_cam is the one
+# yes/no that gates the per-scene inset (camera_inset.detect_in_scene): without
+# it, any small still face or body on a screen was enlarged as the presenter.
+SHOT_CONTENT_PROMPT = """
+Each image is one shot from the same landscape video, in order, numbered from 0.
+The video is being re-framed to a vertical 9:16 clip, and the person who uploaded
+it told us it is a screen-based video (a tutorial, a demo, slides).
 
-List every time range where on-screen content would be cut by that, and for each
-one report HOW MUCH OF THE FRAME WIDTH the content spans.
+For EVERY image return one entry with its shot number and a kind:
 
-width_fraction is the single most important field. Measure the content's own
-horizontal extent, from its left edge to its right edge, as a fraction of the
-full frame width:
-- a spreadsheet, slide, screen recording or map filling the picture: 0.9 - 1.0
-- a chart or diagram beside a speaker: 0.4 - 0.7
-- a lower-third or headline strip across the bottom: 0.6 - 0.9
-- a logo, channel bug, score counter or subscriber count in a corner: 0.1 - 0.2
-- subtitles centred at the bottom: 0.3 - 0.5
+- "screen": a screen recording, app window, web page, document, spreadsheet,
+  slide or code editor fills most of the picture. A webcam bubble or small video
+  of the presenter laid over it still makes it "screen". So does a person who
+  only appears INSIDE the app (a video being edited, a webcam preview on a page).
+- "beside": a chart, slide or screen takes part of the picture and a person
+  filmed by a camera stands or sits beside it, each in their own area.
+- "camera": camera footage. A person talking to the camera, people, a room,
+  b-roll, products, landscapes. Logos, lower-thirds, subtitles or a title card
+  over camera footage are still "camera".
 
-Report what you actually see. Do NOT inflate the number to make a range seem
-worth reporting, and do NOT leave out corner graphics — report them with their
-true small width_fraction. A range reported honestly at 0.15 is useful; the same
-range reported at 0.9 makes the video worse.
+focus_left and focus_right (0..1, fractions of the image width) bound the part
+of the picture a viewer must READ to follow the shot: the document page, the
+web page column, the canvas, the active window or code. Include any webcam
+bubble or video of the presenter laid over the screen, and any text paragraph
+in full: the box must not cut a face or a line of text. Leave out toolbars, side
+panels, browser tabs, docks, desktop wallpaper and empty margins. If the whole
+width matters (a full spreadsheet, a full-width slide) answer 0 and 1. For
+"camera" answer 0 and 1.
 
-COUNT a range when the frame shows:
-- a screen recording, slide, spreadsheet, chart, graph or map
-- headlines, labels, statistics or comparison tables burned into the picture
-- a side-by-side or split-screen layout
-- any diagram or product shot where the edges carry the meaning
-
-DO NOT count an ordinary talking head, even against a busy background, and do
-not count b-roll, landscapes, crowds or action footage with no graphics.
-
-TIME CONTRACT — STRICT:
-- ABSOLUTE SECONDS from the start, numbers only, up to 3 decimals.
-- 0 <= start < end <= {video_duration}.
-- Merge ranges that are less than 1 second apart.
-- Return an EMPTY list if the video never shows such content. An empty list is
-  the correct, expected answer for most talking-head and b-roll videos — do not
-  invent ranges to seem useful.
-
-For "what", name the content in three words or fewer (e.g. "stock chart",
-"spreadsheet", "corner ticker").
+presenter_cam is true only for a "screen" shot with a LIVE webcam window of the
+person narrating the video laid over the screen (a bubble, a box, a Loom or
+QuickTime window). It is false for everything else, including a person who is
+part of the content: a photo or illustration on a slide, a thumbnail or cover
+art, a video playing or being edited inside the app, a game character, a
+person in a web page. When unsure, answer false. For "beside" and "camera"
+answer false.
 """
 
 
@@ -244,19 +253,26 @@ def _log(message: str) -> None:
 
 SCORE_PROMPT_TEMPLATE = """
 You are a senior short-form video strategist.
-Select the MOST viral candidate windows from this batch.
+RANK these candidate windows by how well each would work as a standalone short.
 
 Rules:
 - Return only valid JSON.
-- Choose up to 3 windows from this batch.
-- `score` must be an integer from 0 to 100.
+- Score EVERY window in this batch: exactly one entry per input window, with
+  the id you were given. Do not drop the weak ones — say they are weak.
+- `score` must be an integer from 0 to 100, and the ranking is what matters:
+  use the whole range instead of clustering. Most windows of a normal video
+  are not clippable, so reserve 70+ for the ones that pass the test below,
+  and put weak filler, housekeeping, outros, rambling transitions and
+  low-signal padding under 30 even when the topic is interesting.
 - THE 2-SECOND TEST is the main criterion: would the first 2 seconds of this
   moment force a cold viewer (no context) to keep watching? Windows that only
   work with prior context score low.
 - Prefer windows with strong hooks, conflict, surprise, outrage, emotion,
   novelty, big numbers, or a clear payoff.
-- Ignore weak filler, housekeeping, outros, rambling transitions, and
-  low-signal padding unless there is an obvious hook or payoff.
+- A window may carry `viewers_clipped` / `viewer_clip_views`: the stream's own
+  live viewers clipped that stretch themselves. That is strong evidence the
+  moment lands even when the transcript looks thin (a chase, a crash, a scream),
+  so weigh it up; the window still has to make sense to a cold viewer.
 
 TRANSCRIPT_LANGUAGE: {language}
 VIDEO_DURATION_SECONDS: {video_duration}
@@ -290,6 +306,10 @@ CLIP RULES:
 - Start slightly before the hook and end slightly after the payoff when possible.
 - Include enough setup to understand the action and the actual outcome; omit long
   inactive stretches after the payoff. Never claim an outcome not present in the clip.
+
+- When a window has `viewer_moments` ([start, end] stretches the stream's
+  viewers clipped), the best clip of that window should cover the strongest
+  of them, opening a few seconds before it so the moment has its setup.
 - Do not cut in the middle of a word or phrase.
 - No generic intros/outros unless they are the hook.
 - STANDS ALONE: the clip must make sense to someone who has seen nothing else.
@@ -328,6 +348,8 @@ COPY RULES — ALL text fields (descriptions, title, hook) MUST be written in TR
   without spoiling it, then 3-5 topically relevant hashtags. No generic hashtag spam.
 - `video_title_for_youtube_short`: max 100 chars, curiosity-driven, no fake claims.
 - `predicted_score`: honest 0-100 estimate of viral potential.
+- `why`: one sentence, max 20 words, naming what makes THIS moment worth a
+  clip — the specific hook, claim, number or payoff, not the topic.
 
 TRANSCRIPT_LANGUAGE: {language}
 VIDEO_DURATION_SECONDS: {video_duration}
@@ -345,7 +367,8 @@ Return only:
       "video_description_for_tiktok": "<description + hashtags>",
       "video_description_for_instagram": "<description + hashtags>",
       "video_title_for_youtube_short": "<title max 100 chars>",
-      "viral_hook_text": "<short overlay max 10 words>"
+      "viral_hook_text": "<short overlay max 10 words>",
+      "why": "<one sentence, max 20 words>"
     }}
   ]
 }}
@@ -405,6 +428,34 @@ def _parse_json_response_text(text: str) -> dict:
         except json.JSONDecodeError as e:
             last_error = e
     raise ValueError(f"Failed to parse Gemini JSON response: {last_error}")
+
+
+def upload_media(client, path, mime_type=None):
+    """Upload a local file to the Gemini Files API, by handle and never by path.
+
+    Handed a path, the SDK copies ``os.path.basename(path)`` verbatim into the
+    ``X-Goog-Upload-File-Name`` header, and httpx encodes header values as
+    ASCII. The downloaded source is named after the video's title, so every
+    video whose title is written in Japanese, Cyrillic, Arabic or Greek died
+    before a byte left the container with ``'ascii' codec can't encode
+    characters in position 0-4`` (prod, 20-sep-2026) — on the three stages
+    that upload the whole file: the silent-footage vision pass, the screencast
+    detector and the AI editor. Passing an open handle skips that header
+    entirely; the readable name still travels as ``display_name``, which goes
+    in the JSON body and is UTF-8 all the way.
+    """
+    guessed = mime_type or mimetypes.guess_type(path)[0] or ""
+    # Every caller uploads the source video; an extension the stdlib does not
+    # know (or knows as octet-stream) must not reach the API as a type it
+    # refuses, so fall back to the container the pipeline always writes.
+    if not guessed.startswith(("video/", "audio/", "image/")):
+        guessed = "video/mp4"
+    with open(path, "rb") as fh:
+        return client.files.upload(
+            file=fh,
+            config={"mime_type": guessed,
+                    "display_name": os.path.basename(path)},
+        )
 
 
 class GeminiBlockedError(ValueError):
@@ -562,7 +613,7 @@ def main() -> int:
     if args.mode != "score":
         # Score mode receives every window, not a shortlist, so a count target
         # derived from it would be meaningless — and the score template has no
-        # placeholder for one anyway.
+        # placeholder for one: it ranks whatever it is given.
         fmt["min_clips"], fmt["max_clips"] = clip_count_targets(len(payload.get("windows") or []))
         fmt["min_secs"], fmt["max_secs"] = clip_duration_bounds()
     prompt = template.format(**fmt)

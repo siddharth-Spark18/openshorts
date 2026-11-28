@@ -1,5 +1,7 @@
+# Base images are pinned by digest (@sha256): the tag is only a label.
+# To update one: docker buildx imagetools inspect <tag> and paste the new digest.
 # Multi-stage build for smaller final image
-FROM python:3.11-slim AS builder
+FROM python:3.11-slim@sha256:65bd3d9f1d7fa268dd1909973ba7eb4bdf41f6dcf2cfbe76ba9528b170f3fd79 AS builder
 
 WORKDIR /app
 
@@ -9,46 +11,78 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy and install Python dependencies
-# Copy and install Python dependencies
-COPY requirements.txt requirements-billing.txt ./
+COPY requirements.txt requirements-billing.txt requirements-cpu.lock requirements-gpu.lock ./
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
-RUN pip install --upgrade pip
-ARG CPU_ONLY=1
-RUN if [ "$CPU_ONLY" = "1" ]; then \
+RUN pip install --no-cache-dir pip==26.3
+# torch from PyPI bundles ~16 CUDA/triton wheels (several GB) even when nothing
+# will ever use a GPU. CPU builds take the same versions from PyTorch's CPU
+# index first (keep the two pins in step with requirements.txt).
+ARG GPU=0
+RUN if [ "$GPU" != "1" ]; then \
       pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu \
         torch==2.11.0 torchvision==0.26.0; \
     fi
-RUN pip install --no-cache-dir -r requirements.txt
-# Cloud (paid mode) deps: installed always so one image serves both modes; they
-# are only imported when BILLING_ENABLED is set. Harmless/unused in self-host.
-RUN pip install --no-cache-dir -r requirements-billing.txt
-
-# GPU build (--build-arg GPU=1 --build-arg CPU_ONLY=0): user-space CUDA libs only — the NVIDIA
-# container runtime injects the driver. cuBLAS 12 + cuDNN 9 for CTranslate2
-# (faster-whisper CUDA), onnx-asr + onnxruntime-gpu for Parakeet. Adds ~2GB,
-# so the default CPU image stays slim.
-ARG GPU=0
-RUN if [ "$GPU" = "1" ]; then \
-      pip install --no-cache-dir \
-        "nvidia-cublas-cu12<13" "nvidia-cudnn-cu12>=9,<10" \
-        onnx-asr onnxruntime-gpu; \
-    fi
+# Every other Python package comes from a full lock (direct and transitive
+# deps at exact versions) installed with --no-deps, so nothing unpinned gets
+# in. requirements-gpu.lock adds the user-space CUDA libs (cuBLAS 12 + cuDNN 9
+# for CTranslate2, onnx-asr + onnxruntime-gpu for Parakeet; the NVIDIA runtime
+# injects the driver). pip check fails the build if a lock misses a dependency;
+# the --no-index pass fails it if requirements*.txt lists something the lock
+# does not have. The billing deps are installed always so one image serves
+# both modes; they are only imported when BILLING_ENABLED is set.
+#
+# onnxruntime and onnxruntime-gpu are two distributions of ONE import package:
+# both write onnxruntime/capi/, and whichever pip unpacks last is the one that
+# runs. The GPU lock needs both names (faster-whisper requires "onnxruntime",
+# so pip check fails without it), and inside one pip install the CPU wheel
+# landed last: Parakeet got only the CPU provider and every transcription ran
+# on the CPU. So the GPU build writes onnxruntime-gpu again on top (same
+# version, from the lock) and fails unless the CUDA provider is compiled in.
+# get_available_providers() lists what the build has, no GPU needed at build time.
+RUN if [ "$GPU" = "1" ]; then LOCK=requirements-gpu.lock; else LOCK=requirements-cpu.lock; fi \
+ && pip install --no-cache-dir --no-deps -r "$LOCK" \
+ && if [ "$GPU" = "1" ]; then \
+      pip install --no-cache-dir --no-deps --force-reinstall \
+        "$(grep -E '^onnxruntime-gpu==' requirements-gpu.lock)" \
+      && python -c "import onnxruntime as o, sys; p = o.get_available_providers(); print('onnxruntime providers:', p); sys.exit('CUDAExecutionProvider' not in p)"; \
+    fi \
+ && pip check \
+ && pip install --no-index --no-deps -q -r requirements.txt -r requirements-billing.txt
 
 # PyTorch's C++ headers and static build metadata are unnecessary for inference.
 # Remove them in the builder before copying the environment into the final image.
-RUN if [ "$CPU_ONLY" = "1" ] && [ "$GPU" != "1" ]; then \
+RUN if [ "$GPU" != "1" ]; then \
       python -c "import pathlib, shutil, torch; p = pathlib.Path(torch.__file__).parent; [shutil.rmtree(p / name, ignore_errors=True) for name in ('include', 'share', 'test')]"; \
     fi
 
+# osrender (osrender/, Rust): renders a reframed clip in one pass on the GPU
+# (gpu_render.py). Only GPU builds compile it; the CPU image ships without it
+# and renders through ffmpeg. It links the same Debian FFmpeg libraries the
+# final stage installs, so both stages must stay on the same Debian release.
+FROM rust:1-slim-trixie@sha256:7eab7ce19273ce785e0ca7578bdf7bc1fcbae621775a8197379a04c9f6e03cd5 AS osrender
+ARG GPU=0
+COPY osrender /src/osrender
+RUN mkdir -p /out && if [ "$GPU" = "1" ]; then \
+      apt-get update && apt-get install -y --no-install-recommends \
+        pkg-config clang libclang-dev libavcodec-dev libavformat-dev libavutil-dev \
+        libavfilter-dev libavdevice-dev libswscale-dev libswresample-dev libass-dev \
+      && rm -rf /var/lib/apt/lists/* \
+      && cd /src/osrender && cargo build --release --locked \
+      && cp target/release/osrender /out/; \
+    fi
+
 # Final stage
-FROM python:3.11-slim
+FROM python:3.11-slim@sha256:65bd3d9f1d7fa268dd1909973ba7eb4bdf41f6dcf2cfbe76ba9528b170f3fd79
 
 WORKDIR /app
 
 # Install FFmpeg, OpenCV deps, Node.js + npm + git (for yt-dlp JS + bgutil build).
 # fontconfig + fonts-liberation back the subtitle font choices: without real
 # fonts libass falls back to DejaVu for every UI option (issue #57).
+# fonts-noto-core (~42 MB) is the glyph fallback for every other script:
+# Arabic, Hebrew, Devanagari, Bengali, Thai... burned as tofu boxes without it
+# (issue #89). libass shapes and orders RTL text itself once a font has the glyphs.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg espeak-ng \
     curl \
@@ -57,16 +91,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libsm6 \
     libxext6 \
     libxrender1 \
-    nodejs \
-    npm \
     git \
     fontconfig \
     fonts-liberation \
+    fonts-noto-core \
     fonts-noto-color-emoji \
     && rm -rf /var/lib/apt/lists/*
 
+# Node.js 22 from NodeSource: Debian's nodejs package is Node 20, which no
+# longer gets security fixes. The bgutil token provider below runs on it.
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
 # Deno JS runtime — required by yt-dlp for some extractor challenges.
-COPY --from=denoland/deno:bin /deno /usr/local/bin/deno
+COPY --from=denoland/deno:bin@sha256:b507583d3c68ba69f3ed2ce5969ae5b8b70f43421c781279c7aea06435263543 /deno /usr/local/bin/deno
 
 # Helper token provider, baked in as a local Node script (no separate service).
 RUN git clone --depth 1 https://github.com/Brainicism/bgutil-ytdlp-pot-provider /opt/bgutil-provider \
@@ -78,6 +117,8 @@ ENV BGUTIL_SCRIPT_PATH=/opt/bgutil-provider/server/build/generate_once.js
 
 # Copy virtual env from builder
 COPY --from=builder /opt/venv /opt/venv
+# Empty on CPU builds.
+COPY --from=osrender /out/ /usr/local/bin/
 ENV PATH="/opt/venv/bin:$PATH"
 ENV PYTHONUNBUFFERED=1
 
@@ -89,10 +130,19 @@ ENV LD_LIBRARY_PATH=/opt/venv/lib/python3.11/site-packages/nvidia/cublas/lib:/op
 ENV NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
 
 # Latest yt-dlp (nightly — it updates frequently) plus its helper plugin.
-RUN pip install --upgrade --pre --no-cache-dir "yt-dlp[default]" bgutil-ytdlp-pot-provider
+# A cached layer keeps the build it was made with, so the floor is raised
+# whenever YouTube ships a player the installed build cannot read (the JS
+# challenges fail and every format goes missing).
+RUN pip install --upgrade --pre --no-cache-dir "yt-dlp[default]>=2026.11.23" bgutil-ytdlp-pot-provider
 
 # Copy application code
 COPY . .
+
+# Every ffmpeg the app starts goes through bin/ffmpeg, which caps its decoder
+# and filter threads (docs/architecture/jobs-and-deploys.md). Uncapped, each
+# one sized its pools to the whole machine; at 2 the same encode used less
+# than half the CPU and finished sooner on a busy host, byte-identical.
+ENV PATH="/app/bin:$PATH" FFMPEG_THREADS=2
 
 # Register the bundled fonts (Anton for Impact) and the UI-name -> real-font
 # aliases with fontconfig so libass resolves what the subtitle modal offers.
@@ -141,4 +191,9 @@ EXPOSE 8000
 HEALTHCHECK --interval=5s --timeout=3s --start-period=30s --retries=2 \
   CMD curl -sf http://127.0.0.1:8000/health/ready > /dev/null || exit 1
 
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips", "*", "--timeout-graceful-shutdown", "15"]
+# serve.py starts uvicorn with exactly those flags: one process by default,
+# or (API_FRONT_WORKERS=N) an engine on a local socket plus N front processes
+# on port 8000, so the API uses more than one core
+# (docs/architecture/multiprocess-api.md). uvloop and httptools (in the
+# locks) are picked up by uvicorn on their own.
+CMD ["python", "serve.py"]

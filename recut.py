@@ -266,7 +266,7 @@ def perform_recut(*, input_path, segments, output_dir, clean_name,
                   reframe=False, output_format="auto", watermark=False,
                   captions_transcript=None, force_strategy=None,
                   crop_overrides=None, runner=None, renderer=None,
-                  watermarker=None, captioner=None):
+                  watermarker=None, captioner=None, subtitle_band=None):
     """Render a recut clip. Returns (served_filename, clean_filename).
 
     - ``input_path``/``segments``: the file to cut from and the times ON THAT
@@ -308,7 +308,8 @@ def perform_recut(*, input_path, segments, output_dir, clean_name,
 
                 def render(i, o, f):
                     return main_render(i, o, f, force_strategy=force_strategy,
-                                       crop_overrides=crop_overrides)
+                                       crop_overrides=crop_overrides,
+                                       subtitle_band=subtitle_band)
             if not render(work_path, out_path, output_format):
                 raise RuntimeError("reframe failed on the recut clip")
         else:
@@ -318,7 +319,7 @@ def perform_recut(*, input_path, segments, output_dir, clean_name,
             # ranges through the cut instead (empty when the input has none).
             import layout_ranges
             layout_ranges.write(out_path, [
-                (r["start"], r["end"], r["layout"])
+                (r["start"], r["end"], r["layout"], r.get("content"))
                 for r in layout_ranges.remap(layout_ranges.read(input_path), segments)])
 
         if watermark:

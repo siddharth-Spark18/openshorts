@@ -52,3 +52,6 @@ CLAUDE.local.md
 
 library/
 *cookies.txt
+
+# Rust build output
+osrender/target/

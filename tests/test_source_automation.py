@@ -35,3 +35,22 @@ def test_existing_manual_job_and_pause_are_respected(tmp_path, monkeypatch):
     assert automation.claim_candidate() is None
     jobs_db.save_settings({'source_auto_enabled': '1'})
     assert automation.claim_candidate()['video_id'] == 'abcdefghijk'
+
+
+def test_auto_submit_uses_current_processing_endpoint(monkeypatch):
+    import asyncio
+    import inspect
+    import app
+
+    signature = inspect.signature(app.process_endpoint)
+
+    async def process(request, **kwargs):
+        signature.bind(request, **kwargs)
+        assert request.state._source_job_id == 'job-123'
+        body = await request.json()
+        assert body['url'] == 'https://www.youtube.com/watch?v=abcdefghijk'
+        assert body['layouts'] == ['gaming']
+        return {'job_id': request.state._source_job_id}
+
+    monkeypatch.setattr(app, 'process_endpoint', process)
+    assert asyncio.run(app._auto_submit_source('abcdefghijk', 'job-123')) == {'job_id': 'job-123'}

@@ -11,6 +11,7 @@ audio codecs, filters) stay at each call site.
 """
 import os
 import subprocess
+from fractions import Fraction
 import threading
 import time
 
@@ -18,27 +19,35 @@ import time
 QUALITY = "quality"            # was: -preset medium -crf 18
 QUALITY_FAST = "quality_fast"  # was: -preset fast -crf 18
 DELIVERY = "delivery"          # was: -preset fast -crf 22
+# A file the pipeline decodes again straight away (the cut that every render
+# reads). libx264 keeps QUALITY_FAST's settings; on NVENC it trades encoder
+# effort for bits instead, see _intermediate_nvenc_args.
+INTERMEDIATE = "intermediate"
 
 _X264_ARGS = {
     QUALITY: ["-c:v", "libx264", "-preset", "medium", "-crf", "18"],
     QUALITY_FAST: ["-c:v", "libx264", "-preset", "fast", "-crf", "18"],
     DELIVERY: ["-c:v", "libx264", "-preset", "fast", "-crf", "22"],
+    INTERMEDIATE: ["-c:v", "libx264", "-preset", "fast", "-crf", "18"],
 }
 
 # NVENC -cq is not 1:1 with x264 CRF: benchmarked on the prod GPU (RTX 4000
 # Ada), cq ≈ crf + 7 lands in the same file-size ballpark, with vbr + AQ for
-# quality. Presets p1-p7: p5 ≈ "medium", p4 ≈ "fast".
+# quality. Presets p1-p7: p5 ≈ "medium", p4 ≈ "fast". QUALITY ran p5 until
+# oct-2026, then p4, then p3: same hq tune and AQs, ~25% less engine time per
+# frame for files ~13% larger at an SSIM to the source within 0.001 of p4. On
+# a shared card the engine time matters more than the small gain.
 # -pix_fmt yuv420p is REQUIRED: with RGB input (the bgr24 rawvideo pipe from
 # OpenCV) nvenc otherwise emits H.264 in gbrp/GBR colorspace, which ffmpeg
 # reads fine but web players render as a magenta/green mess.
 _NVENC_ARGS = {
-    QUALITY: ["-c:v", "h264_nvenc", "-preset", "p5", "-tune", "hq",
+    QUALITY: ["-c:v", "h264_nvenc", "-preset", "p3", "-tune", "hq",
               "-rc", "vbr", "-cq", "25", "-b:v", "0",
               "-spatial-aq", "1", "-temporal-aq", "1", "-pix_fmt", "yuv420p"],
-    QUALITY_FAST: ["-c:v", "h264_nvenc", "-preset", "p4", "-tune", "hq",
+    QUALITY_FAST: ["-c:v", "h264_nvenc", "-preset", "p3", "-tune", "hq",
                    "-rc", "vbr", "-cq", "25", "-b:v", "0", "-spatial-aq", "1",
                    "-pix_fmt", "yuv420p"],
-    DELIVERY: ["-c:v", "h264_nvenc", "-preset", "p4",
+    DELIVERY: ["-c:v", "h264_nvenc", "-preset", "p3",
                "-rc", "vbr", "-cq", "29", "-b:v", "0", "-spatial-aq", "1",
                "-pix_fmt", "yuv420p"],
 }
@@ -143,44 +152,107 @@ def audio_encode_args():
 
 _probe_lock = threading.Lock()
 _nvenc_ok = None  # None = not probed yet
+_nvenc_reprobe_at = None  # set while a "no" only means "the card was full"
 _announced = False
+
+
+def _env_number(name, default, cast=float):
+    try:
+        value = cast(os.environ.get(name, "") or default)
+    except ValueError:
+        value = cast(default)
+    return value if value >= 0 else cast(default)
+
+
+# A probe that fails only because the card is momentarily full is retried,
+# and its "no" is never kept for the whole process. Measured in prod on
+# 18-nov-2026: 1 of 5 probes hit CUDA_ERROR_OUT_OF_MEMORY at a VRAM peak, and
+# because the first verdict was cached per job process, 6 of 14 running jobs
+# encoded every clip with libx264: the host went to 100% CPU and full swap,
+# and the OOM killer took the API down.
+NVENC_PROBE_ATTEMPTS = _env_number("NVENC_PROBE_ATTEMPTS", 3, int) or 1
+NVENC_PROBE_BACKOFF = _env_number("NVENC_PROBE_BACKOFF", 2.0)
+NVENC_REPROBE_SECONDS = _env_number("NVENC_REPROBE_SECONDS", 60.0)
+_TRANSIENT_PROBE_ERRORS = ("OUT_OF_MEMORY", "out of memory")
 
 
 def _probe_nvenc():
     """One tiny lavfi encode to prove h264_nvenc works end-to-end.
 
     NVENC rejects frames smaller than ~145px, so the probe uses 256x256.
-    Any failure (no ffmpeg binary, no GPU, no driver libs) means False.
+    Returns True when it works and False when this host has no NVENC (no
+    ffmpeg binary, no GPU, no driver libs). Returns None when the card is
+    there but could not take one more context right now (CUDA out of memory,
+    or a probe too slow on a saturated host): that says nothing about the
+    encodes to come.
+    Never waits for an encode slot (bin/ffmpeg): queued behind busy encodes it
+    would hit the timeout and turn the whole job to libx264.
     """
     cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "error",
         "-f", "lavfi", "-i", "color=black:s=256x256:d=0.1",
         "-c:v", "h264_nvenc", "-f", "null", "-",
     ]
+    env = {**os.environ, "NVENC_SLOTS": "0"}
     try:
         result = subprocess.run(
-            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=30,
+            env=env, text=True, errors="replace",
         )
-        return result.returncode == 0
+    except subprocess.TimeoutExpired:
+        return None
     except Exception:
         return False
+    if result.returncode == 0:
+        return True
+    stderr = result.stderr or ""
+    if any(marker in stderr for marker in _TRANSIENT_PROBE_ERRORS):
+        return None
+    return False
+
+
+def _probe_nvenc_patiently():
+    """``_probe_nvenc`` again, with a growing pause, while the card is only
+    full. (verdict, transient): transient means every attempt found the card
+    full, so the False is for now and not for good."""
+    delay = NVENC_PROBE_BACKOFF
+    for attempt in range(NVENC_PROBE_ATTEMPTS):
+        verdict = _probe_nvenc()
+        if verdict is not None:
+            return verdict, False
+        if attempt + 1 < NVENC_PROBE_ATTEMPTS:
+            time.sleep(delay)
+            delay *= 2
+    print("⚠️ [Encoder] the GPU was full on every NVENC probe: libx264 for now, "
+          f"probing again in {NVENC_REPROBE_SECONDS:.0f}s", flush=True)
+    return False, True
 
 
 def nvenc_available():
-    """Probe h264_nvenc once and cache the verdict (thread-safe)."""
-    global _nvenc_ok
-    if _nvenc_ok is None:
+    """Probe h264_nvenc and cache the verdict (thread-safe).
+
+    A real verdict is kept for the process. A "no" that only means "the card
+    was full" lasts NVENC_REPROBE_SECONDS, then the next encode probes again.
+    """
+    global _nvenc_ok, _nvenc_reprobe_at
+    if _nvenc_ok is None or (_nvenc_reprobe_at is not None
+                             and time.monotonic() >= _nvenc_reprobe_at):
         with _probe_lock:
-            if _nvenc_ok is None:
-                _nvenc_ok = _probe_nvenc()
+            if _nvenc_ok is None or (_nvenc_reprobe_at is not None
+                                     and time.monotonic() >= _nvenc_reprobe_at):
+                verdict, transient = _probe_nvenc_patiently()
+                _nvenc_ok = verdict
+                _nvenc_reprobe_at = (time.monotonic() + NVENC_REPROBE_SECONDS
+                                     if transient else None)
     return _nvenc_ok
 
 
 def reset_encoder_cache():
     """Test hook: forget the cached probe result."""
-    global _nvenc_ok, _announced
+    global _nvenc_ok, _nvenc_reprobe_at, _announced
     with _probe_lock:
         _nvenc_ok = None
+        _nvenc_reprobe_at = None
         _announced = False
 
 
@@ -203,7 +275,100 @@ def video_encode_args(tier=QUALITY):
         print(f"🎞️ [Encoder] video encoder: {'h264_nvenc' if use_nvenc else 'libx264'} "
               f"(FFMPEG_ENCODER={mode})")
 
-    return list((_NVENC_ARGS if use_nvenc else _X264_ARGS)[tier])
+    if use_nvenc and tier == INTERMEDIATE:
+        return _intermediate_nvenc_args()
+    if use_nvenc:
+        return list(_NVENC_ARGS[tier])
+    return _x264_with_preset(_X264_ARGS[tier])
+
+
+# libx264 presets a deployment may pick with X264_PRESET (same CRF, less CPU
+# per frame for slightly larger files). Unset keeps each tier's own preset.
+_X264_PRESETS = ("ultrafast", "superfast", "veryfast", "faster", "fast",
+                 "medium", "slow")
+
+
+def _x264_with_preset(args):
+    args = list(args)
+    preset = os.environ.get("X264_PRESET", "").strip().lower()
+    if preset in _X264_PRESETS:
+        args[args.index("-preset") + 1] = preset
+    return args
+
+
+def _intermediate_nvenc_args():
+    """NVENC args for INTERMEDIATE: the cheapest preset at a lower -cq.
+
+    The cut is never delivered: the reframe decodes it and encodes the clip
+    again. Spending NVENC time on it (p4, hq tune, spatial AQ) bought quality
+    the next encode throws away, and on a busy card the cuts were the largest
+    share of the encoder's sessions. p1 is several times cheaper per frame; the
+    lower -cq spends bits instead so the clip that comes out of the reframe
+    stays the same. CUT_NVENC_PRESET / CUT_NVENC_CQ override both.
+    """
+    preset = os.environ.get("CUT_NVENC_PRESET", "p1").strip() or "p1"
+    cq = os.environ.get("CUT_NVENC_CQ", "19").strip() or "19"
+    return ["-c:v", "h264_nvenc", "-preset", preset, "-rc", "vbr", "-cq", cq,
+            "-b:v", "0", "-pix_fmt", "yuv420p"]
+
+
+def cut_gop():
+    """Keyframe spacing of the cut, in frames (``CUT_GOP``, 0 = the encoder's).
+
+    The layout checks read a few frames per scene from the cut by seeking, and
+    a seek decodes again from the keyframe before the frame asked. At the
+    encoders' default of 250 frames a 60 s 1080p cut's ~100 samples cost 155
+    CPU-s; one keyframe a second brings that to 55, for a file under 1% larger
+    on NVENC (benched 23-nov-2026). The cut is never delivered, so the spacing
+    of the clips that are stays the encoder's.
+    """
+    try:
+        n = int(os.environ.get("CUT_GOP", "30").strip() or 0)
+    except ValueError:
+        n = 30
+    return max(0, n)
+
+
+def cut_gop_args():
+    n = cut_gop()
+    return ["-g", str(n)] if n else []
+
+
+def finished_before_crash(result, outputs):
+    """True when ffmpeg died on a signal AFTER finishing every output.
+
+    The multi-output passes (hook, captions, the wm_ copy) sometimes segfault
+    while tearing down, after the last trailer is written: each output's final
+    stats line ("muxing overhead", printed once its trailer and faststart
+    rewrite are done) is already on stderr and the files are complete, byte
+    for byte what a clean exit writes. Treating that as a failure re-ran the whole thing as separate
+    passes for nothing. Anything short of every output finished still fails.
+    """
+    if result.returncode >= 0:
+        return False
+    if (result.stderr or b"").count(b"muxing overhead") < len(outputs):
+        return False
+    if not all(os.path.exists(p) and os.path.getsize(p) > 0 for p in outputs):
+        return False
+    print(f"   ℹ️ ffmpeg exited on signal {-result.returncode} after writing all "
+          f"{len(outputs)} outputs — keeping them.")
+    return True
+
+
+def blurred_backdrop(out_w, out_h, sigma):
+    """Filter chain (no labels) filling out_w x out_h with a blurred copy.
+
+    The blur runs at a quarter of the output size and is scaled up afterwards:
+    a blurred picture has no detail to lose, the result looks the same (SSIM
+    0.994-0.998 against the full-size gblur on prod clips) and the segment
+    encode needs ~45% less CPU. ``sigma`` is the full-size one.
+    """
+    small_w = max(2, out_w // 4 - (out_w // 4) % 2)
+    small_h = max(2, out_h // 4 - (out_h // 4) % 2)
+    return (
+        f"scale=-2:{small_h},crop=w=min(iw\\,{small_w}):h={small_h},"
+        f"gblur=sigma={sigma / 4:g},scale={out_w}:{out_h}"
+    )
 
 
 def escape_filter_value(value):
@@ -239,6 +404,93 @@ MIN_CUT_BYTES = 1024
 # encode, another job finishes and gives back.
 CUT_RETRY_WAITS = (3, 9)
 
+# The cut can stay on the card end to end: NVDEC decodes into GPU memory and
+# NVENC encodes from it, so the CPU never touches a frame. Measured on a real
+# 1080p source: byte-identical decoded frames to the CPU-decoded cut, 64% less
+# CPU (25-sep-2026). Only for 8-bit 4:2:0 in codecs the card decodes: anything
+# else would reach nvenc in a pixel format a delivered H.264 must not have, so
+# it keeps the CPU decode. FFMPEG_GPU_CUT=0 turns it off.
+_GPU_CUT_CODECS = {"h264", "hevc", "vp9", "av1"}
+_gpu_cut_sources = {}
+
+
+def _source_format(path):
+    """(codec, pix_fmt) of the first video stream, or None."""
+    if not os.path.exists(path):
+        return None
+    try:
+        out = subprocess.check_output(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=codec_name,pix_fmt", "-of", "csv=p=0", path],
+            stderr=subprocess.DEVNULL, timeout=60, text=True).strip()
+        codec, pix_fmt = out.split(",")[:2]
+        return codec, pix_fmt
+    except Exception:
+        return None
+
+
+def _gpu_cut_ok(input_video):
+    if os.environ.get("FFMPEG_GPU_CUT", "1").strip() == "0":
+        return False
+    if os.environ.get("FFMPEG_ENCODER", "x264").strip().lower() not in ("nvenc", "auto"):
+        return False
+    if input_video not in _gpu_cut_sources:
+        fmt = _source_format(input_video) if nvenc_available() else None
+        _gpu_cut_sources[input_video] = bool(
+            fmt and fmt[0] in _GPU_CUT_CODECS and fmt[1] == "yuv420p")
+    return _gpu_cut_sources[input_video]
+
+
+_source_rates = {}
+
+
+def _source_rate(path):
+    """Average frame rate of the first video stream as a Fraction, or None."""
+    if path in _source_rates:
+        return _source_rates[path]
+    rate = None
+    try:
+        out = subprocess.check_output(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=avg_frame_rate", "-of", "csv=p=0", path],
+            stderr=subprocess.DEVNULL, timeout=60, text=True).strip()
+        num, _, den = out.partition("/")
+        value = Fraction(int(num), int(den or 1))
+        rate = value if value > 0 else None
+    except Exception:
+        rate = None
+    _source_rates[path] = rate
+    return rate
+
+
+def cut_rate_filter(input_video):
+    """``["-vf", "fps=N/D"]`` when the job caps its frame rate and the source
+    is well above the cap, else ``[]``.
+
+    The cut is the file every later pass reads (tracking, scene detection, the
+    reframe render, captions, hook, watermark), so a 60 fps source cut at 30
+    halves the decode and encode of all of them. CUT_MAX_FPS is set per job by
+    the API (the free plan, FREE_MAX_FPS). The rate is the source's divided by
+    a whole number (60 -> 30, 59.94 -> 29.97, 50 -> 25, 120 -> 30), so every
+    kept frame is evenly spaced and motion stays smooth. A source under 1.5x
+    the cap (a 40 fps one) is left alone: halving it would cost more
+    smoothness than it saves.
+    """
+    try:
+        cap = float(os.environ.get("CUT_MAX_FPS", "0") or 0)
+    except ValueError:
+        cap = 0
+    if cap <= 0:
+        return []
+    rate = _source_rate(input_video)
+    if rate is None or rate < Fraction(cap) * Fraction(3, 2):
+        return []
+    n = 2
+    while rate / n > Fraction(cap) * Fraction(1001, 1000):
+        n += 1
+    target = (rate / n).limit_denominator(1001)
+    return ["-vf", f"fps={target.numerator}/{target.denominator}"]
+
 
 def cut_clip(input_video, clip_temp_path, start, end, clip_number):
     """Cut [start, end] out of the source into ``clip_temp_path``.
@@ -258,25 +510,52 @@ def cut_clip(input_video, clip_temp_path, start, end, clip_number):
     cached for the life of the process, so it stays true while a real 1080p
     session cannot allocate on a GPU that other jobs are filling.
     """
-    encode_args = video_encode_args(QUALITY_FAST)
+    encode_args = video_encode_args(INTERMEDIATE)
+    rate = cut_rate_filter(input_video)
     command = [
         'ffmpeg', '-y',
         '-ss', str(start),
         '-to', str(end),
         '-i', input_video,
+        *rate,
         *encode_args,
+        *cut_gop_args(),
         *audio_encode_args(),
         clip_temp_path
     ]
+    gpu_command = None
+    if _gpu_cut_ok(input_video):
+        # CUDA frames are already 4:2:0 (nv12); -pix_fmt would force a copy
+        # back to system memory.
+        gpu_args = list(encode_args)
+        if "-pix_fmt" in gpu_args:
+            i = gpu_args.index("-pix_fmt")
+            del gpu_args[i:i + 2]
+        gpu_command = ['ffmpeg', '-y', '-hwaccel', 'cuda', '-hwaccel_output_format', 'cuda',
+                       '-ss', str(start), '-to', str(end), '-i', input_video,
+                       *rate, *gpu_args, *cut_gop_args(), *audio_encode_args(),
+                       clip_temp_path]
 
-    def _run():
-        result = subprocess.run(command, stdout=subprocess.DEVNULL,
+    def _run_one(cmd):
+        result = subprocess.run(cmd, stdout=subprocess.DEVNULL,
                                 stderr=subprocess.PIPE, text=True, errors="replace")
         # ffmpeg has been seen exiting 0 having written nothing, so the file
         # itself is the verdict, not just the return code.
         size = os.path.getsize(clip_temp_path) if os.path.exists(clip_temp_path) else 0
         ok = result.returncode == 0 and size >= MIN_CUT_BYTES
         return ok, f"exit {result.returncode}, {size} bytes\n{(result.stderr or '').strip()[-800:]}"
+
+    def _run():
+        nonlocal gpu_command
+        if gpu_command:
+            ok, report = _run_one(gpu_command)
+            if ok:
+                return ok, report
+            # Not worth a second try on this source: back to the CPU decode.
+            print(f"   ⚠️ GPU cut of clip {clip_number} failed — decoding on the CPU.")
+            gpu_command = None
+            _gpu_cut_sources[input_video] = False
+        return _run_one(command)
 
     for attempt, wait in enumerate(CUT_RETRY_WAITS + (None,), start=1):
         ok, report = _run()

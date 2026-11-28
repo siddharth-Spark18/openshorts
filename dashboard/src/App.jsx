@@ -1,10 +1,11 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
-import { Upload, Sparkles, Youtube, Instagram, Share2, ChevronDown, Check, Activity, LayoutDashboard, Settings, Plus, History, X, Terminal, Shield, LayoutGrid, Image, Globe, RotateCcw, Calendar, AlertTriangle, KeyRound, Bot, Users, Smartphone, ExternalLink, Copy, CheckCircle2, Mail, Loader2, Download, Menu, Lock } from 'lucide-react';
+import { Upload, Sparkles, Youtube, Instagram, Share2, ChevronDown, Check, Activity, LayoutDashboard, Settings, Plus, History, X, Terminal, Shield, LayoutGrid, Image, Globe, RotateCcw, Calendar, AlertTriangle, KeyRound, Bot, Users, Smartphone, ExternalLink, Copy, CheckCircle2, Mail, Loader2, Download, Menu, Lock, Rocket } from 'lucide-react';
 import KeyInput from './components/KeyInput';
 import MediaInput from './components/MediaInput';
 import McpConnectCard from './components/McpConnectCard';
 import ResultCard from './components/ResultCard';
 import ProcessingAnimation from './components/ProcessingAnimation';
+import { clipProgress, FREE_CLIPS_PER_VIDEO, FREE_CLIPS_QUIET, MAX_CLIPS_PER_VIDEO } from './lib/clipProgress';
 // import Gallery from './components/Gallery';
 import ThumbnailStudio from './components/ThumbnailStudio';
 import SaaShortsTab from './components/SaaShortsTab';
@@ -14,9 +15,12 @@ import ClipEditor from './components/ClipEditor';
 import ReframeEditor from './components/ReframeEditor';
 import UsageMeter from './components/UsageMeter';
 import TopUpModal from './components/TopUpModal';
+import WatermarkModal, { watermarkNoticeDismissed } from './components/WatermarkModal';
+import { getApiUrl } from './config';
 import StarBanner from './components/StarBanner';
 import PlanChoiceModal from './components/PlanChoiceModal';
 import ClipTutorial from './components/ClipTutorial';
+import OnboardingSurvey from './components/OnboardingSurvey';
 import TrialUpgradeModal from './components/TrialUpgradeModal';
 import LoginModal from './components/LoginModal';
 import TrialGate from './components/TrialGate';
@@ -28,11 +32,16 @@ import YoutubeCookies from './components/YoutubeCookies';
 import DriveConnection from './components/DriveConnection';
 import JobHistory from './components/JobHistory';
 import HistoryTab from './components/HistoryTab';
+import AutopilotTab from './components/AutopilotTab';
 import ProfileMenu from './components/ProfileMenu';
 import Modal from './components/ui/Modal';
 import { useAuth } from './contexts/AuthContext';
-import { apiFetch, apiJson, QuotaError } from './lib/api';
+import { apiFetch, apiJson, QuotaError, QUOTA_WALL_EVENT, openQuotaWall } from './lib/api';
+import { SOCIAL_PLATFORMS } from './lib/socialPlatforms';
 import { track } from './lib/analytics';
+import { readConnectReturn, stripConnectReturn } from './lib/connectReturn';
+import { rememberTabAfterLogin } from './lib/tabAfterLogin';
+import { JobPollError, pollFailureAction } from './lib/jobPoll';
 
 // Enhanced "Encryption" using XOR + Base64 with a Salt
 // This is better than plain Base64 but still client-side.
@@ -141,6 +150,9 @@ const formatRetention = (seconds) => {
   return `${Math.max(1, Math.round(seconds / 60))} min`;
 };
 
+// TikTok, Instagram and YouTube have their own icons above; the rest come from the shared list.
+const EXTRA_NETWORKS = SOCIAL_PLATFORMS.slice(3);
+
 const ProfileNetworkIcons = ({ profile, size = 12 }) => (
   <span className="flex items-center gap-1.5">
     <span className={profile?.connected?.includes('tiktok') ? 'text-ink' : 'text-muted opacity-40'}>
@@ -152,6 +164,11 @@ const ProfileNetworkIcons = ({ profile, size = 12 }) => (
     <span className={profile?.connected?.includes('youtube') ? 'text-ink' : 'text-muted opacity-40'}>
       <Youtube size={size} />
     </span>
+    {EXTRA_NETWORKS.map((p) => (
+      <span key={p.value} className={profile?.connected?.includes(p.value) ? 'text-ink' : 'text-muted opacity-40'}>
+        <p.Icon size={size} />
+      </span>
+    ))}
   </span>
 );
 
@@ -218,6 +235,11 @@ const UserProfileSelector = ({ profiles, selectedUserId, onSelect, onConnect }) 
                       <div className={`flex items-center gap-1 ${profile.connected.includes('youtube') ? 'text-ink2' : 'text-muted opacity-40'}`}>
                         <Youtube size={10} />
                       </div>
+                      {EXTRA_NETWORKS.map((p) => (
+                        <div key={p.value} className={`flex items-center gap-1 ${profile.connected.includes(p.value) ? 'text-ink2' : 'text-muted opacity-40'}`}>
+                          <p.Icon size={10} />
+                        </div>
+                      ))}
                     </div>
                   </div>
                 </div>
@@ -243,14 +265,29 @@ const UserProfileSelector = ({ profiles, selectedUserId, onSelect, onConnect }) 
 };
 
 const SESSION_KEY = 'openshorts_session';
+
+// The server's own explanation for a rejected/failed job, readable: FastAPI
+// answers {"detail": "..."} or {"detail": {"message": ...}}. Showing the raw
+// JSON (or a generic "failed") hid actionable reasons such as "this video is
+// only 30s long", and new users in the tutorial saw only "That run failed".
+const readableError = (raw) => {
+  const text = String(raw || '').trim();
+  try {
+    const body = JSON.parse(text);
+    const d = body?.detail ?? body;
+    if (typeof d === 'string' && d) return d.slice(0, 300);
+    if (d && typeof d.message === 'string') return d.message.slice(0, 300);
+  } catch (_) { /* not JSON */ }
+  return text.replace(/^Error:\s*/, '').slice(0, 300) || 'Something went wrong.';
+};
 // Matches the self-host JOB_RETENTION_SECONDS default. A restore whose job was
-// already purged server-side fails gracefully and clears the saved session.
+// already purged server-side (Cloud keeps it 1 h) gets a 404 from the status
+// poll, which clears the saved session (see lib/jobPoll.js).
 const SESSION_MAX_AGE = 86400000; // 24 hours
 
-// Mock polling function
 const pollJob = async (jobId) => {
   const res = await apiFetch(`/api/status/${jobId}`);
-  if (!res.ok) throw new Error('Status check failed');
+  if (!res.ok) throw new JobPollError(res.status);
   return res.json();
 };
 
@@ -259,6 +296,9 @@ function App() {
   const { loading: authLoading, ownerWorkspace, hasServerGeminiKey, billingEnabled, isManaged, isSignedIn, me, plan, refreshMe, jobRetentionSeconds, localLlm } = useAuth();
   const [showLogin, setShowLogin] = useState(false);
   const [showTopUp, setShowTopUp] = useState(false);
+  // Free plan: "want the watermark off?" once per job, when the clips land.
+  const [showWmNotice, setShowWmNotice] = useState(false);
+  const wmNoticedJobRef = useRef(null);
   const [showPlanChoice, setShowPlanChoice] = useState(false);
   const [tutorialPhase, setTutorialPhase] = useState(null); // null | intro | coach | celebrate
   const [showTrialUpgrade, setShowTrialUpgrade] = useState(false);
@@ -266,6 +306,28 @@ function App() {
   // {processed_minutes, total_minutes} when the running/finished job clips
   // only the first part of the source (the quota wall's free offer).
   const [partialJob, setPartialJob] = useState(null);
+  // The free plan's first video, clipped whole past the 20-minute balance.
+  const [firstVideoJob, setFirstVideoJob] = useState(false);
+  // {position, ahead, eta_seconds} while the job waits in line, else null.
+  const [queueInfo, setQueueInfo] = useState(null);
+  // A free video far back in a saturated queue: the server says later
+  // arrivals can still pass it (eta_is_minimum) and its minimum wait is long.
+  // The first seconds of a new video are never this (it enters at the front
+  // of a lane that serves its newest first), so nobody is told "hours" for a
+  // video that starts in ten minutes.
+  const queueSlow = Boolean(billingEnabled && queueInfo && queueInfo.eta_is_minimum
+    && queueInfo.ahead > 0 && queueInfo.eta_seconds >= 20 * 60
+    && !['starter', 'creator', 'pro'].includes(plan));
+  const queueSlowSeenRef = useRef(false);
+  useEffect(() => {
+    if (!queueInfo) { queueSlowSeenRef.current = false; return; }
+    if (queueSlow && !queueSlowSeenRef.current) {
+      queueSlowSeenRef.current = true;
+      track('QueueSlowSeen', { props: { position: String(queueInfo.position) } });
+    }
+  }, [queueSlow, queueInfo]);
+  // Why the last job could not start or failed, in plain words (or '').
+  const [jobError, setJobError] = useState('');
   // Durable R2 URLs (per clip index) for the current job — used as a fallback when
   // the ephemeral local /videos/ files have been cleaned up (e.g. after a reload).
   const [durableClips, setDurableClips] = useState({});
@@ -300,6 +362,14 @@ function App() {
   const [socialNudgeDismissed, setSocialNudgeDismissed] = useState(() => {
     try { return localStorage.getItem('os_social_nudge_dismissed') === '1'; } catch (_) { return false; }
   });
+  // Autopilot nudge, same results peak, ahead of the social one: the sign-up
+  // survey's "autopilot" goal pays about twice the "clips" one, and 95% of
+  // users never come back a second day; Autopilot is the one feature that
+  // works without them coming back. Gone once clicked or dismissed.
+  const [autopilotNudgeDismissed, setAutopilotNudgeDismissed] = useState(() => {
+    try { return localStorage.getItem('os_autopilot_nudge_dismissed') === '1'; } catch (_) { return false; }
+  });
+  const [autopilotOn, setAutopilotOn] = useState(false);
   const [showKeyModal, setShowKeyModal] = useState(false);
   const [jobId, setJobId] = useState(null);
   const [status, setStatus] = useState('idle'); // idle, processing, complete, error
@@ -332,6 +402,12 @@ function App() {
   // Pre-flight quality gate: { info: {max_height, min_height, cookies_invalid}, data }
   const [qualityGate, setQualityGate] = useState(null);
   const [logs, setLogs] = useState([]);
+  // When each server log line arrived (epoch s, parallel to logs), from /api/status.
+  const [logTimes, setLogTimes] = useState([]);
+  // Clips picked and finished so far, read from the running job's log, so the
+  // results panel can say "3/5" instead of an open-ended wait.
+  const progress = useMemo(() => clipProgress(logs), [logs]);
+  const clipsMaking = status === 'processing' && progress.total > 0;
   // Collapsed on phones: the log tail is the least useful thing on a 360px
   // screen and it was pushing the actual clips a full scroll down.
   const [logsVisible, setLogsVisible] = useState(() => {
@@ -349,6 +425,8 @@ function App() {
   const [noSource, setNoSource] = useState(false);
 
   const [sessionRecovered, setSessionRecovered] = useState(false);
+  // The job a restored session was polling is no longer on the server.
+  const [jobGone, setJobGone] = useState(false);
   const [showScheduleWeek, setShowScheduleWeek] = useState(false);
   // Clip editor overlay: index of the clip being edited, or null.
   const [editingClip, setEditingClip] = useState(null);
@@ -364,7 +442,9 @@ function App() {
   const [syncTrigger, setSyncTrigger] = useState(0);
 
   const handleClipPlay = (startTime) => {
-    setSyncedTime(startTime);
+    // Clip times are relative to the processed stretch; the preview plays the
+    // whole source, so a picked range shifts them by its start.
+    setSyncedTime(startTime + (Number(partialJob?.start_seconds) || 0));
     setIsSyncedPlaying(true);
     setSyncTrigger(prev => prev + 1);
   };
@@ -415,6 +495,81 @@ function App() {
   // map on a backoff until the archived name matches the clip's new file, then it
   // can play from R2 again. Gives up quietly: staying on /videos is correct, just
   // slower, and is exactly what happens for self-hosted users all the time.
+  // opts.source / opts.highlight: which surface opened it (CheckoutStarted
+  // source) and which plan the modal puts forward (WatermarkModal: starter).
+  // opts.partialJob: the trimmed job on screen, so the modal sells the rest of it.
+  const openUpsell = (opts = {}) => {
+    setTopUpInfo({ context: 'upsell', source: opts.source, highlight: opts.highlight,
+                   partialJob: opts.partialJob || null });
+    setShowTopUp(true);
+  };
+
+  // Out-of-minutes errors from the thumbnail studio, clip editor and autopilot
+  // (lib/api.openQuotaWall) open the same wall as the main clip flow.
+  const meStatus = me?.status;
+  useEffect(() => {
+    if (!isManaged) return undefined;
+    const onWall = (ev) => {
+      refreshMe();
+      if (meStatus === 'trialing') { setShowTrialUpgrade(true); return; }
+      const d = ev.detail || {};
+      if (d.code === 'connect_requires_plan') {
+        // Connecting socials is paid: the plans modal sells posting.
+        setTopUpInfo({ context: 'connect_wall', source: d.source || 'connect_wall', highlight: 'starter' });
+      } else if (d.code === 'post_requires_plan') {
+        // The free posts are used: the plans modal sells posting, not minutes.
+        setTopUpInfo({ context: 'post_wall', source: d.source || 'post_wall', highlight: 'starter' });
+      } else {
+        setTopUpInfo({ context: 'wall', required: d.required, remaining: d.remaining, source: d.source });
+      }
+      setShowTopUp(true);
+    };
+    window.addEventListener(QUOTA_WALL_EVENT, onWall);
+    return () => window.removeEventListener(QUOTA_WALL_EVENT, onWall);
+  }, [isManaged, meStatus, refreshMe]);
+
+  // The clips just landed on a free account: ask once, per job, whether they
+  // want the mark off. A beat after the grid renders, so the first thing they
+  // see is their clips and not a modal over them.
+  useEffect(() => {
+    if (status !== 'complete' || plan !== 'free' || !isManaged || !jobId) return;
+    if (!(results?.clips?.length > 0)) return;
+    // Not on top of the tutorial's celebrate step: it shows once that closes.
+    if (tutorialPhase === 'coach' || tutorialPhase === 'celebrate') return;
+    if (wmNoticedJobRef.current === jobId || watermarkNoticeDismissed(jobId)) return;
+    wmNoticedJobRef.current = jobId;
+    const t = setTimeout(() => { if (jobIdRef.current === jobId) setShowWmNotice(true); }, 2500);
+    return () => clearTimeout(t);
+  }, [status, plan, isManaged, jobId, results?.clips?.length, tutorialPhase]);
+
+  // Paying re-points the clips already on screen at their clean twins (the API
+  // does it from the Stripe webhook, a few seconds after the plan flips, plus
+  // a few more per clip when the twin is encoded then: clean_twin.py). Chase
+  // the job result until no served file carries the wm_ prefix, then refresh
+  // the durable map so the players switch to the clean R2 copies too.
+  useEffect(() => {
+    if (!isManaged || !jobId || !plan || plan === 'free') return;
+    const isMarked = (c) => /\/wm_[^/]*$/.test(c?.video_url || '');
+    if (!(results?.clips || []).some(isMarked)) return;
+    let cancelled = false;
+    (async () => {
+      for (const delay of [1500, 3000, 6000, 12000, 20000, 30000, 45000]) {
+        await new Promise((r) => setTimeout(r, delay));
+        if (cancelled || jobIdRef.current !== jobId) return;
+        let data;
+        try { data = await pollJob(jobId); } catch { continue; }
+        if (cancelled || jobIdRef.current !== jobId) return;
+        if (data?.result) setResults(data.result);
+        if (!(data?.result?.clips || []).some(isMarked)) {
+          fetchDurableMap().then((m) => { if (!cancelled) setDurableClips(m); }).catch(() => {});
+          return;
+        }
+      }
+    })();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [plan, isManaged, jobId]);
+
   const chaseDurableFile = async (index, expectedFile) => {
     const forJob = jobId;
     for (const delay of [2500, 6000, 15000, 30000]) {
@@ -462,6 +617,7 @@ function App() {
         start: data.start,
         end: data.end,
         recipe: data.recipe,
+        mode: data.mode ?? clips[index].mode,
       };
       return { ...prev, clips };
     });
@@ -485,6 +641,38 @@ function App() {
     handleClipStateChange(index, { activeLayers: null, serverVideoFile: newFile });
   };
 
+  // Whether a job's source video can still be played (a paid job's is kept in
+  // storage for a while; older ones and the free plan's are gone). Asked of a
+  // player of its own: playing it is the only honest test, and a missing
+  // source must leave the panel as it was, not a dead player.
+  const sourcePlayable = async (id) => {
+    try {
+      const res = await apiFetch(`/api/source-url/${id}`);
+      if (!res.ok) return false;
+      const { url } = await res.json();
+      if (!url) return false;
+      return await new Promise((resolve) => {
+        const probe = document.createElement('video');
+        let settled = false;
+        const done = (ok) => {
+          if (settled) return;
+          settled = true;
+          probe.removeAttribute('src');
+          probe.load();
+          resolve(ok);
+        };
+        probe.preload = 'metadata';
+        probe.muted = true;
+        probe.onloadedmetadata = () => done(true);
+        probe.onerror = () => done(false);
+        setTimeout(() => done(false), 15000);
+        probe.src = getApiUrl(url);
+      });
+    } catch {
+      return false;
+    }
+  };
+
   // Reopen an archived project from the History tab: the backend re-downloads
   // its files from R2 into the server's working dir and returns the full state.
   const restoreProject = async (projectJobId) => {
@@ -495,10 +683,18 @@ function App() {
     setJobId(data.job_id);
     setResults(data.result || null);
     setLogs(['♻️ Project restored from your library.']);
+    setLogTimes([Date.now() / 1000]);
     setProcessingMedia(null);
     setQualityGate(null);
     setStatus('complete');
     setActiveTab('dashboard');
+    // The long video comes back next to the clips when it is still there, so
+    // a clip can be checked against it before lengthening or trimming it.
+    sourcePlayable(data.job_id).then((ok) => {
+      if (!ok || jobIdRef.current !== data.job_id) return;
+      setNoSource(false);
+      setProcessingMedia({ type: 'server', payload: `/api/source/${data.job_id}` });
+    });
   };
 
   const openJob = async (id) => {
@@ -539,11 +735,15 @@ function App() {
             border_width: options.borderWidth,
             bg_color: options.bgColor,
             bg_opacity: options.bgOpacity,
-            style: options.style || 'classic',
+            style: options.style || 'pill',
             highlight_color: options.highlightColor || '#FFD700',
             effect: options.effect || 'none',
             base_opacity: options.baseOpacity ?? 1.0,
             uppercase: options.uppercase || false,
+            reveal: options.reveal || false,
+            shadow: options.shadow || 0,
+            max_chars: options.maxChars ?? null,
+            max_duration: options.maxDuration ?? null,
             // Chain from the clip's current server file (its video_url basename).
             input_filename: (clips[i].video_url || '').split('/').pop(),
           }),
@@ -759,14 +959,39 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isManaged, jobId, status, results?.clips?.length]);
 
+  // Read at failure time: the poll effect must not restart when auth settles.
+  const historyAvailableRef = useRef(false);
+  historyAvailableRef.current = billingEnabled && isSignedIn;
+  const handleResetRef = useRef(null);
+
   useEffect(() => {
-    let interval;
-    let cancelled = false;
-    if ((status === 'processing' || status === 'completed') && jobId) {
-      interval = setInterval(async () => {
+    let timer;
+    let stopped = false;
+    let failures = 0;
+    // One poll at a time (the next is scheduled when this one answers, so a
+    // slow server never gets a pile of them), and at the pace the job needs:
+    // every 2 s while it renders, 5 s while it waits in the queue, 15 s in a
+    // tab nobody is looking at.
+    let nextDelay = 2000;
+    let inFlight = false;
+    const stop = () => { stopped = true; clearTimeout(timer); };
+    const schedule = () => {
+      if (stopped) return;
+      const delay = (typeof document !== 'undefined' && document.hidden) ? 15000 : nextDelay;
+      timer = setTimeout(tick, delay);
+    };
+    const onVisible = () => {
+      if (!stopped && !inFlight && typeof document !== 'undefined' && !document.hidden) {
+        clearTimeout(timer);
+        timer = setTimeout(tick, 0);
+      }
+    };
+    const tick = async () => {
+        if (stopped || inFlight) return;
+        inFlight = true;
         try {
           const data = await pollJob(jobId);
-          if (cancelled) return;
+          failures = 0;
           console.log("Job status:", data);
 
           // Update results if available (real-time)
@@ -775,27 +1000,52 @@ function App() {
           }
 
           if (data.partial) setPartialJob(data.partial);
+          setQueueInfo(data.status === 'queued' && data.queue ? data.queue : null);
+          nextDelay = data.status === 'queued' ? 5000 : 2000;
 
           if (data.status === 'completed') {
+            setQueueInfo(null);
             setStatus('complete');
-            clearInterval(interval);
+            stop();
             refreshMe();
           } else if (data.status === 'failed') {
             setStatus('error');
             const errorMsg = data.error || (data.logs && data.logs.length > 0 ? data.logs[data.logs.length - 1] : "Process failed");
+            setJobError(readableError(errorMsg));
             setLogs(prev => [...prev, "Error: " + errorMsg]);
-            clearInterval(interval);
+            stop();
             refreshMe();
           } else {
             // Update logs if available
-            if (data.logs) setLogs(data.logs);
+            if (data.logs) {
+              setLogs(data.logs);
+              setLogTimes(data.log_times || []);
+            }
           }
         } catch (e) {
           console.error("Polling error", e);
+          failures += 1;
+          if (pollFailureAction(e, failures) === 'gone') {
+            stop();
+            // Back to idle (which drops the saved session) and on to History,
+            // where a finished job's clips are kept.
+            handleResetRef.current();
+            setSessionRecovered(false);
+            setJobGone(true);
+            if (historyAvailableRef.current) setActiveTab('history');
+          }
         }
-      }, 2000);
+        inFlight = false;
+        schedule();
+    };
+    if ((status === 'processing' || status === 'completed') && jobId) {
+      document.addEventListener('visibilitychange', onVisible);
+      timer = setTimeout(tick, 2000);
     }
-    return () => { cancelled = true; clearInterval(interval); };
+    return () => {
+      stop();
+      document.removeEventListener('visibilitychange', onVisible);
+    };
   }, [status, jobId, refreshMe]);
 
 
@@ -878,9 +1128,81 @@ function App() {
 
   const tutorialLock = tutorialPhase === 'intro' || tutorialPhase === 'coach' || tutorialPhase === 'celebrate';
 
+  // Sign-up survey (cloud/onboarding.py): before the tutorial intro, never
+  // during the coach phase or the celebration. It may open while a job runs or
+  // once it is done: a link pasted on the landing resumes straight into
+  // processing after sign-in, and gating on 'idle' left ~half of all sign-ups
+  // (the landing-paste flow, 98% of whom never come back) unasked.
+  const [surveyDone, setSurveyDone] = useState(false);
+  const showSurvey = billingEnabled && !!me?.onboarding_survey_pending && !surveyDone
+    && (tutorialPhase === null || tutorialPhase === 'intro') && status !== 'error';
+
   useEffect(() => {
     if (tutorialLock && activeTab !== 'dashboard') setActiveTab('dashboard');
   }, [tutorialLock, activeTab]);
+
+  // Deep links into a tab: #app?tab=autopilot (Autopilot emails, the social
+  // connect page's return URL). Read once per hash change, then the query is
+  // dropped so a reload does not keep forcing the tab.
+  const [autopilotConnected, setAutopilotConnected] = useState(null); // connect outcome, see lib/connectReturn.js
+  useEffect(() => {
+    const DEEP_LINK_TABS = ['autopilot', 'history', 'settings', 'thumbnails', 'dashboard', 'saasshorts'];
+    const apply = () => {
+      const hash = window.location.hash || '';
+      if (!hash.startsWith('#app?')) return;
+      const params = new URLSearchParams(hash.slice(5));
+      const tab = params.get('tab');
+      if (!tab || !DEEP_LINK_TABS.includes(tab)) return;  // e.g. #app?tutorial=1
+      setActiveTab(tab);
+      // The connect outcome rides in the query string, not in the hash
+      // (lib/connectReturn.js): a cancel also comes back with connected=1.
+      if (tab === 'autopilot' && params.get('connected') === '1') {
+        setAutopilotConnected(readConnectReturn(window.location.search));
+      }
+      try {
+        window.history.replaceState(null, '', `${window.location.pathname}${stripConnectReturn(window.location.search)}#app`);
+      } catch (_) { /* ignore */ }
+    };
+    apply();
+    window.addEventListener('hashchange', apply);
+    return () => window.removeEventListener('hashchange', apply);
+  }, []);
+
+  // Signed out on a tab that needs a session (the clips-ready email links to
+  // #app?tab=history): remember it, so the sign-in comes back here instead of
+  // to the Clip Generator (lib/tabAfterLogin, read by AuthContext).
+  useEffect(() => {
+    if (billingEnabled && !authLoading && !isSignedIn) rememberTabAfterLogin(activeTab);
+  }, [billingEnabled, authLoading, isSignedIn, activeTab]);
+
+  // #app?checkout=cancel: back from a Stripe checkout opened inside the app
+  // (cancel_url in cloud/billing.py), so the user lands on their clips again.
+  useEffect(() => {
+    const hash = window.location.hash || '';
+    if (!hash.startsWith('#app?') || new URLSearchParams(hash.slice(5)).get('checkout') !== 'cancel') return;
+    track('CheckoutCanceled', { props: { back_to: 'app' } });
+    try { window.history.replaceState(null, '', '#app'); } catch (_) { /* ignore */ }
+  }, []);
+
+  // #app?login=1: the "Log in" link of the site nav (seo/nav.js). Opens the
+  // sign-in dialog once the session is known (already signed in: just the
+  // app), then drops the query so a reload does not reopen it.
+  const wantsLogin = () => {
+    const hash = window.location.hash || '';
+    return hash.startsWith('#app?') && new URLSearchParams(hash.slice(5)).get('login') === '1';
+  };
+  const [loginRequested, setLoginRequested] = useState(wantsLogin);
+  useEffect(() => {
+    const onHash = () => { if (wantsLogin()) setLoginRequested(true); };
+    window.addEventListener('hashchange', onHash);
+    return () => window.removeEventListener('hashchange', onHash);
+  }, []);
+  useEffect(() => {
+    if (!loginRequested || authLoading) return;
+    setLoginRequested(false);
+    if (billingEnabled && !isSignedIn) setShowLogin(true);
+    try { window.history.replaceState(null, '', '#app'); } catch (_) { /* ignore */ }
+  }, [loginRequested, authLoading, billingEnabled, isSignedIn]);
 
   useEffect(() => {
     if (tutorialPhase === 'coach' && status === 'complete' && (results?.clips?.length > 0)) {
@@ -917,7 +1239,33 @@ function App() {
   // connected yet. userProfiles being empty (not yet fetched / none created)
   // also counts as "not connected" — that is the 97% case.
   const connectedSocials = ((userProfiles.find((p) => p.username === uploadUserId) || userProfiles[0])?.connected) || [];
-  const showSocialNudge = isManaged && !socialNudgeDismissed && connectedSocials.length === 0 && !tutorialLock;
+  const showAutopilotNudge = billingEnabled && isManaged && !autopilotNudgeDismissed && !autopilotOn && !tutorialLock;
+  const showSocialNudge = isManaged && !socialNudgeDismissed && connectedSocials.length === 0 && !tutorialLock
+    && !showAutopilotNudge;
+
+  // Paid plans may already run Autopilot: ask once, on the first results.
+  const autopilotCheckedRef = useRef(false);
+  useEffect(() => {
+    if (status !== 'complete' || !showAutopilotNudge || plan === 'free' || autopilotCheckedRef.current) return;
+    autopilotCheckedRef.current = true;
+    apiJson('/api/autopilot')
+      .then((d) => { if (d?.settings?.enabled) setAutopilotOn(true); })
+      .catch(() => { /* keep the nudge */ });
+  }, [status, showAutopilotNudge, plan]);
+
+  const dismissAutopilotNudge = (event) => {
+    track(event);
+    setAutopilotNudgeDismissed(true);
+    try { localStorage.setItem('os_autopilot_nudge_dismissed', '1'); } catch (_) { /* ignore */ }
+  };
+
+  const autopilotNudgeSeenRef = useRef(null);
+  useEffect(() => {
+    if (status === 'complete' && (results?.clips?.length > 0) && showAutopilotNudge && autopilotNudgeSeenRef.current !== jobId) {
+      autopilotNudgeSeenRef.current = jobId;
+      track('AutopilotNudgeSeen', { props: { plan: plan || 'free' } });
+    }
+  }, [status, results, showAutopilotNudge, jobId, plan]);
 
   // One Seen event per job, only when the banner actually rendered.
   const socialNudgeSeenRef = useRef(null);
@@ -935,6 +1283,7 @@ function App() {
       // Same tab so the connect page's redirectUrl brings the user back into the app.
       if (access_url) window.location.href = access_url;
     } catch (e) {
+      if (e instanceof QuotaError) { openQuotaWall(e, 'social_connect'); return; }
       alert('Could not open the connection page. Please try again.');
     }
   };
@@ -946,6 +1295,7 @@ function App() {
       const { access_url } = await apiJson('/api/social/connect', { method: 'POST' });
       if (access_url) window.open(access_url, '_blank', 'noopener');
     } catch (e) {
+      if (e instanceof QuotaError) { openQuotaWall(e, 'calendar'); return; }
       alert('Could not open the calendar. Please try again.');
     }
   };
@@ -967,7 +1317,9 @@ function App() {
     // Past every gate, so this request is really running: nothing left to resume.
     clearPendingJob();
     setStatus('processing');
+    setJobError('');
     setLogs(["Starting process..."]);
+    setLogTimes([Date.now() / 1000]);
     setResults(null);
     // Studio handovers have no local media object; the preview switches to the
     // backend-served source once the job id is known.
@@ -976,6 +1328,7 @@ function App() {
     setProjectState(null);
     setNoSource(false);
     setPartialJob(null);
+    setFirstVideoJob(false);
 
     try {
       let body;
@@ -992,12 +1345,15 @@ function App() {
         // Sent explicitly both ways: absent means off for raw API callers,
         // but the dashboard always states the user's choice.
         auto_hook: data.autoHook ? '1' : '0',
-        auto_hook_style: data.autoHook ? (data.autoHookStyle || 'classic') : null,
+        auto_hook_style: data.autoHook ? (data.autoHookStyle || 'pill') : null,
         // 'auto' is the server default, so only a deliberate choice travels.
         layouts: data.layout && data.layout !== 'auto' ? data.layout : null,
         // Set when the user took the quota wall's "clip the first N minutes"
         // offer: the server reserves N minutes and cuts the source to them.
         max_minutes: data.maxMinutes || null,
+        // The stretch picked under the cost line (seconds); absent = whole video.
+        source_start: data.sourceStart ?? null,
+        source_end: data.sourceEnd ?? null,
       };
 
       if (data.type === 'url') {
@@ -1045,6 +1401,13 @@ function App() {
 
       setJobId(resData.job_id);
       setPartialJob(resData.partial || null);
+      setFirstVideoJob(!!resData.first_video);
+      // The server clipped past the balance on its own (no wall): the first
+      // video whole, or the first N minutes of a later one.
+      if (resData.first_video) track('FirstVideoGrant');
+      else if (resData.partial && !resData.partial.chosen && data.maxMinutes == null) {
+        track('AutoPartial', { props: { processed: resData.partial.processed_minutes, total: resData.partial.total_minutes } });
+      }
       if (data.type === 'thumbnail_session') {
         setProcessingMedia({ type: 'server', payload: `/api/source/${resData.job_id}` });
       }
@@ -1052,6 +1415,14 @@ function App() {
       refreshMe();
 
     } catch (e) {
+      if (e instanceof QuotaError && e.code === 'free_queue_full') {
+        // The free queue is full: nothing was reserved or spent. Same plan
+        // wall, its own copy and source so the funnel is measured apart.
+        setStatus('idle');
+        setTopUpInfo({ context: 'queue_full', source: 'queue_full', highlight: 'starter' });
+        setShowTopUp(true);
+        return;
+      }
       if (e instanceof QuotaError) {
         setStatus('idle');
         refreshMe();
@@ -1079,8 +1450,10 @@ function App() {
         }
         return;
       }
+      const reason = readableError(e.message);
+      setJobError(reason);
       setStatus('error');
-      setLogs(l => [...l, `Error starting job: ${e.message}`]);
+      setLogs(l => [...l, `Error starting job: ${reason}`]);
     }
   };
 
@@ -1106,6 +1479,7 @@ function App() {
   }, [billingEnabled, isSignedIn]);
 
   const handleReset = () => {
+    setJobGone(false);
     // Flush any pending edit-state sync before dropping the project: the clips
     // themselves are already archived to R2 as they were edited.
     flushClipState();
@@ -1113,12 +1487,19 @@ function App() {
     setJobId(null);
     setResults(null);
     setLogs([]);
+    setLogTimes([]);
     setProcessingMedia(null);
     setProjectState(null);
     setNoSource(false);
     setPartialJob(null);
+    setFirstVideoJob(false);
+    setQueueInfo(null);
+    setJobError('');
     localStorage.removeItem(SESSION_KEY);
   };
+  useEffect(() => {
+    handleResetRef.current = handleReset;
+  });
 
   // --- UI Components ---
 
@@ -1127,15 +1508,17 @@ function App() {
   // wraps to two lines in a 5-up bar on a 360px phone.
   const navItems = [
     { id: 'dashboard', ord: '01', icon: LayoutDashboard, label: 'Clip Generator', short: 'clips', primary: true },
-    { id: 'saasshorts', ord: '02', icon: Sparkles, label: 'AI Shorts', short: 'ai shorts', byok: true, primary: true },
-    { id: 'ai-agent', ord: '03', icon: Bot, label: 'AI Agent', short: 'agent', byok: true },
-    { id: 'ugc-gallery', ord: '04', icon: LayoutGrid, label: 'UGC Gallery', short: 'gallery', primary: true },
-    { id: 'thumbnails', ord: '05', icon: Image, label: 'YouTube Studio', short: 'studio', primary: true },
     ...(ownerWorkspace ? [{ id: 'factory', icon: LayoutGrid, label: 'Content factory', short: 'factory' }] : []),
     ...(ownerWorkspace ? [{ id: 'sources', icon: Youtube, label: 'Source channels', short: 'sources' }] : []),
     ...(ownerWorkspace ? [{ id: 'library', icon: Download, label: 'Manage clips', short: 'library' }] : []),
-    ...((ownerWorkspace || (billingEnabled && isSignedIn)) ? [{ id: 'history', ord: '06', icon: History, label: 'History', short: 'history' }] : []),
-    { id: 'settings', ord: '07', icon: Settings, label: 'Settings', short: 'settings' },
+    // Cloud only: it runs on the managed pipeline and the Upload-Post connection.
+    ...(billingEnabled ? [{ id: 'autopilot', ord: '02', icon: Rocket, label: 'Autopilot', short: 'autopilot', isNew: true }] : []),
+    { id: 'saasshorts', ord: '03', icon: Sparkles, label: 'AI Shorts', short: 'ai shorts', byok: true, primary: true },
+    { id: 'ai-agent', ord: '04', icon: Bot, label: 'AI Agent', short: 'agent', byok: true },
+    { id: 'ugc-gallery', ord: '05', icon: LayoutGrid, label: 'UGC Gallery', short: 'gallery', primary: true },
+    { id: 'thumbnails', ord: '06', icon: Image, label: 'YouTube Studio', short: 'studio', primary: true },
+    ...((ownerWorkspace || (billingEnabled && isSignedIn)) ? [{ id: 'history', ord: '07', icon: History, label: 'History', short: 'history' }] : []),
+    { id: 'settings', ord: '08', icon: Settings, label: 'Settings', short: 'settings' },
   ];
   const activeNav = navItems.find((n) => n.id === activeTab);
 
@@ -1199,7 +1582,7 @@ function App() {
   // entirely — an unlabelled 80px rail ate a fifth of a phone screen.
   const Sidebar = () => (
     <div className="hidden md:flex w-20 lg:w-64 bg-paper2 border-r border-rule flex-col h-full shrink-0 transition-all duration-300">
-      <a href="#landing" className="p-6 flex items-center gap-3" title="go to landing page">
+      <a href="#app" onClick={() => goToTab('dashboard')} className="p-6 flex items-center gap-3" title="openshorts home">
         <div className="w-8 h-8 bg-paper3 rounded-input flex items-center justify-center shrink-0 overflow-hidden border border-rule">
           <img src="/logo-openshorts.png" alt="Logo" className="w-full h-full object-cover" />
         </div>
@@ -1226,7 +1609,8 @@ function App() {
               <span className="text-sm lowercase hidden lg:block flex-1 text-left truncate">{item.label}</span>
               {tabLocked(item.id)
                 ? <Lock size={12} className="shrink-0 hidden lg:block" />
-                : item.byok ? <span className="readout hidden lg:block">BYOK</span> : null}
+                : item.byok ? <span className="readout hidden lg:block">BYOK</span>
+                  : item.isNew ? <span className="badge-brass hidden lg:block">new</span> : null}
               <span className="readout hidden lg:block">{item.ord}</span>
             </button>
           );
@@ -1254,7 +1638,7 @@ function App() {
       />
       <div className="relative w-[17rem] max-w-[82vw] h-full bg-paper2 border-r border-rule flex flex-col animate-slide-in-left">
         <div className="flex items-center justify-between px-5 h-14 border-b border-rule shrink-0">
-          <a href="#landing" className="flex items-center gap-2.5" onClick={() => setNavOpen(false)}>
+          <a href="#app" className="flex items-center gap-2.5" onClick={() => goToTab('dashboard')}>
             <div className="w-7 h-7 bg-paper3 rounded-input overflow-hidden border border-rule shrink-0">
               <img src="/logo-openshorts.png" alt="" className="w-full h-full object-cover" />
             </div>
@@ -1289,7 +1673,8 @@ function App() {
                 <span className="text-[0.95rem] lowercase flex-1 text-left truncate">{item.label}</span>
                 {tabLocked(item.id)
                   ? <Lock size={12} className="shrink-0" />
-                  : item.byok ? <span className="readout shrink-0">BYOK</span> : null}
+                  : item.byok ? <span className="readout shrink-0">BYOK</span>
+                    : item.isNew ? <span className="badge-brass shrink-0">new</span> : null}
               </button>
             );
           })}
@@ -1394,7 +1779,7 @@ function App() {
                 failing against the quota wall. */}
             {billingEnabled && isManaged && (
               <UsageMeter onClick={() => {
-                if (plan === 'free') { setTopUpInfo({ context: 'upsell' }); setShowTopUp(true); }
+                if (plan === 'free') openUpsell({ source: 'meter' });
                 else { window.location.hash = '#/account'; }
               }} />
             )}
@@ -1410,7 +1795,7 @@ function App() {
                 Sign in
               </button>
             )}
-            {billingEnabled && isSignedIn && <ProfileMenu />}
+            {billingEnabled && isSignedIn && <ProfileMenu onUpgrade={isManaged ? openUpsell : null} />}
 
             {/* Hidden below sm: the standing banner underneath already says the
                 same thing, and two warnings in a 360px header is just noise. */}
@@ -1469,6 +1854,28 @@ function App() {
           </div>
         )}
 
+        {/* The restored job is no longer on the server (purged or not yours). */}
+        {jobGone && (
+          <div role="status" className="mx-3 sm:mx-6 mt-2 px-3.5 sm:px-4 py-3 bg-paper2 border border-rule rounded-card flex items-start justify-between gap-3 animate-fade shrink-0">
+            <div className="flex items-start sm:items-center gap-2 text-sm text-ink2 flex-wrap min-w-0">
+              <History size={16} className="text-brass shrink-0 mt-0.5 sm:mt-0" />
+              <span className="font-medium">That project is no longer open</span>
+              <span className="text-muted text-xs">
+                {billingEnabled && isSignedIn
+                  ? 'If it finished, its clips are saved in History.'
+                  : 'The server has already cleared it. Start a new project to keep going.'}
+              </span>
+            </div>
+            <button
+              onClick={() => setJobGone(false)}
+              aria-label="dismiss"
+              className="text-muted hover:text-ink transition-colors shrink-0 -m-1 p-1"
+            >
+              <X size={16} />
+            </button>
+          </div>
+        )}
+
         {/* Included tools (Clip Generator, YouTube Studio): non-blocking trial prompt. */}
         {gateThisTab && <TrialGate toolName={TOOL_NAMES[activeTab] || 'this'} />}
 
@@ -1486,7 +1893,7 @@ function App() {
             <div className="h-full overflow-y-auto p-4 sm:p-8 max-w-2xl mx-auto animate-fade">
               <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-4 mb-8">
                 <div>
-                  <p className="eyebrow mb-1.5">07 · SETTINGS</p>
+                  <p className="eyebrow mb-1.5">08 · SETTINGS</p>
                   <h1 className="font-display lowercase text-2xl text-ink">Settings</h1>
                 </div>
                 <div className="flex items-center gap-2 text-xs text-muted mt-1">
@@ -1849,11 +2256,47 @@ function App() {
             </div>
           )}
 
+          {/* View: Autopilot */}
+          {activeTab === 'autopilot' && (
+            <div className="h-full overflow-y-auto custom-scrollbar animate-fade">
+              <div className="max-w-6xl mx-auto p-4 sm:p-6 md:p-8">
+                {isSignedIn ? (
+                  <AutopilotTab
+                    onOpenProject={restoreProject}
+                    onUpgrade={() => (isManaged ? openUpsell({ source: 'autopilot' }) : setShowPlanChoice(true))}
+                    justConnected={autopilotConnected}
+                  />
+                ) : (
+                  <div className="max-w-2xl mx-auto card p-8 text-center">
+                    <Rocket size={28} className="mx-auto mb-4 text-brass" />
+                    <h1 className="font-display lowercase text-2xl text-ink mb-2">your channel, clipped on its own</h1>
+                    <p className="text-muted text-sm mb-6">
+                      Connect your YouTube channel and every new video turns into shorts automatically.
+                      Sign in to set it up.
+                    </p>
+                    <button onClick={() => setShowLogin(true)} className="btn-primary">sign in</button>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
           {/* View: History */}
           {activeTab === 'history' && (
             <div className="h-full overflow-y-auto custom-scrollbar animate-fade">
               <div className="max-w-6xl mx-auto p-4 sm:p-6 md:p-8">
-                {ownerWorkspace ? <JobHistory onOpen={openJob} onRetry={openJob} /> : <HistoryTab onReopenProject={restoreProject} />}
+                {ownerWorkspace ? <JobHistory onOpen={openJob} onRetry={openJob} /> : billingEnabled && !isSignedIn ? (
+                  <div className="max-w-2xl mx-auto card p-8 text-center">
+                    <History size={28} className="mx-auto mb-4 text-brass" />
+                    <h1 className="font-display lowercase text-2xl text-ink mb-2">your clips are saved to your account</h1>
+                    <p className="text-muted text-sm mb-6">
+                      Sign in with the email address you used to create them and they open right here.
+                    </p>
+                    <button onClick={() => setShowLogin(true)} className="btn-primary">sign in</button>
+                  </div>
+                ) : (
+                  <HistoryTab onReopenProject={restoreProject} />
+                )}
               </div>
             </div>
           )}
@@ -1941,6 +2384,61 @@ function App() {
                   </span>
                 </div>
 
+                {/* Trimmed run: say it while it renders, not only once the
+                    clips land, so the shorter result is no surprise. */}
+                {status === 'processing' && partialJob && !partialJob.chosen && plan === 'free' && isManaged && (
+                  <button
+                    onClick={() => openUpsell({ source: 'partial_processing', partialJob })}
+                    className="mb-4 w-full text-left rounded-card border border-brass/40 bg-brass/5 px-4 py-3 text-sm hover:border-brass transition-colors"
+                  >
+                    <span className="text-ink">Clipping the first {partialJob.processed_minutes} of {partialJob.total_minutes} minutes with your free minutes.</span>{' '}
+                    <span className="text-brass font-medium">Clip the whole video →</span>
+                  </button>
+                )}
+
+                {/* Waiting in line: say where and for how long, and that paid
+                    plans go first (they do: plan priority in the job queue). */}
+                {status === 'processing' && queueInfo && (
+                  <div className="mb-4 rounded-card border border-brass/40 bg-brass/5 px-4 py-3 text-sm">
+                    <p className="text-ink">
+                      {queueInfo.ahead === 0
+                        ? 'You are next in line. Starting in a moment…'
+                        : <>You are <b>#{queueInfo.position}</b> in line · {queueInfo.eta_is_minimum ? 'at least' : 'about'} <b>{Math.max(1, Math.round(queueInfo.eta_seconds / 60))} min</b></>}
+                    </p>
+                    {queueSlow ? (
+                      /* The free queue is saturated and this video is far
+                         back in it: later arrivals can still pass it
+                         (eta_is_minimum), so the wait is hours, not minutes.
+                         Said here, when it is this user's wait, with the one
+                         thing that changes it. All of it is how the queue
+                         works: plan priority, and paying re-keys the video
+                         already in line. */
+                      <>
+                        <p className="mt-1 text-muted">
+                          High demand right now: free videos wait behind paid ones and this can take hours.
+                          We are adding capacity.
+                        </p>
+                        <button
+                          onClick={() => { track('QueueUpsellClick', { props: { position: String(queueInfo.position), slow: '1' } }); if (isManaged) openUpsell({ source: 'queue' }); else setShowPlanChoice(true); }}
+                          className="btn-primary mt-3"
+                        >
+                          Skip the line with a plan
+                        </button>
+                        <p className="mt-2 text-xs text-muted">
+                          Paid videos are usually ready in minutes, and this one moves to the front as soon as you subscribe.
+                        </p>
+                      </>
+                    ) : billingEnabled && !['starter', 'creator', 'pro'].includes(plan) && queueInfo.ahead > 0 && (
+                      <button
+                        onClick={() => { track('QueueUpsellClick', { props: { position: String(queueInfo.position) } }); if (isManaged) openUpsell({ source: 'queue' }); else setShowPlanChoice(true); }}
+                        className="mt-2 text-xs lowercase text-brass hover:underline"
+                      >
+                        paid plans skip the line →
+                      </button>
+                    )}
+                  </div>
+                )}
+
                 {/* Video Preview */}
                 {processingMedia && (
                   <ProcessingAnimation
@@ -1995,7 +2493,9 @@ function App() {
                     <div className="flex-1 p-3.5 sm:p-4 overflow-y-auto font-mono text-[11px] sm:text-xs space-y-1.5 custom-scrollbar text-muted break-words">
                       {logs.map((log, i) => (
                         <div key={i} className={`flex gap-2 ${log.toLowerCase().includes('error') ? 'text-danger' : 'text-muted'}`}>
-                          <span className="text-muted opacity-50 shrink-0 hidden sm:inline">{new Date().toLocaleTimeString()}</span>
+                          <span className="text-muted opacity-50 shrink-0 hidden sm:inline tabular-nums">
+                            {logTimes[i] ? new Date(logTimes[i] * 1000).toLocaleTimeString() : ''}
+                          </span>
                           <span className="min-w-0 break-words">{log}</span>
                         </div>
                       ))}
@@ -2015,7 +2515,11 @@ function App() {
                 <div className="mb-4 sm:mb-6 shrink-0 space-y-3">
                   <h2 className="font-display lowercase text-lg sm:text-xl text-ink flex flex-wrap items-center gap-2">
                     <span className="mr-auto">Generated Shorts</span>
-                    {results?.clips?.length > 0 && (
+                    {clipsMaking ? (
+                      <span className="readout bg-paper3 px-2.5 py-1 rounded-full text-brass">
+                        {progress.ready}/{progress.total} Clips
+                      </span>
+                    ) : results?.clips?.length > 0 && (
                       <span className="readout bg-paper3 px-2.5 py-1 rounded-full">
                         {results.clips.length} Clips
                       </span>
@@ -2026,6 +2530,18 @@ function App() {
                       </span>
                     )}
                   </h2>
+                  {clipsMaking && (
+                    <div
+                      className="h-1 rounded-full bg-paper3 overflow-hidden"
+                      role="progressbar" aria-valuemin={0} aria-valuemax={progress.total} aria-valuenow={progress.ready}
+                      aria-label="Clips ready"
+                    >
+                      <div
+                        className="h-full bg-brass transition-all duration-500"
+                        style={{ width: `${(progress.ready / progress.total) * 100}%` }}
+                      />
+                    </div>
+                  )}
                   {results?.clips?.length > 0 && status === 'complete' && (
                     <div className="flex flex-col sm:flex-row sm:justify-end items-stretch sm:items-center gap-2">
                       <button
@@ -2055,9 +2571,9 @@ function App() {
                   <div className="mb-2 space-y-2">
                     {/* Partial job: the clips on screen come from the first N
                         minutes only. Say so, and sell the rest of the video. */}
-                    {partialJob && (
+                    {partialJob && !partialJob.chosen && (
                       <button
-                        onClick={() => { setTopUpInfo({ context: 'upsell' }); setShowTopUp(true); }}
+                        onClick={() => openUpsell({ source: 'partial_banner', partialJob })}
                         className="w-full text-left px-3 py-2.5 rounded-input bg-paper3 border border-brass/40 hover:border-brass text-sm transition-colors"
                       >
                         <span className="text-ink">These clips come from the first {partialJob.processed_minutes} of {partialJob.total_minutes} minutes.</span>{' '}
@@ -2066,15 +2582,69 @@ function App() {
                     )}
                     {/* Peak-moment upsell: they just SAW their clips — sell while
                         they're proud of the result, before asking for stars. */}
-                    {plan === 'free' && !partialJob && (
+                    {firstVideoJob && !partialJob && (
                       <button
-                        onClick={() => { setTopUpInfo({ context: 'upsell' }); setShowTopUp(true); }}
+                        onClick={() => openUpsell({ source: 'first_video_banner' })}
                         className="w-full text-left px-3 py-2.5 rounded-input bg-paper3 border border-brass/40 hover:border-brass text-sm transition-colors"
                       >
-                        <span className="text-ink">Like these clips?</span>{' '}
-                        <span className="text-muted">They carry a watermark and delete in 7 days.</span>{' '}
-                        <span className="text-brass font-medium">Keep them forever →</span>
+                        <span className="text-ink">Your first video is on us: we clipped all of it.</span>{' '}
+                        <span className="text-muted">That used this month's free minutes.</span>{' '}
+                        <span className="text-brass font-medium">Keep clipping →</span>
                       </button>
+                    )}
+                    {plan === 'free' && (!partialJob || partialJob.chosen) && !firstVideoJob && (
+                      <button
+                        onClick={() => openUpsell({ source: 'results_banner' })}
+                        className="w-full text-left px-3 py-2.5 rounded-input bg-paper3 border border-brass/40 hover:border-brass text-sm transition-colors"
+                      >
+                        <span className="text-ink">
+                          {results?.clips?.length <= FREE_CLIPS_QUIET
+                            ? `The free plan makes the ${FREE_CLIPS_PER_VIDEO} to ${FREE_CLIPS_QUIET} best clips of each video.`
+                            : 'Like these clips?'}
+                        </span>{' '}
+                        <span className="text-muted">
+                          {results?.clips?.length <= FREE_CLIPS_QUIET
+                            ? `Plans get every clip, up to ${MAX_CLIPS_PER_VIDEO} per video, and these lose the watermark on the spot.`
+                            : 'Upgrade and these exact clips lose the watermark on the spot, and stay for good.'}
+                        </span>{' '}
+                        <span className="text-brass font-medium">
+                          {results?.clips?.length <= FREE_CLIPS_QUIET ? 'Get every clip →' : 'Remove the watermark →'}
+                        </span>
+                      </button>
+                    )}
+                    {showAutopilotNudge && (
+                      <div className="w-full flex flex-col sm:flex-row sm:items-center gap-2 sm:gap-3 px-3 py-2.5 rounded-input bg-paper3 border border-rule text-sm">
+                        <div className="flex items-start gap-3 flex-1 min-w-0">
+                          <Rocket size={16} className="text-brass shrink-0 mt-0.5" />
+                          <div className="min-w-0 leading-relaxed">
+                            <span className="text-ink">Want this for every new video, without coming back?</span>{' '}
+                            <span className="text-muted">
+                              Autopilot watches your YouTube channel and clips each new upload on its own
+                              {plan === 'free' ? ', included in every paid plan.' : '.'}
+                            </span>
+                          </div>
+                          <button
+                            onClick={() => dismissAutopilotNudge('AutopilotNudgeDismissed')}
+                            aria-label="dismiss"
+                            className="sm:hidden shrink-0 -m-1 p-1 text-muted hover:text-ink"
+                          >
+                            <X size={16} />
+                          </button>
+                        </div>
+                        <button
+                          onClick={() => { dismissAutopilotNudge('AutopilotNudgeClicked'); setActiveTab('autopilot'); }}
+                          className="btn-quiet shrink-0 text-xs py-1.5 px-3 lowercase w-full sm:w-auto"
+                        >
+                          set up autopilot →
+                        </button>
+                        <button
+                          onClick={() => dismissAutopilotNudge('AutopilotNudgeDismissed')}
+                          aria-label="dismiss"
+                          className="hidden sm:block shrink-0 p-1 text-muted hover:text-ink"
+                        >
+                          <X size={14} />
+                        </button>
+                      </div>
                     )}
                     {/* Distribution nudge at the same peak: clips on screen,
                         publishing them is one connect away. Hidden once any
@@ -2132,7 +2702,7 @@ function App() {
 
                 <div className="flex-1 overflow-y-auto custom-scrollbar p-1">
                   {results && results.clips && results.clips.length > 0 ? (
-                    <div className={`grid gap-4 pb-10 ${status === 'complete' ? 'grid-cols-1 xl:grid-cols-2' : 'grid-cols-1'}`}>
+                    <div className={`grid gap-4 pb-10 ${status === 'complete' ? 'grid-cols-[repeat(auto-fill,minmax(min(100%,600px),1fr))]' : 'grid-cols-1'}`}>
                       {rankedClips.map(({ clip, index: i }) => (
                         <ResultCard
                           key={`${jobId}-${i}-${clip.video_url || ''}`}
@@ -2141,6 +2711,8 @@ function App() {
                           jobId={jobId}
                           onEditClip={(index) => setEditingClip(index)}
                           onReframeClip={(index) => setReframingClip(index)}
+                          onModeChanged={status === 'processing' ? null : handleClipRerendered}
+                          onUpgrade={isManaged ? openUpsell : null}
                           initialState={projectState?.clips?.find((c) => c.index === i) || null}
                           onStateChange={handleClipStateChange}
                           durable={durableClips[i]}
@@ -2163,7 +2735,9 @@ function App() {
                     status === 'processing' ? (
                       <div className="h-full min-h-[140px] flex flex-col items-center justify-center text-muted space-y-3 text-center px-4">
                         <Loader2 size={28} className="animate-spin text-brass" />
-                        <p className="text-sm lowercase">Waiting for clips...</p>
+                        <p className="text-sm lowercase">
+                          {clipsMaking ? `Making ${progress.total} ${progress.total === 1 ? 'clip' : 'clips'}...` : 'Waiting for clips...'}
+                        </p>
                         <p className="text-xs text-muted/80 max-w-[26ch] leading-snug">
                           They appear here one by one as each finishes rendering.
                         </p>
@@ -2333,16 +2907,27 @@ function App() {
         />
       )}
       {showLogin && <LoginModal onClose={() => setShowLogin(false)} queued={typeof peekPendingJob()?.data?.payload === 'string'} />}
-      {tutorialPhase && (
+      {showSurvey && <OnboardingSurvey onDone={() => setSurveyDone(true)} />}
+      {tutorialPhase && !showSurvey && (
         <ClipTutorial
           phase={tutorialPhase}
           jobStatus={status}
+          errorText={jobError}
           onStart={startTutorial}
           onSkip={skipTutorial}
           onDismissCelebrate={finishTutorial}
         />
       )}
       {showPlanChoice && <PlanChoiceModal onClose={() => setShowPlanChoice(false)} />}
+      {showWmNotice && (
+        <WatermarkModal
+          source="results"
+          jobId={jobId}
+          previewSrc={results?.clips?.[0]?.video_url ? getApiUrl(results.clips[0].video_url) : null}
+          onUpgrade={openUpsell}
+          onClose={() => setShowWmNotice(false)}
+        />
+      )}
       {showTopUp && (
         <TopUpModal
           onClose={() => setShowTopUp(false)}
@@ -2351,6 +2936,9 @@ function App() {
           partialMinutes={topUpInfo.partialMinutes}
           onPartial={topUpInfo.onPartial}
           context={topUpInfo.context || 'wall'}
+          source={topUpInfo.source}
+          highlight={topUpInfo.highlight}
+          partialJob={topUpInfo.partialJob}
         />
       )}
       {showTrialUpgrade && (

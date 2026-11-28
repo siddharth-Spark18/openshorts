@@ -39,6 +39,31 @@ export function capture() {
 }
 
 /**
+ * The first-touch snapshot flattened into event props: which page the visit
+ * started on (the static SEO pages write this same key, see seo/render.js),
+ * where from, and the campaign. Empty object when nothing was captured.
+ */
+export function firstTouchProps() {
+  try {
+    const raw = read(KEY);
+    if (!raw) return {};
+    const d = JSON.parse(raw);
+    let host = '';
+    try { host = d.referrer ? new URL(d.referrer).hostname : ''; } catch (_) { /* malformed */ }
+    const props = {
+      landing_path: String(d.landing_path || '').split('?')[0] || '/',
+      referrer_host: host || 'direct',
+    };
+    if (d.utm_source) props.utm_source = d.utm_source;
+    if (d.utm_medium) props.utm_medium = d.utm_medium;
+    if (d.utm_campaign) props.utm_campaign = d.utm_campaign;
+    return props;
+  } catch (_) {
+    return {};
+  }
+}
+
+/**
  * Post the snapshot for a freshly signed-up user. Fire-and-forget: the server
  * drops it if the account is not brand new or already has a row.
  */

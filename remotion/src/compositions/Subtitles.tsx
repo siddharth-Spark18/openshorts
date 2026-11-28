@@ -15,6 +15,11 @@ interface SubtitlesProps {
   config: SubtitleConfig;
 }
 
+// Hebrew, Arabic, Syriac, Thaana, NKo and their presentation forms. The words
+// are laid out as flex items, which always run left to right, so a block in
+// one of these scripts has to flip the row itself (github issue #89).
+const RTL_CHARS = /[\u0590-\u08FF\uFB1D-\uFDFF\uFE70-\uFEFF]/;
+
 const POSITION_MAP: Record<string, React.CSSProperties> = {
   top: { top: "12%", bottom: "auto" },
   middle: { top: "45%", bottom: "auto" },
@@ -103,6 +108,7 @@ const SubtitleBlock: React.FC<SubtitleBlockProps> = ({
           display: "flex",
           flexWrap: "wrap",
           justifyContent: "center",
+          direction: block.words.some((w) => RTL_CHARS.test(w.text)) ? "rtl" : "ltr",
           gap: "6px 8px",
           maxWidth: "85%",
           ...bgStyle,

@@ -1,3 +1,4 @@
+import os
 import subprocess
 
 import pytest
@@ -6,9 +7,11 @@ import ffmpeg_utils
 from ffmpeg_utils import (
     AI_DISCLOSURE,
     DELIVERY,
+    INTERMEDIATE,
     METADATA_SCRUB,
     QUALITY,
     QUALITY_FAST,
+    blurred_backdrop,
     mark_ai_generated,
     reset_encoder_cache,
     video_encode_args,
@@ -18,6 +21,8 @@ from ffmpeg_utils import (
 @pytest.fixture(autouse=True)
 def _clean_encoder_state(monkeypatch):
     monkeypatch.delenv("FFMPEG_ENCODER", raising=False)
+    monkeypatch.delenv("X264_PRESET", raising=False)
+    monkeypatch.setattr(ffmpeg_utils, "_gpu_cut_sources", {})
     reset_encoder_cache()
     yield
     reset_encoder_cache()
@@ -30,6 +35,22 @@ def test_default_args_pin_historical_x264_settings():
         "-c:v", "libx264", "-preset", "fast", "-crf", "18"]
     assert video_encode_args(DELIVERY) == [
         "-c:v", "libx264", "-preset", "fast", "-crf", "22"]
+
+
+def test_a_deployment_can_pick_a_faster_x264_preset(monkeypatch):
+    """A CPU-only host (the remote worker) trades a little size for CPU; the
+    CRF stays, NVENC and an unknown preset name are untouched."""
+    monkeypatch.setenv("X264_PRESET", "veryfast")
+    assert video_encode_args(QUALITY) == [
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "18"]
+    assert video_encode_args(DELIVERY)[3:] == ["veryfast", "-crf", "22"]
+    assert ffmpeg_utils._X264_ARGS[QUALITY][3] == "medium"      # not mutated
+    monkeypatch.setenv("X264_PRESET", "placebo; rm")
+    assert video_encode_args(QUALITY)[3] == "medium"
+    monkeypatch.setenv("X264_PRESET", "veryfast")
+    monkeypatch.setenv("FFMPEG_ENCODER", "nvenc")
+    monkeypatch.setattr(ffmpeg_utils, "_probe_nvenc", lambda: True)
+    assert video_encode_args(QUALITY)[:4] == ["-c:v", "h264_nvenc", "-preset", "p3"]
 
 
 def test_unknown_tier_raises():
@@ -208,3 +229,214 @@ def test_every_attempt_failing_raises_with_ffmpeg_stderr(_cut):
     with pytest.raises(RuntimeError, match="Invalid data found"):
         _cut([(1, 0, "Invalid data found when processing input")] * attempts)
     assert _cut.slept == list(ffmpeg_utils.CUT_RETRY_WAITS)
+
+
+def test_backdrop_blurs_at_quarter_size_and_fills_the_frame():
+    chain = blurred_backdrop(1080, 1920, 12)
+    assert "scale=-2:480,crop=w=min(iw\\,270):h=480" in chain
+    assert "gblur=sigma=3," in chain
+    assert chain.endswith("scale=1080:1920")
+
+
+def _gpu_source(monkeypatch, codec_pix):
+    monkeypatch.setattr(ffmpeg_utils, "_gpu_cut_sources", {})
+    monkeypatch.setattr(ffmpeg_utils, "_source_format",
+                        lambda path: tuple(codec_pix.split(",")))
+
+
+def test_cut_stays_on_the_gpu_for_8bit_420(_cut, monkeypatch):
+    _gpu_source(monkeypatch, "h264,yuv420p")
+    cmd = _cut([(0, 5_000_000, "")]).commands[0]
+    assert cmd[cmd.index("-hwaccel") + 1] == "cuda"
+    assert cmd[cmd.index("-hwaccel_output_format") + 1] == "cuda"
+    assert "-pix_fmt" not in cmd
+    assert "h264_nvenc" in cmd
+
+
+def test_cut_decodes_10bit_sources_on_the_cpu(_cut, monkeypatch):
+    _gpu_source(monkeypatch, "hevc,yuv420p10le")
+    cmd = _cut([(0, 5_000_000, "")]).commands[0]
+    assert "-hwaccel" not in cmd
+    assert cmd[cmd.index("-pix_fmt") + 1] == "yuv420p"
+
+
+def test_failed_gpu_cut_falls_back_to_the_cpu_decode(_cut, monkeypatch):
+    _gpu_source(monkeypatch, "av1,yuv420p")
+    fake = _cut([(1, 0, "cuvid error"), (0, 5_000_000, "")])
+    assert "-hwaccel" in fake.commands[0]
+    assert "-hwaccel" not in fake.commands[1]
+    assert len(fake.commands) == 2
+
+
+# --- INTERMEDIATE: the cut is decoded again at once, so NVENC spends bits, not effort ---
+
+def test_intermediate_keeps_the_cpu_settings_of_quality_fast():
+    assert video_encode_args(INTERMEDIATE) == video_encode_args(QUALITY_FAST)
+
+
+def test_intermediate_on_nvenc_is_the_cheap_preset(monkeypatch):
+    monkeypatch.setenv("FFMPEG_ENCODER", "nvenc")
+    monkeypatch.setattr(ffmpeg_utils, "_probe_nvenc", lambda: True)
+    args = video_encode_args(INTERMEDIATE)
+    assert args[:2] == ["-c:v", "h264_nvenc"]
+    assert args[args.index("-preset") + 1] == "p1"
+    assert "-spatial-aq" not in args and "-tune" not in args
+    assert args[-2:] == ["-pix_fmt", "yuv420p"]
+    monkeypatch.setenv("CUT_NVENC_PRESET", "p3")
+    monkeypatch.setenv("CUT_NVENC_CQ", "17")
+    args = video_encode_args(INTERMEDIATE)
+    assert args[args.index("-preset") + 1] == "p3"
+    assert args[args.index("-cq") + 1] == "17"
+
+
+def test_cut_uses_the_intermediate_tier(_cut):
+    cmd = _cut([(0, 5_000_000, "")]).commands[0]
+    assert cmd[cmd.index("-preset") + 1] == "p1"
+
+
+
+# --- the cut's keyframes: the layout checks seek into it once per sample ---
+
+def test_the_cut_has_a_keyframe_a_second(_cut, monkeypatch):
+    _gpu_source(monkeypatch, "h264,yuv420p")
+    cmd = _cut([(0, 5_000_000, "")]).commands[0]
+    assert "-hwaccel" in cmd and cmd[cmd.index("-g") + 1] == "30"
+    assert cmd.index("-g") < cmd.index("-c:a")              # an option of the video encode
+    _gpu_source(monkeypatch, "hevc,yuv420p10le")            # the CPU decode cuts the same way
+    cmd = _cut([(0, 5_000_000, "")]).commands[0]
+    assert "-hwaccel" not in cmd and cmd[cmd.index("-g") + 1] == "30"
+
+
+def test_the_cut_spacing_is_a_setting(_cut, monkeypatch):
+    monkeypatch.setenv("CUT_GOP", "60")
+    assert ffmpeg_utils.cut_gop_args() == ["-g", "60"]
+    monkeypatch.setenv("CUT_GOP", "0")                      # the encoder's own spacing
+    assert "-g" not in _cut([(0, 5_000_000, "")]).commands[0]
+    monkeypatch.setenv("CUT_GOP", "soon")
+    assert ffmpeg_utils.cut_gop() == 30
+
+
+def test_only_the_cut_is_spaced_that_way():
+    for tier in (QUALITY, QUALITY_FAST, DELIVERY, INTERMEDIATE):
+        assert "-g" not in video_encode_args(tier)          # what is delivered keeps the encoder's
+
+
+# --- bin/ffmpeg: the thread cap every ffmpeg of the image goes through ---
+
+WRAPPER = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                       "bin", "ffmpeg")
+
+
+def _wrapped(tmp_path, threads, *args):
+    echo = tmp_path / "echo-ffmpeg"
+    echo.write_text('#!/bin/sh\nfor a in "$@"; do printf \'%s\\n\' "$a"; done\n')
+    echo.chmod(0o755)
+    env = {"PATH": os.environ.get("PATH", ""), "FFMPEG_REAL_BIN": str(echo)}
+    if threads is not None:
+        env["FFMPEG_THREADS"] = threads
+    out = subprocess.run(["sh", WRAPPER, *args], env=env, capture_output=True,
+                         text=True, check=True).stdout
+    return out.splitlines()
+
+
+def test_wrapper_caps_decoder_and_filter_threads(tmp_path):
+    argv = _wrapped(tmp_path, "3", "-y", "-ss", "1", "-i", "a b.mp4", "-i", "logo.png",
+                    "-filter_complex", "[0:v][1:v]overlay", "-c:v", "h264_nvenc",
+                    "-threads", "8", "out.mp4")
+    assert argv == ["-filter_threads", "3", "-filter_complex_threads", "3",
+                    "-y", "-ss", "1", "-threads", "3", "-i", "a b.mp4",
+                    "-threads", "3", "-i", "logo.png",
+                    "-filter_complex", "[0:v][1:v]overlay", "-c:v", "h264_nvenc",
+                    "-threads", "8", "out.mp4"]
+
+
+def test_wrapper_keeps_what_the_caller_set(tmp_path):
+    argv = _wrapped(tmp_path, "2", "-threads", "5", "-i", "a.mp4",
+                    "-filter_threads", "1", "-i", "b.mp4", "out.mp4")
+    assert argv == ["-filter_complex_threads", "2", "-threads", "5", "-i", "a.mp4",
+                    "-filter_threads", "1", "-threads", "2", "-i", "b.mp4", "out.mp4"]
+
+
+@pytest.mark.parametrize("threads", [None, "", "0", "auto"])
+def test_wrapper_is_a_passthrough_when_unset(tmp_path, threads):
+    assert _wrapped(tmp_path, threads, "-i", "a.mp4", "x y.mp4") == ["-i", "a.mp4", "x y.mp4"]
+
+
+# --- 18-nov-2026: a probe at a VRAM peak sent whole jobs to libx264 ----------
+
+_OOM = ("[h264_nvenc] cuCtxCreate(...) failed -> CUDA_ERROR_OUT_OF_MEMORY: "
+        "out of memory\nNo capable devices found\n")
+
+
+def _fake_run(results):
+    """subprocess.run stand-in returning (returncode, stderr) in order."""
+    calls = []
+
+    def run(cmd, **kwargs):
+        calls.append(cmd)
+        rc, err = results[min(len(calls), len(results)) - 1]
+        if rc == "timeout":
+            raise subprocess.TimeoutExpired(cmd, 30)
+        return subprocess.CompletedProcess(cmd, rc, stderr=err)
+    return run, calls
+
+
+def test_probe_tells_a_full_card_from_a_missing_encoder(monkeypatch):
+    run, _ = _fake_run([(187, _OOM)])
+    monkeypatch.setattr(ffmpeg_utils.subprocess, "run", run)
+    assert ffmpeg_utils._probe_nvenc() is None
+    run, _ = _fake_run([("timeout", "")])
+    monkeypatch.setattr(ffmpeg_utils.subprocess, "run", run)
+    assert ffmpeg_utils._probe_nvenc() is None
+    run, _ = _fake_run([(1, "Unknown encoder 'h264_nvenc'\n")])
+    monkeypatch.setattr(ffmpeg_utils.subprocess, "run", run)
+    assert ffmpeg_utils._probe_nvenc() is False
+    run, _ = _fake_run([(0, "")])
+    monkeypatch.setattr(ffmpeg_utils.subprocess, "run", run)
+    assert ffmpeg_utils._probe_nvenc() is True
+
+
+def test_a_full_card_is_probed_again_and_nvenc_wins(monkeypatch):
+    run, calls = _fake_run([(187, _OOM), (0, "")])
+    monkeypatch.setattr(ffmpeg_utils.subprocess, "run", run)
+    monkeypatch.setattr(ffmpeg_utils.time, "sleep", lambda s: None)
+    monkeypatch.setenv("FFMPEG_ENCODER", "auto")
+    assert video_encode_args(QUALITY)[:2] == ["-c:v", "h264_nvenc"]
+    assert len(calls) == 2
+    # A real verdict is kept: no more probes.
+    video_encode_args(QUALITY)
+    assert len(calls) == 2
+
+
+def test_a_card_full_on_every_attempt_is_not_libx264_for_good(monkeypatch):
+    now = [1000.0]
+    monkeypatch.setattr(ffmpeg_utils.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(ffmpeg_utils.time, "sleep", lambda s: None)
+    monkeypatch.setattr(ffmpeg_utils, "NVENC_PROBE_ATTEMPTS", 3)
+    monkeypatch.setattr(ffmpeg_utils, "NVENC_REPROBE_SECONDS", 60.0)
+    run, calls = _fake_run([(187, _OOM)] * 3 + [(0, "")])
+    monkeypatch.setattr(ffmpeg_utils.subprocess, "run", run)
+    monkeypatch.setenv("FFMPEG_ENCODER", "auto")
+
+    assert video_encode_args(QUALITY)[:2] == ["-c:v", "libx264"]
+    assert len(calls) == 3                       # every attempt used
+    now[0] += 30
+    assert video_encode_args(QUALITY)[:2] == ["-c:v", "libx264"]
+    assert len(calls) == 3                       # within the window: no probe
+    now[0] += 31
+    assert video_encode_args(QUALITY)[:2] == ["-c:v", "h264_nvenc"]
+    assert len(calls) == 4
+    now[0] += 3600
+    video_encode_args(QUALITY)
+    assert len(calls) == 4                       # kept for good once it works
+
+
+def test_no_nvenc_on_the_host_is_kept_without_retries(monkeypatch):
+    sleeps = []
+    monkeypatch.setattr(ffmpeg_utils.time, "sleep", sleeps.append)
+    run, calls = _fake_run([(1, "Unknown encoder 'h264_nvenc'\n")])
+    monkeypatch.setattr(ffmpeg_utils.subprocess, "run", run)
+    monkeypatch.setenv("FFMPEG_ENCODER", "auto")
+    for _ in range(3):
+        assert video_encode_args(DELIVERY)[:2] == ["-c:v", "libx264"]
+    assert len(calls) == 1 and sleeps == []
