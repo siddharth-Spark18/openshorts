@@ -161,3 +161,196 @@ def test_source_automation_can_be_paused_by_owner(tmp_path, monkeypatch):
     assert client.get('/api/source-automation').json() == {'enabled': True}
     assert client.put('/api/source-automation', json={'enabled': False}).json() == {'enabled': False}
     assert client.get('/api/source-automation').json() == {'enabled': False}
+
+
+def test_factory_channels_and_idea_review_persist_privately(tmp_path, monkeypatch):
+    import jobs_db
+    monkeypatch.setattr(jobs_db, '_DB_PATH', str(tmp_path / 'jobs.db'))
+    jobs_db.init_db()
+    app = FastAPI()
+    install(app, 'password', ClipLibrary(tmp_path / 'library'))
+    client = TestClient(app, follow_redirects=False)
+    assert client.get('/api/factory/channels').status_code == 401
+    client.post('/owner/login', data={'password': 'password'})
+    assert client.post('/api/factory/channels', json={'name': '  ', 'content_type': 'workplace_skits'}).status_code == 400
+    channel = client.post('/api/factory/channels', json={'name': 'Office stories', 'content_type': 'workplace_skits'}).json()
+    idea = client.post(f"/api/factory/channels/{channel['id']}/ideas", json={'idea': 'A meeting that could have been an email'}).json()
+    assert idea['status'] == 'needs_review'
+    assert client.patch(f"/api/factory/ideas/{idea['id']}", json={'status': 'approved'}).status_code == 200
+    assert client.patch(f"/api/factory/ideas/{idea['id']}", json={'status': 'published'}).status_code == 400
+    rows = client.get('/api/factory/channels').json()['channels']
+    assert rows[0]['ideas'][0]['status'] == 'approved'
+    jobs_db.init_db()
+    assert client.get('/api/factory/channels').json()['channels'][0]['ideas'][0]['idea'].startswith('A meeting')
+
+
+def test_workplace_script_generation_edit_and_review(tmp_path, monkeypatch):
+    import jobs_db
+    import factory_story
+    monkeypatch.setattr(jobs_db, '_DB_PATH', str(tmp_path / 'jobs.db'))
+    monkeypatch.setenv('GEMINI_API_KEY', 'example')
+    monkeypatch.setattr(factory_story, 'generate_script', lambda idea, key: f'Title: A meeting\nBoss: {idea}')
+    jobs_db.init_db()
+    app = FastAPI()
+    install(app, 'password', ClipLibrary(tmp_path / 'library'))
+    client = TestClient(app, follow_redirects=False)
+    assert client.post(f'/api/factory/ideas/{uuid4()}/script').status_code == 401
+    client.post('/owner/login', data={'password': 'password'})
+    channel = client.post('/api/factory/channels', json={'name': 'Office', 'content_type': 'workplace_skits'}).json()
+    idea = client.post(f"/api/factory/channels/{channel['id']}/ideas", json={'idea': 'No meetings'}).json()
+    url = f"/api/factory/ideas/{idea['id']}"
+    assert client.post(url + '/script').status_code == 400
+    client.patch(url, json={'status': 'approved'})
+    draft = client.post(url + '/script').json()
+    assert draft['status'] == 'needs_review' and draft['revision'] == 1
+    approved = client.patch(url + '/script/review', json={'status': 'approved', 'revision': 1}).json()
+    assert approved['revision'] == 2
+    assert client.put(url + '/script', json={'script': 'Stale edit', 'revision': 1}).status_code == 409
+    edited = client.put(url + '/script', json={'script': 'Edited script', 'revision': 2}).json()
+    assert edited['status'] == 'needs_review' and edited['revision'] == 3
+    client.patch(url, json={'status': 'rejected'})
+    assert client.patch(url + '/script/review', json={'status': 'approved', 'revision': 3}).status_code == 409
+    item = client.get('/api/factory/channels').json()['channels'][0]['ideas'][0]
+    assert item['script'] == 'Edited script' and item['script_status'] == 'needs_review'
+
+
+def test_project_settings_are_private_persistent_and_used_for_scripts(tmp_path, monkeypatch):
+    import jobs_db
+    import factory_story
+    monkeypatch.setattr(jobs_db, '_DB_PATH', str(tmp_path / 'jobs.db'))
+    monkeypatch.setenv('GEMINI_API_KEY', 'example')
+    monkeypatch.setattr(factory_story, 'generate_script', lambda idea, key: 'Boss: ' + idea)
+    jobs_db.init_db()
+    app = FastAPI()
+    install(app, 'password', ClipLibrary(tmp_path / 'library'))
+    client = TestClient(app, follow_redirects=False)
+    settings = {'style': 'Dry humor', 'daily_target': 3, 'publishing_mode': 'automatic'}
+    assert client.put(f'/api/factory/channels/{uuid4()}/settings', json=settings).status_code == 401
+    client.post('/owner/login', data={'password': 'password'})
+    first = client.post('/api/factory/channels', json={'name': 'Office', 'content_type': 'workplace_skits'}).json()
+    second = client.post('/api/factory/channels', json={'name': 'Other', 'content_type': 'workplace_skits'}).json()
+    endpoint = f"/api/factory/channels/{first['id']}/settings"
+    assert client.put(endpoint, json={**settings, 'daily_target': 0}).status_code == 400
+    assert client.put(endpoint, json={**settings, 'publishing_mode': 'invalid'}).status_code == 400
+    assert client.put(f'/api/factory/channels/{uuid4()}/settings', json=settings).status_code == 404
+    assert client.put(endpoint, json=settings).json() == settings
+    jobs_db.init_db()
+    projects = {p['id']: p for p in client.get('/api/factory/channels').json()['channels']}
+    assert projects[first['id']]['settings'] == settings
+    assert projects[second['id']]['settings']['publishing_mode'] == 'manual'
+    idea = client.post(f"/api/factory/channels/{first['id']}/ideas", json={'idea': 'A meeting'}).json()
+    client.patch(f"/api/factory/ideas/{idea['id']}", json={'status': 'approved'})
+    assert 'Dry humor' in client.post(f"/api/factory/ideas/{idea['id']}/script").json()['script']
+
+
+def test_skit_render_requires_approval_and_invalidates_after_edit(tmp_path, monkeypatch):
+    import jobs_db
+    import factory_story
+    import factory_render
+    monkeypatch.setattr(jobs_db, '_DB_PATH', str(tmp_path / 'jobs.db'))
+    monkeypatch.setenv('GEMINI_API_KEY', 'example')
+    monkeypatch.setattr(factory_story, 'generate_script', lambda idea, key: 'Boss: Hello there.')
+    def fake_render(script, output):
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(b'video')
+    monkeypatch.setattr(factory_render, 'render', fake_render)
+    jobs_db.init_db()
+    app = FastAPI()
+    install(app, 'password', ClipLibrary(tmp_path / 'library'))
+    with TestClient(app, follow_redirects=False) as client:
+        client.post('/owner/login', data={'password': 'password'})
+        channel = client.post('/api/factory/channels', json={'name': 'Office', 'content_type': 'workplace_skits'}).json()
+        idea = client.post(f"/api/factory/channels/{channel['id']}/ideas", json={'idea': 'Meeting'}).json()
+        url = f"/api/factory/ideas/{idea['id']}"
+        client.patch(url, json={'status': 'approved'})
+        client.post(url + '/script')
+        assert client.post(url + '/render').status_code == 400
+        client.patch(url + '/script/review', json={'status': 'approved', 'revision': 1})
+        assert client.post(url + '/render').status_code == 202
+        import time
+        for _ in range(100):
+            if client.get(url + '/video').status_code == 200:
+                break
+            time.sleep(0.01)
+        assert client.get(url + '/video').content == b'video'
+        assert any(item['title'] == 'Workplace skit' for item in client.get('/api/library').json())
+        assert client.get('/api/factory/channels').json()['channels'][0]['ideas'][0]['video_ready'] == 1
+        assert client.get('/api/factory/channels').json()['channels'][0]['ideas'][0]['queue_status'] == 'needs_review'
+        assert client.put(url + '/video/review', json={'status': 'approved', 'revision': 1}).status_code == 409
+        assert client.put(url + '/video/review', json={'status': 'approved', 'revision': 2}).status_code == 200
+        assert client.get('/api/factory/channels').json()['channels'][0]['ideas'][0]['queue_status'] == 'approved'
+        client.put(url + '/script', json={'script': 'Boss: Goodbye.', 'revision': 2})
+        assert client.get(url + '/video').status_code == 404
+        assert client.get('/api/factory/channels').json()['channels'][0]['ideas'][0]['queue_status'] is None
+
+
+def test_generate_ideas_saves_batch_for_review(tmp_path, monkeypatch):
+    import jobs_db
+    import factory_story
+    monkeypatch.setattr(jobs_db, '_DB_PATH', str(tmp_path / 'jobs.db'))
+    monkeypatch.setenv('GEMINI_API_KEY', 'example')
+    seen = []
+    def generate(style, count, key):
+        seen.append((style, count, key))
+        return ['First funny meeting', 'Second funny meeting', 'Third funny meeting']
+    monkeypatch.setattr(factory_story, 'generate_ideas', generate)
+    jobs_db.init_db()
+    app = FastAPI()
+    install(app, 'password', ClipLibrary(tmp_path / 'library'))
+    client = TestClient(app, follow_redirects=False)
+    client.post('/owner/login', data={'password': 'password'})
+    project = client.post('/api/factory/channels', json={'name': 'Office', 'content_type': 'workplace_skits'}).json()
+    base = f"/api/factory/channels/{project['id']}"
+    client.put(base + '/settings', json={'style': 'Dry humor', 'daily_target': 3, 'publishing_mode': 'manual'})
+    assert client.post(base + '/ideas/generate', json={'count': 6}).status_code == 400
+    response = client.post(base + '/ideas/generate', json={'count': 3})
+    assert response.status_code == 201
+    assert seen == [('Dry humor', 3, 'example')]
+    jobs_db.init_db()
+    ideas = client.get('/api/factory/channels').json()['channels'][0]['ideas']
+    assert len(ideas) == 3 and all(idea['status'] == 'needs_review' for idea in ideas)
+
+
+def test_skit_render_runs_in_background_and_rejects_parallel_work(tmp_path, monkeypatch):
+    import time
+    import threading
+    import jobs_db
+    import factory_story
+    import factory_render
+    monkeypatch.setattr(jobs_db, '_DB_PATH', str(tmp_path / 'jobs.db'))
+    monkeypatch.setenv('GEMINI_API_KEY', 'example')
+    monkeypatch.setattr(factory_story, 'generate_script', lambda idea, key: 'Boss: Hello.')
+    started, finish = threading.Event(), threading.Event()
+    def delayed(script, output):
+        started.set()
+        assert finish.wait(3)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(b'video')
+    monkeypatch.setattr(factory_render, 'render', delayed)
+    jobs_db.init_db()
+    app = FastAPI()
+    install(app, 'password', ClipLibrary(tmp_path / 'library'))
+    with TestClient(app, follow_redirects=False) as client:
+        client.post('/owner/login', data={'password': 'password'})
+        channel = client.post('/api/factory/channels', json={'name': 'Office', 'content_type': 'workplace_skits'}).json()
+        idea = client.post(f"/api/factory/channels/{channel['id']}/ideas", json={'idea': 'Meeting'}).json()
+        url = f"/api/factory/ideas/{idea['id']}"
+        client.patch(url, json={'status': 'approved'})
+        client.post(url + '/script')
+        client.patch(url + '/script/review', json={'status': 'approved', 'revision': 1})
+        try:
+            assert client.post(url + '/render').status_code == 202
+            assert started.wait(1)
+            assert client.post(url + '/render').status_code == 409
+            item = client.get('/api/factory/channels').json()['channels'][0]['ideas'][0]
+            assert item['render_status'] == 'processing'
+            client.put(url + '/script', json={'script': 'Boss: Changed.', 'revision': 2})
+        finally:
+            finish.set()
+        for _ in range(100):
+            item = client.get('/api/factory/channels').json()['channels'][0]['ideas'][0]
+            if item['render_status'] != 'processing':
+                break
+            time.sleep(.01)
+        assert item['render_status'] == 'failed'
+        assert client.get(url + '/video').status_code == 404

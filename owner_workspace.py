@@ -1,5 +1,6 @@
 """Private single-owner session and persistent finished-clip library."""
 import hmac
+import asyncio
 import os
 import json
 import secrets
@@ -7,7 +8,7 @@ import shutil
 import tempfile
 import time
 from pathlib import Path
-from uuid import UUID, uuid4
+from uuid import UUID, uuid4, uuid5, NAMESPACE_URL
 from urllib.parse import urlsplit, quote
 from pydantic import BaseModel
 import re
@@ -85,7 +86,8 @@ def install(app, password, library):
     @app.middleware("http")
     async def require_owner(request: Request, call_next):
         public = {"/owner/login", "/health/ready", "/health/live", "/health/deployment"}
-        if request.url.path not in public:
+        media_grant = request.method in {'GET', 'HEAD'} and re.fullmatch(r'/api/factory/media/[A-Za-z0-9_-]{43}', request.url.path)
+        if request.url.path not in public and not media_grant:
             token = request.cookies.get(COOKIE, "")
             if sessions.get(token, 0) <= time.monotonic():
                 return JSONResponse({"detail": "Sign in to OpenShorts."}, status_code=401,
@@ -166,6 +168,379 @@ def install(app, password, library):
 
     import drive_connection
     drive_connection.install(app, library)
+
+    import factory_youtube
+    factory_youtube.install(app, library)
+    import factory_instagram
+    factory_instagram.install(app, library)
+
+    factory_render_lock = asyncio.Lock()
+    app.state.factory_render_active = False
+    app.state.factory_library = library
+
+    def ensure_not_publishing(con, idea_id):
+        if (con.execute("SELECT 1 FROM factory_publications WHERE idea_id=? AND status IN ('preparing','uploading')", (str(idea_id),)).fetchone()
+                or con.execute("SELECT 1 FROM factory_publish_queue WHERE idea_id=? AND status='processing'", (str(idea_id),)).fetchone()):
+            raise HTTPException(409, 'Wait for publishing to finish before changing this video.')
+
+    class FactoryChannel(BaseModel):
+        name: str
+        content_type: str
+
+    class FactoryIdea(BaseModel):
+        idea: str
+
+    class FactoryIdeaStatus(BaseModel):
+        status: str
+
+    class FactoryIdeaBatch(BaseModel):
+        count: int = 3
+
+    class FactoryProjectSettings(BaseModel):
+        style: str = ''
+        daily_target: int = 1
+        publishing_mode: str = 'manual'
+
+    @app.get("/api/factory/channels")
+    def list_factory_channels():
+        with jobs_db._conn() as con:
+            channels = [dict(row) for row in con.execute(
+                "SELECT * FROM factory_channels ORDER BY created_at DESC, rowid DESC")]
+            for channel in channels:
+                settings = con.execute("SELECT style,daily_target,publishing_mode FROM factory_project_settings WHERE channel_id=?", (channel['id'],)).fetchone()
+                channel['settings'] = dict(settings) if settings else {'style': '', 'daily_target': 1, 'publishing_mode': 'manual'}
+                connection = factory_youtube.read_connection(library.root, channel['id'])
+                instagram = factory_instagram.read_connection(library.root, channel['id'])
+                channel['connections'] = {'youtube': {'connected': bool(connection.get('refresh_token')),
+                    'channel_title': connection.get('channel_title'), 'channel_id': connection.get('channel_id'),
+                    'available': all(factory_youtube.credentials())}, 'instagram': {
+                        'connected': bool(instagram.get('access_token') and instagram.get('expires_at', 0) > time.time()),
+                        'username': instagram.get('username'), 'available': all(factory_instagram.credentials())}}
+                auto_state = con.execute('SELECT status,error FROM factory_auto_state WHERE channel_id=?', (channel['id'],)).fetchone()
+                channel['auto_production'] = dict(auto_state) if auto_state else {'status': 'idle', 'error': None}
+                channel["ideas"] = [dict(row) for row in con.execute(
+                    "SELECT i.*, s.script, s.status AS script_status, s.revision AS script_revision, "
+                    "CASE WHEN r.revision=s.revision AND s.status='approved' AND i.status='approved' THEN 1 ELSE 0 END AS video_ready, "
+                    "j.status AS render_status, j.error AS render_error, "
+                    "CASE WHEN q.revision=s.revision AND s.status='approved' AND i.status='approved' THEN q.status ELSE NULL END AS queue_status, "
+                    "p.status AS youtube_publication_status, p.remote_id AS youtube_video_id, "
+                    "pq.status AS schedule_status, pq.scheduled_at, "
+                    "ip.status AS instagram_publication_status, ip.remote_id AS instagram_media_id, "
+                    "iq.status AS instagram_schedule_status, iq.scheduled_at AS instagram_scheduled_at "
+                    "FROM factory_ideas i LEFT JOIN factory_scripts s ON s.idea_id=i.id "
+                    "LEFT JOIN factory_renders r ON r.idea_id=i.id "
+                    "LEFT JOIN factory_render_jobs j ON j.idea_id=i.id "
+                    "LEFT JOIN factory_review_queue q ON q.idea_id=i.id "
+                    "LEFT JOIN factory_publications p ON p.idea_id=i.id AND p.revision=s.revision AND p.platform='youtube' "
+                    "LEFT JOIN factory_publications ip ON ip.idea_id=i.id AND ip.revision=s.revision AND ip.platform='instagram' "
+                    "LEFT JOIN factory_publish_queue pq ON pq.idea_id=i.id AND pq.revision=s.revision AND pq.platform='youtube' "
+                    "LEFT JOIN factory_publish_queue iq ON iq.idea_id=i.id AND iq.revision=s.revision AND iq.platform='instagram' "
+                    "WHERE i.channel_id=? ORDER BY i.created_at DESC, i.rowid DESC",
+                    (channel["id"],))]
+        return {"channels": channels}
+
+    @app.post("/api/factory/channels", status_code=201)
+    def create_factory_channel(body: FactoryChannel):
+        name = body.name.strip()
+        if not name or len(name) > 100 or body.content_type not in {"gaming_clips", "workplace_skits"}:
+            raise HTTPException(400, "Enter a name and choose a content type.")
+        row = {"id": str(uuid4()), "name": name, "content_type": body.content_type,
+               "created_at": jobs_db._utcnow()}
+        with jobs_db._conn() as con:
+            con.execute("INSERT INTO factory_channels VALUES (:id,:name,:content_type,:created_at)", row)
+        return row
+
+    @app.put('/api/factory/channels/{channel_id}/settings')
+    def update_factory_settings(channel_id: UUID, body: FactoryProjectSettings):
+        style = body.style.strip()
+        if len(style) > 2000 or not 1 <= body.daily_target <= 20 or body.publishing_mode not in {'manual', 'automatic'}:
+            raise HTTPException(400, 'Choose a valid publishing mode, daily target (1–20), and style (up to 2,000 characters).')
+        with jobs_db._conn() as con:
+            if not con.execute('SELECT 1 FROM factory_channels WHERE id=?', (str(channel_id),)).fetchone():
+                raise HTTPException(404, 'Project not found.')
+            con.execute('INSERT INTO factory_project_settings (channel_id,style,daily_target,publishing_mode) VALUES (?,?,?,?) '
+                        'ON CONFLICT(channel_id) DO UPDATE SET style=excluded.style,daily_target=excluded.daily_target,publishing_mode=excluded.publishing_mode',
+                        (str(channel_id), style, body.daily_target, body.publishing_mode))
+            if body.publishing_mode == 'automatic':
+                from factory_schedule import schedule_approved
+                approved = con.execute("SELECT i.id,s.revision FROM factory_ideas i JOIN factory_scripts s ON s.idea_id=i.id "
+                    "JOIN factory_review_queue q ON q.idea_id=i.id AND q.revision=s.revision "
+                    "WHERE i.channel_id=? AND i.status='approved' AND s.status='approved' AND q.status='approved'", (str(channel_id),)).fetchall()
+                for idea in approved:
+                    schedule_approved(con, idea['id'], idea['revision'])
+        return {'style': style, 'daily_target': body.daily_target, 'publishing_mode': body.publishing_mode}
+
+    @app.post('/api/factory/channels/{channel_id}/production/retry')
+    def retry_factory_production(channel_id: UUID):
+        with jobs_db._conn() as con:
+            changed = con.execute("UPDATE factory_auto_state SET status='idle',error=NULL,updated_at=? WHERE channel_id=? AND status='failed'",
+                                  (jobs_db._utcnow(), str(channel_id)))
+            if not changed.rowcount:
+                raise HTTPException(409, 'There is no failed production to retry.')
+        return {'status': 'idle'}
+
+    @app.post("/api/factory/channels/{channel_id}/ideas", status_code=201)
+    def create_factory_idea(channel_id: UUID, body: FactoryIdea):
+        idea = body.idea.strip()
+        if not idea or len(idea) > 2000:
+            raise HTTPException(400, "Enter an idea of up to 2,000 characters.")
+        now = jobs_db._utcnow()
+        row = {"id": str(uuid4()), "channel_id": str(channel_id), "idea": idea,
+               "status": "needs_review", "created_at": now, "updated_at": now}
+        with jobs_db._conn() as con:
+            if not con.execute("SELECT 1 FROM factory_channels WHERE id=?", (str(channel_id),)).fetchone():
+                raise HTTPException(404, "Channel not found.")
+            con.execute("INSERT INTO factory_ideas VALUES (:id,:channel_id,:idea,:status,:created_at,:updated_at)", row)
+        return row
+
+    @app.post('/api/factory/channels/{channel_id}/ideas/generate', status_code=201)
+    async def generate_factory_ideas(channel_id: UUID, body: FactoryIdeaBatch):
+        import factory_story
+        if not 1 <= body.count <= 5:
+            raise HTTPException(400, 'Choose between one and five ideas.')
+        with jobs_db._conn() as con:
+            channel = con.execute("SELECT c.name,c.content_type,COALESCE(p.style,'') AS style FROM factory_channels c "
+                                  "LEFT JOIN factory_project_settings p ON p.channel_id=c.id WHERE c.id=?", (str(channel_id),)).fetchone()
+        if not channel:
+            raise HTTPException(404, 'Project not found.')
+        if channel['content_type'] != 'workplace_skits':
+            raise HTTPException(400, 'Idea generation is currently available for workplace skits.')
+        api_key = jobs_db.get_setting('gemini_key') or os.environ.get('GEMINI_API_KEY')
+        if not api_key:
+            raise HTTPException(400, 'Add a Gemini API key in Settings first.')
+        try:
+            ideas = await asyncio.to_thread(factory_story.generate_ideas, channel['style'], body.count, api_key)
+        except Exception as exc:
+            print(f'Idea generation failed: {type(exc).__name__}')
+            raise HTTPException(502, 'Could not generate ideas. Check your Gemini connection and try again.') from exc
+        now = jobs_db._utcnow()
+        rows = [{'id': str(uuid4()), 'channel_id': str(channel_id), 'idea': idea, 'status': 'needs_review',
+                 'created_at': now, 'updated_at': now} for idea in ideas]
+        with jobs_db._conn() as con:
+            con.execute('BEGIN IMMEDIATE')
+            if not con.execute('SELECT 1 FROM factory_channels WHERE id=?', (str(channel_id),)).fetchone():
+                raise HTTPException(404, 'Project no longer exists.')
+            con.executemany('INSERT INTO factory_ideas VALUES (:id,:channel_id,:idea,:status,:created_at,:updated_at)', rows)
+        return {'ideas': rows}
+
+    @app.patch("/api/factory/ideas/{idea_id}")
+    def update_factory_idea(idea_id: UUID, body: FactoryIdeaStatus):
+        if body.status not in {"needs_review", "approved", "rejected"}:
+            raise HTTPException(400, "Invalid review status.")
+        with jobs_db._conn() as con:
+            con.execute('BEGIN IMMEDIATE')
+            ensure_not_publishing(con, idea_id)
+            result = con.execute("UPDATE factory_ideas SET status=?, updated_at=? WHERE id=?",
+                                 (body.status, jobs_db._utcnow(), str(idea_id)))
+            if not result.rowcount:
+                raise HTTPException(404, "Idea not found.")
+            if body.status != "approved":
+                con.execute("UPDATE factory_scripts SET status='needs_review',revision=revision+1,updated_at=? WHERE idea_id=?",
+                            (jobs_db._utcnow(), str(idea_id)))
+                con.execute("UPDATE factory_publish_queue SET status='cancelled',updated_at=? WHERE idea_id=? AND status='pending'", (jobs_db._utcnow(), str(idea_id)))
+        return {"id": str(idea_id), "status": body.status}
+
+    class FactoryScript(BaseModel):
+        script: str
+        revision: int
+
+    class FactoryScriptReview(BaseModel):
+        status: str
+        revision: int
+
+    @app.post("/api/factory/ideas/{idea_id}/script")
+    async def generate_factory_script(idea_id: UUID):
+        import factory_story
+        with jobs_db._conn() as con:
+            idea = con.execute(
+                "SELECT i.idea,i.status,c.content_type, COALESCE(p.style, '') AS style FROM factory_ideas i "
+                "JOIN factory_channels c ON c.id=i.channel_id LEFT JOIN factory_project_settings p ON p.channel_id=c.id WHERE i.id=?", (str(idea_id),)).fetchone()
+            previous = con.execute("SELECT revision FROM factory_scripts WHERE idea_id=?", (str(idea_id),)).fetchone()
+        if not idea:
+            raise HTTPException(404, "Idea not found.")
+        if idea["content_type"] != "workplace_skits" or idea["status"] != "approved":
+            raise HTTPException(400, "Approve a workplace skit idea before generating its script.")
+        api_key = jobs_db.get_setting("gemini_key") or os.environ.get("GEMINI_API_KEY")
+        if not api_key:
+            raise HTTPException(400, "Add a Gemini API key in Settings first.")
+        revision = previous["revision"] if previous else 0
+        try:
+            prompt_idea = idea['idea']
+            if idea['style']:
+                prompt_idea += '\n\nDesired project style: ' + idea['style']
+            script = await asyncio.to_thread(factory_story.generate_script, prompt_idea, api_key)
+        except Exception as exc:
+            print(f"Script generation failed: {type(exc).__name__}")
+            raise HTTPException(502, "Could not generate the script. Check your Gemini connection and try again.") from exc
+        with jobs_db._conn() as con:
+            con.execute("BEGIN IMMEDIATE")
+            ensure_not_publishing(con, idea_id)
+            current = con.execute("SELECT revision FROM factory_scripts WHERE idea_id=?", (str(idea_id),)).fetchone()
+            still_approved = con.execute("SELECT status FROM factory_ideas WHERE id=?", (str(idea_id),)).fetchone()
+            if (current["revision"] if current else 0) != revision or not still_approved or still_approved["status"] != "approved":
+                raise HTTPException(409, "The idea or script changed while generating. Try again.")
+            con.execute("INSERT INTO factory_scripts VALUES (?,?,?,?,?) ON CONFLICT(idea_id) DO UPDATE SET "
+                        "script=excluded.script,status=excluded.status,revision=excluded.revision,updated_at=excluded.updated_at",
+                        (str(idea_id), script, "needs_review", revision + 1, jobs_db._utcnow()))
+            con.execute("UPDATE factory_publish_queue SET status='cancelled',updated_at=? WHERE idea_id=? AND status='pending'", (jobs_db._utcnow(), str(idea_id)))
+        return {"script": script, "status": "needs_review", "revision": revision + 1}
+
+    @app.put("/api/factory/ideas/{idea_id}/script")
+    def edit_factory_script(idea_id: UUID, body: FactoryScript):
+        script = body.script.strip()
+        if not script or len(script) > 12000:
+            raise HTTPException(400, "Enter a script of up to 12,000 characters.")
+        with jobs_db._conn() as con:
+            con.execute('BEGIN IMMEDIATE')
+            ensure_not_publishing(con, idea_id)
+            result = con.execute("UPDATE factory_scripts SET script=?,status='needs_review',revision=revision+1,updated_at=? "
+                                 "WHERE idea_id=? AND revision=?", (script, jobs_db._utcnow(), str(idea_id), body.revision))
+            if not result.rowcount:
+                raise HTTPException(409, "The script changed. Refresh and try again.")
+            con.execute("UPDATE factory_publish_queue SET status='cancelled',updated_at=? WHERE idea_id=? AND status='pending'", (jobs_db._utcnow(), str(idea_id)))
+        return {"script": script, "status": "needs_review", "revision": body.revision + 1}
+
+    @app.patch("/api/factory/ideas/{idea_id}/script/review")
+    def review_factory_script(idea_id: UUID, body: FactoryScriptReview):
+        if body.status not in {"approved", "rejected", "needs_review"}:
+            raise HTTPException(400, "Invalid review status.")
+        with jobs_db._conn() as con:
+            con.execute('BEGIN IMMEDIATE')
+            ensure_not_publishing(con, idea_id)
+            result = con.execute("UPDATE factory_scripts SET status=?,revision=revision+1,updated_at=? "
+                                 "WHERE idea_id=? AND revision=? AND EXISTS "
+                                 "(SELECT 1 FROM factory_ideas WHERE id=? AND status='approved')",
+                                 (body.status, jobs_db._utcnow(), str(idea_id), body.revision, str(idea_id)))
+            if not result.rowcount:
+                raise HTTPException(409, "The script changed or its idea is no longer approved. Refresh and try again.")
+            con.execute("UPDATE factory_publish_queue SET status='cancelled',updated_at=? WHERE idea_id=? AND status='pending'", (jobs_db._utcnow(), str(idea_id)))
+        return {"status": body.status, "revision": body.revision + 1}
+
+    async def _run_factory_skit(idea_id, revision, script, output):
+        import factory_render
+        status, error = 'failed', 'Rendering was interrupted. Try again.'
+        try:
+            await asyncio.to_thread(factory_render.render, script, output)
+            with jobs_db._conn() as con:
+                con.execute("BEGIN IMMEDIATE")
+                current = con.execute("SELECT s.revision FROM factory_scripts s JOIN factory_ideas i ON i.id=s.idea_id "
+                                      "WHERE s.idea_id=? AND s.status='approved' AND i.status='approved'", (idea_id,)).fetchone()
+                if not current or current['revision'] != revision:
+                    output.unlink(missing_ok=True)
+                    error = 'The script changed during rendering. Approve it and render again.'
+                else:
+                    archive_id = str(uuid5(NAMESPACE_URL, f"openshorts:factory:{idea_id}:{revision}"))
+                    library.archive(archive_id, {"status": "completed", "output_dir": output.parent,
+                        "result": {"clips": [{"title": "Workplace skit", "video_url": f"/videos/{archive_id}/{output.name}"}]}})
+                    if not (library.root / archive_id / 'index.json').is_file():
+                        raise RuntimeError("Could not save skit to the clip library")
+                    con.execute("INSERT INTO factory_renders VALUES (?,?,?) ON CONFLICT(idea_id) DO UPDATE SET "
+                                "revision=excluded.revision,created_at=excluded.created_at", (idea_id, revision, jobs_db._utcnow()))
+                    automatic = con.execute("SELECT 1 FROM factory_auto_ideas a JOIN factory_project_settings p ON p.channel_id=a.channel_id "
+                        "WHERE a.idea_id=? AND p.publishing_mode='automatic'", (idea_id,)).fetchone()
+                    video_review = 'approved' if automatic else 'needs_review'
+                    con.execute("INSERT INTO factory_review_queue VALUES (?,?,?,?) ON CONFLICT(idea_id) DO UPDATE SET "
+                                "revision=excluded.revision,status=excluded.status,updated_at=excluded.updated_at",
+                                (idea_id, revision, video_review, jobs_db._utcnow()))
+                    if automatic:
+                        from factory_schedule import schedule_approved
+                        schedule_approved(con, idea_id, revision)
+                    status, error = 'completed', None
+        except Exception as exc:
+            print(f"Skit render failed: {type(exc).__name__}")
+            error = 'Could not render the skit. Check server logs and try again.'
+        finally:
+            try:
+                with jobs_db._conn() as con:
+                    con.execute("UPDATE factory_render_jobs SET status=?,error=?,updated_at=? WHERE idea_id=? AND revision=?",
+                                (status, error, jobs_db._utcnow(), idea_id, revision))
+                    auto_idea = con.execute('SELECT channel_id FROM factory_auto_ideas WHERE idea_id=?', (idea_id,)).fetchone()
+                    if auto_idea:
+                        con.execute("UPDATE factory_auto_state SET status=?,error=?,updated_at=? WHERE channel_id=?",
+                            ('idle' if status == 'completed' else 'failed', error, jobs_db._utcnow(), auto_idea['channel_id']))
+            finally:
+                app.state.factory_render_active = False
+
+    @app.post("/api/factory/ideas/{idea_id}/render", status_code=202)
+    async def render_factory_skit(idea_id: UUID):
+        import factory_render
+        async with factory_render_lock:
+            if app.state.factory_render_active:
+                raise HTTPException(409, "Another skit is rendering. Try again when it finishes.")
+            guard = getattr(app.state, 'factory_render_guard', None)
+            if guard and not guard():
+                raise HTTPException(409, "Wait for processing or deployment to finish before rendering a skit.")
+            if shutil.disk_usage(library.root).free < 2 * 1024**3:
+                raise HTTPException(507, 'At least 2 GB of free storage is needed to render a skit.')
+            with jobs_db._conn() as con:
+                con.execute('BEGIN IMMEDIATE')
+                ensure_not_publishing(con, idea_id)
+                row = con.execute("SELECT s.script,s.revision FROM factory_scripts s "
+                                  "JOIN factory_ideas i ON i.id=s.idea_id "
+                                  "WHERE s.idea_id=? AND s.status='approved' AND i.status='approved'", (str(idea_id),)).fetchone()
+                active = con.execute("SELECT 1 FROM jobs WHERE status IN ('queued','processing') LIMIT 1").fetchone()
+                if not row:
+                    raise HTTPException(400, "Approve the idea and script before rendering.")
+                if active:
+                    raise HTTPException(409, "Wait for video processing to finish before rendering a skit.")
+                try:
+                    factory_render.dialogue_lines(row['script'])
+                except ValueError as exc:
+                    raise HTTPException(400, str(exc)) from exc
+                con.execute("INSERT INTO factory_render_jobs VALUES (?,?,?,?,?) ON CONFLICT(idea_id) DO UPDATE SET "
+                            "revision=excluded.revision,status=excluded.status,error=NULL,updated_at=excluded.updated_at",
+                            (str(idea_id), row['revision'], 'processing', None, jobs_db._utcnow()))
+                con.execute("UPDATE factory_review_queue SET status='needs_review',updated_at=? WHERE idea_id=? AND revision=?",
+                            (jobs_db._utcnow(), str(idea_id), row['revision']))
+                con.execute("UPDATE factory_publish_queue SET status='cancelled',updated_at=? WHERE idea_id=? AND revision=? AND status='pending'",
+                            (jobs_db._utcnow(), str(idea_id), row['revision']))
+            app.state.factory_render_active = True
+            output = library.root / 'factory' / str(idea_id) / f'{row["revision"]}.mp4'
+            asyncio.create_task(_run_factory_skit(str(idea_id), row['revision'], row['script'], output))
+            return {"status": "processing"}
+
+    app.state.factory_render_skit = render_factory_skit
+
+    @app.get("/api/factory/ideas/{idea_id}/video")
+    def factory_skit_video(idea_id: UUID):
+        with jobs_db._conn() as con:
+            row = con.execute("SELECT r.revision FROM factory_renders r JOIN factory_scripts s ON s.idea_id=r.idea_id "
+                              "JOIN factory_ideas i ON i.id=s.idea_id WHERE r.idea_id=? AND r.revision=s.revision "
+                              "AND s.status='approved' AND i.status='approved'", (str(idea_id),)).fetchone()
+        path = library.root / 'factory' / str(idea_id) / f'{row["revision"]}.mp4' if row else None
+        if not path or not path.is_file():
+            raise HTTPException(404, "No current skit video is available.")
+        return FileResponse(path, media_type='video/mp4', filename='workplace-skit.mp4')
+
+    class FactoryVideoReview(BaseModel):
+        status: str
+        revision: int
+
+    @app.put('/api/factory/ideas/{idea_id}/video/review')
+    def review_factory_video(idea_id: UUID, body: FactoryVideoReview):
+        if body.status not in {'needs_review', 'approved', 'rejected'}:
+            raise HTTPException(400, 'Invalid video review status.')
+        with jobs_db._conn() as con:
+            con.execute('BEGIN IMMEDIATE')
+            ensure_not_publishing(con, idea_id)
+            row = con.execute("SELECT s.revision FROM factory_scripts s JOIN factory_ideas i ON i.id=s.idea_id "
+                              "JOIN factory_renders r ON r.idea_id=s.idea_id AND r.revision=s.revision "
+                              "WHERE i.id=? AND i.status='approved' AND s.status='approved'", (str(idea_id),)).fetchone()
+            if con.execute("SELECT 1 FROM factory_render_jobs WHERE idea_id=? AND status='processing'", (str(idea_id),)).fetchone():
+                raise HTTPException(409, 'Wait for rendering to finish before reviewing this video.')
+            path = library.root / 'factory' / str(idea_id) / f'{body.revision}.mp4'
+            if not row or row['revision'] != body.revision or not path.is_file():
+                raise HTTPException(409, 'The video is missing or out of date. Render the current approved script first.')
+            con.execute('INSERT INTO factory_review_queue VALUES (?,?,?,?) ON CONFLICT(idea_id) DO UPDATE SET '
+                        'revision=excluded.revision,status=excluded.status,updated_at=excluded.updated_at',
+                        (str(idea_id), body.revision, body.status, jobs_db._utcnow()))
+            from factory_schedule import schedule_approved
+            if body.status == 'approved':
+                schedule_approved(con, str(idea_id), body.revision)
+            else:
+                con.execute("UPDATE factory_publish_queue SET status='cancelled',updated_at=? WHERE idea_id=? AND revision=? AND status='pending'",
+                            (jobs_db._utcnow(), str(idea_id), body.revision))
+        return {'status': body.status, 'revision': body.revision}
 
     class SourceChannel(BaseModel):
         url: str

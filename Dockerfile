@@ -50,7 +50,7 @@ WORKDIR /app
 # fontconfig + fonts-liberation back the subtitle font choices: without real
 # fonts libass falls back to DejaVu for every UI option (issue #57).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg \
+    ffmpeg espeak-ng \
     curl \
     libgl1 \
     libglib2.0-0 \

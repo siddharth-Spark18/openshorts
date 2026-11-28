@@ -874,10 +874,10 @@ async def _drain_then_exit(previous_handler, timeout=None, proxy_grace=None,
     proxy_grace = PROXY_DRAIN_SECONDS if proxy_grace is None else proxy_grace
     hard_exit_after = HARD_EXIT_SECONDS if hard_exit_after is None else hard_exit_after
     deadline = time.time() + timeout
-    while _running_jobs and time.time() < deadline:
+    while (_running_jobs or getattr(app.state, 'factory_render_active', False)) and time.time() < deadline:
         await asyncio.sleep(1)
-    if _running_jobs:
-        print(f"⏱️ Drain timeout after {timeout}s with {len(_running_jobs)} job(s) still "
+    if _running_jobs or getattr(app.state, 'factory_render_active', False):
+        print(f"⏱️ Drain timeout after {timeout}s with {len(_running_jobs) + int(getattr(app.state, 'factory_render_active', False))} job(s) still "
               f"running — they will resume on the next instance.")
     else:
         print("✅ Drained: no running jobs.")
@@ -1279,7 +1279,7 @@ async def process_queue():
 
             # Acquire semaphore slot (waits if max jobs are running)
             await concurrency_semaphore.acquire()
-            while _deployment_paused() and not _draining:
+            while (_deployment_paused() or getattr(app.state, 'factory_render_active', False)) and not _draining:
                 await asyncio.sleep(1)
             if _draining:
                 concurrency_semaphore.release()
@@ -1899,6 +1899,10 @@ async def sync_owner_drive():
 async def lifespan(app: FastAPI):
     # Initialise persistent SQLite store (Fix 2 & 3).
     jobs_db.init_db()
+    if owner_library:
+        with jobs_db._conn() as con:
+            con.execute("UPDATE factory_render_jobs SET status='failed', error='Rendering was interrupted. Try again.', updated_at=? WHERE status='processing'", (jobs_db._utcnow(),))
+            con.execute("UPDATE factory_auto_state SET status='failed', error='Rendering was interrupted. Retry to continue.', updated_at=? WHERE status='rendering'", (jobs_db._utcnow(),))
     # Rehydrate finished jobs from disk before serving (survives restarts).
     _recover_jobs_from_disk()
     if owner_library:
@@ -1919,6 +1923,10 @@ async def lifespan(app: FastAPI):
     if owner_library:
         asyncio.create_task(sync_owner_drive())
         asyncio.create_task(discover_owner_sources())
+        import factory_schedule
+        asyncio.create_task(factory_schedule.worker(app, owner_library, lambda: not _draining and not _deployment_paused()))
+        import factory_autopilot
+        asyncio.create_task(factory_autopilot.worker(app, lambda: not _draining and not _deployment_paused()))
     worker_task = asyncio.create_task(process_queue())
     cleanup_task = asyncio.create_task(cleanup_jobs())
     if BILLING_ENABLED:
@@ -1941,6 +1949,7 @@ if os.environ.get("OWNER_PASSWORD"):
     import owner_workspace
     owner_library = owner_workspace.ClipLibrary(os.environ.get("CLIP_LIBRARY_DIR", "library"))
     owner_workspace.install(app, os.environ["OWNER_PASSWORD"], owner_library)
+    app.state.factory_render_guard = lambda: not _draining and not _deployment_paused() and not _running_jobs
 
 
 # Cloud mode: attach middleware + routers at import time (before the app serves).
@@ -2252,7 +2261,7 @@ async def health_ready():
 async def deployment_status(request: Request):
     if not request.client or request.client.host not in ("127.0.0.1", "::1"):
         raise HTTPException(403, "Local access only.")
-    return {"running_jobs": len(_running_jobs), "paused": _deployment_paused()}
+    return {"running_jobs": len(_running_jobs) + int(getattr(app.state, 'factory_render_active', False)), "paused": _deployment_paused()}
 
 
 @app.get("/api/config")

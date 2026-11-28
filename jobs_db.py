@@ -120,12 +120,85 @@ def init_db() -> None:
                     lease_until REAL
                 );
 
+                CREATE TABLE IF NOT EXISTS factory_channels (
+                    id TEXT PRIMARY KEY, name TEXT NOT NULL, content_type TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS factory_project_settings (
+                    channel_id TEXT PRIMARY KEY, style TEXT NOT NULL DEFAULT '',
+                    daily_target INTEGER NOT NULL DEFAULT 1,
+                    publishing_mode TEXT NOT NULL DEFAULT 'manual',
+                    FOREIGN KEY(channel_id) REFERENCES factory_channels(id)
+                );
+                CREATE TABLE IF NOT EXISTS factory_ideas (
+                    id TEXT PRIMARY KEY, channel_id TEXT NOT NULL, idea TEXT NOT NULL,
+                    status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                    FOREIGN KEY(channel_id) REFERENCES factory_channels(id)
+                );
+
+                CREATE TABLE IF NOT EXISTS factory_scripts (
+                    idea_id TEXT PRIMARY KEY, script TEXT NOT NULL, status TEXT NOT NULL,
+                    revision INTEGER NOT NULL, updated_at TEXT NOT NULL,
+                    FOREIGN KEY(idea_id) REFERENCES factory_ideas(id)
+                );
+
+                CREATE TABLE IF NOT EXISTS factory_renders (
+                    idea_id TEXT PRIMARY KEY, revision INTEGER NOT NULL, created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS factory_render_jobs (
+                    idea_id TEXT PRIMARY KEY, revision INTEGER NOT NULL, status TEXT NOT NULL,
+                    error TEXT, updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS factory_review_queue (
+                    idea_id TEXT PRIMARY KEY, revision INTEGER NOT NULL,
+                    status TEXT NOT NULL, updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS factory_publications (
+                    idea_id TEXT NOT NULL, revision INTEGER NOT NULL, platform TEXT NOT NULL,
+                    status TEXT NOT NULL, remote_id TEXT, error TEXT, updated_at TEXT NOT NULL,
+                    PRIMARY KEY(idea_id,revision,platform)
+                );
+
+                CREATE TABLE IF NOT EXISTS factory_publish_queue (
+                    idea_id TEXT NOT NULL, revision INTEGER NOT NULL, channel_id TEXT NOT NULL,
+                    platform TEXT NOT NULL,
+                    scheduled_at TEXT NOT NULL, status TEXT NOT NULL, error TEXT, updated_at TEXT NOT NULL,
+                    PRIMARY KEY(idea_id,revision,platform)
+                );
+
+                CREATE TABLE IF NOT EXISTS factory_media_grants (
+                    token_hash TEXT PRIMARY KEY, idea_id TEXT NOT NULL, revision INTEGER NOT NULL,
+                    expires_at REAL NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS factory_auto_ideas (
+                    idea_id TEXT PRIMARY KEY, channel_id TEXT NOT NULL, created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS factory_auto_state (
+                    channel_id TEXT PRIMARY KEY, status TEXT NOT NULL, error TEXT, updated_at TEXT NOT NULL
+                );
+
                 -- Generic key-value store for persisted settings (API keys, etc.).
                 CREATE TABLE IF NOT EXISTS settings (
                     key   TEXT PRIMARY KEY,
                     value TEXT NOT NULL
                 );
             """)
+            columns = {row['name'] for row in con.execute('PRAGMA table_info(factory_publish_queue)')}
+            if 'platform' not in columns:
+                con.executescript("""
+                    ALTER TABLE factory_publish_queue RENAME TO factory_publish_queue_v1;
+                    CREATE TABLE factory_publish_queue (
+                        idea_id TEXT NOT NULL, revision INTEGER NOT NULL, channel_id TEXT NOT NULL,
+                        platform TEXT NOT NULL, scheduled_at TEXT NOT NULL, status TEXT NOT NULL,
+                        error TEXT, updated_at TEXT NOT NULL, PRIMARY KEY(idea_id,revision,platform)
+                    );
+                    INSERT INTO factory_publish_queue SELECT idea_id,revision,channel_id,'youtube',scheduled_at,status,error,updated_at FROM factory_publish_queue_v1;
+                    DROP TABLE factory_publish_queue_v1;
+                """)
         print(f"📦 jobs_db: initialised at {_DB_PATH}")
     except Exception as e:
         print(f"⚠️ jobs_db: could not initialise DB: {e}")
