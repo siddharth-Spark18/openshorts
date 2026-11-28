@@ -1903,6 +1903,8 @@ async def lifespan(app: FastAPI):
         with jobs_db._conn() as con:
             con.execute("UPDATE factory_render_jobs SET status='failed', error='Rendering was interrupted. Try again.', updated_at=? WHERE status='processing'", (jobs_db._utcnow(),))
             con.execute("UPDATE factory_auto_state SET status='failed', error='Rendering was interrupted. Retry to continue.', updated_at=? WHERE status='rendering'", (jobs_db._utcnow(),))
+            con.execute("UPDATE factory_publications SET status='uncertain', error='Upload was interrupted. Check the destination before retrying.', updated_at=? WHERE status IN ('preparing','uploading')", (jobs_db._utcnow(),))
+            con.execute("UPDATE factory_publish_queue SET status='failed', error='Upload was interrupted. Check the destination before retrying.', updated_at=? WHERE status='processing'", (jobs_db._utcnow(),))
     # Rehydrate finished jobs from disk before serving (survives restarts).
     _recover_jobs_from_disk()
     if owner_library:

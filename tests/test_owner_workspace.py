@@ -311,6 +311,44 @@ def test_generate_ideas_saves_batch_for_review(tmp_path, monkeypatch):
     assert len(ideas) == 3 and all(idea['status'] == 'needs_review' for idea in ideas)
 
 
+def test_rerender_creates_a_new_version_in_library(tmp_path, monkeypatch):
+    import time
+    import jobs_db
+    import factory_story
+    import factory_render
+    monkeypatch.setattr(jobs_db, '_DB_PATH', str(tmp_path / 'jobs.db'))
+    monkeypatch.setenv('GEMINI_API_KEY', 'example')
+    monkeypatch.setattr(factory_story, 'generate_script', lambda idea, key: 'Boss: Hello.')
+    calls = []
+    def render(script, output):
+        calls.append(1)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(f'video-{len(calls)}'.encode())
+    monkeypatch.setattr(factory_render, 'render', render)
+    jobs_db.init_db()
+    app = FastAPI()
+    install(app, 'password', ClipLibrary(tmp_path / 'library'))
+    with TestClient(app, follow_redirects=False) as client:
+        client.post('/owner/login', data={'password': 'password'})
+        project = client.post('/api/factory/channels', json={'name': 'Office', 'content_type': 'workplace_skits'}).json()['id']
+        idea = client.post(f'/api/factory/channels/{project}/ideas', json={'idea': 'Meeting'}).json()['id']
+        url = f'/api/factory/ideas/{idea}'
+        client.patch(url, json={'status': 'approved'})
+        client.post(url + '/script')
+        client.patch(url + '/script/review', json={'status': 'approved', 'revision': 1})
+        for expected in (2, 3):
+            assert client.post(url + '/render').status_code == 202
+            for _ in range(100):
+                item = client.get('/api/factory/channels').json()['channels'][0]['ideas'][0]
+                if item['render_status'] == 'completed' and item['script_revision'] == expected:
+                    break
+                time.sleep(.01)
+            assert item['script_revision'] == expected and item['queue_status'] == 'needs_review'
+        assert client.get(url + '/video').content == b'video-2'
+        clips = client.get('/api/library').json()
+        assert len(clips) == 2
+
+
 def test_skit_render_runs_in_background_and_rejects_parallel_work(tmp_path, monkeypatch):
     import time
     import threading

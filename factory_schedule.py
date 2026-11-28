@@ -20,6 +20,10 @@ def schedule_approved(con, idea_id, revision):
     if not row or row['publishing_mode'] != 'automatic':
         return
     for platform in ('youtube', 'instagram'):
+        publication = con.execute('SELECT status FROM factory_publications WHERE idea_id=? AND revision=? AND platform=?',
+                                  (idea_id, revision, platform)).fetchone()
+        if publication and publication['status'] in {'published', 'preparing', 'uploading', 'uncertain'}:
+            continue
         existing = con.execute("SELECT status FROM factory_publish_queue WHERE idea_id=? AND revision=? AND platform=?", (idea_id, revision, platform)).fetchone()
         if existing and existing['status'] != 'cancelled':
             continue

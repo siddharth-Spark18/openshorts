@@ -45,22 +45,31 @@ def _font(size):
 def _draw_frame(path, title, speaker, text, index, *, mouth_open=False, gesture=False):
     image = Image.new('RGB', (720, 1280), '#e8e3d9')
     d = ImageDraw.Draw(image)
-    d.rectangle((0, 0, 720, 370), fill='#cbd8dc')
-    d.rectangle((0, 790, 720, 1280), fill='#c6b39c')
-    d.rounded_rectangle((42, 45, 678, 230), radius=18, fill='#fffaf1')
-    d.text((65, 75), title[:35], font=_font(34), fill='#1b2631')
-    # Simple original office character, deliberately using fixed-size geometry.
-    skin = '#e0ae88' if index % 2 == 0 else '#bb886a'
+    d.rectangle((0, 0, 720, 790), fill='#d8e2dd')
+    d.rectangle((0, 790, 720, 1280), fill='#bea98d')
+    d.rounded_rectangle((465, 225, 680, 465), radius=12, fill='#9dbec4', outline='#f5f0e4', width=12)
+    d.line((572, 230, 572, 460), fill='#f5f0e4', width=8)
+    d.line((470, 345, 675, 345), fill='#f5f0e4', width=8)
+    d.rounded_rectangle((42, 42, 678, 175), radius=18, fill='#fffaf1')
+    d.text((65, 64), 'WORKPLACE STORIES', font=_font(24), fill='#547a79')
+    d.text((65, 105), title[:32], font=_font(30), fill='#1b2631')
+    skins = ('#e0ae88', '#bb886a', '#cf9671', '#8e604c')
+    shirts = ('#345c79', '#ab6956', '#617757', '#645477')
+    skin = skins[index % len(skins)]
     d.ellipse((263, 365, 457, 560), fill=skin, outline='#263344', width=8)
+    d.pieslice((263, 350, 457, 465), 180, 360, fill='#34404a')
     d.ellipse((318, 438, 332, 452), fill='#263344')
     d.ellipse((390, 438, 404, 452), fill='#263344')
     if mouth_open:
         d.ellipse((342, 474, 378, 496), fill='#263344')
     else:
         d.arc((330, 450, 390, 500), 0, 180, fill='#263344', width=5)
-    d.rounded_rectangle((230, 555, 490, 900), radius=30, fill='#345c79' if index % 2 == 0 else '#ab6956')
+    d.rounded_rectangle((230, 555, 490, 900), radius=30, fill=shirts[index % len(shirts)])
     d.line((248, 610, 185 if gesture else 215, 720 if gesture else 800), fill=skin, width=30)
     d.ellipse((168 if gesture else 198, 703 if gesture else 783, 202 if gesture else 232, 737 if gesture else 817), fill=skin)
+    d.rounded_rectangle((80, 825, 640, 915), radius=12, fill='#866e5a')
+    d.rounded_rectangle((440, 746, 575, 832), radius=8, fill='#354a54')
+    d.rectangle((430, 827, 585, 839), fill='#53636a')
     d.rounded_rectangle((40, 930, 680, 1230), radius=18, fill='#fffaf1')
     d.text((65, 950), speaker[:25], font=_font(32), fill='#2f5873')
     font = _font(42)
@@ -112,6 +121,8 @@ def _speech_poses(path, frames_per_second=8):
 
 def render(script, output_path, *, speech_command='espeak-ng', ffmpeg_command='ffmpeg', voice_settings=None):
     lines = dialogue_lines(script)
+    title_match = re.search(r'^\s*Title:\s*(.+)$', script, re.IGNORECASE | re.MULTILINE)
+    title = title_match.group(1).strip().strip('"') if title_match else 'Office moments'
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=output.parent, prefix='.skit-') as temporary:
@@ -133,7 +144,7 @@ def render(script, output_path, *, speech_command='espeak-ng', ffmpeg_command='f
             for caption_index, caption in enumerate(captions):
                 variants = [temp / f'{idx}-caption-{caption_index}-pose-{pose}.png' for pose in range(4)]
                 for pose, frame in enumerate(variants):
-                    _draw_frame(frame, 'WORKPLACE STORIES', speaker, caption, speaker_id,
+                    _draw_frame(frame, title, speaker, caption, speaker_id,
                                 mouth_open=bool(pose % 2), gesture=pose >= 2)
                 frames.append(variants)
             poses = _speech_poses(wav)

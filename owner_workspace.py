@@ -513,13 +513,19 @@ def install(app, password, library):
                     factory_render.dialogue_lines(row['script'])
                 except ValueError as exc:
                     raise HTTPException(400, str(exc)) from exc
+                row = dict(row)
+                previous_render = con.execute('SELECT revision FROM factory_renders WHERE idea_id=?', (str(idea_id),)).fetchone()
+                if previous_render and previous_render['revision'] == row['revision']:
+                    row['revision'] += 1
+                    con.execute('UPDATE factory_scripts SET revision=?,updated_at=? WHERE idea_id=?',
+                                (row['revision'], jobs_db._utcnow(), str(idea_id)))
                 con.execute("INSERT INTO factory_render_jobs VALUES (?,?,?,?,?) ON CONFLICT(idea_id) DO UPDATE SET "
                             "revision=excluded.revision,status=excluded.status,error=NULL,updated_at=excluded.updated_at",
                             (str(idea_id), row['revision'], 'processing', None, jobs_db._utcnow()))
                 con.execute("UPDATE factory_review_queue SET status='needs_review',updated_at=? WHERE idea_id=? AND revision=?",
                             (jobs_db._utcnow(), str(idea_id), row['revision']))
-                con.execute("UPDATE factory_publish_queue SET status='cancelled',updated_at=? WHERE idea_id=? AND revision=? AND status='pending'",
-                            (jobs_db._utcnow(), str(idea_id), row['revision']))
+                con.execute("UPDATE factory_publish_queue SET status='cancelled',updated_at=? WHERE idea_id=? AND status='pending'",
+                            (jobs_db._utcnow(), str(idea_id)))
             app.state.factory_render_active = True
             output = library.root / 'factory' / str(idea_id) / f'{row["revision"]}.mp4'
             asyncio.create_task(_run_factory_skit(str(idea_id), row['revision'], row['script'], output, dict(voice) if voice else None))
@@ -542,6 +548,22 @@ def install(app, password, library):
     class FactoryVideoReview(BaseModel):
         status: str
         revision: int
+
+    @app.post('/api/factory/ideas/{idea_id}/{platform}/confirm-not-published')
+    def confirm_not_published(idea_id: UUID, platform: str):
+        if platform not in {'youtube', 'instagram'}:
+            raise HTTPException(404, 'Unknown platform.')
+        with jobs_db._conn() as con:
+            con.execute('BEGIN IMMEDIATE')
+            row = con.execute("SELECT p.revision FROM factory_publications p JOIN factory_scripts s "
+                              "ON s.idea_id=p.idea_id AND s.revision=p.revision "
+                              "WHERE p.idea_id=? AND p.platform=? AND p.status='uncertain'", (str(idea_id), platform)).fetchone()
+            if not row:
+                raise HTTPException(409, 'There is no uncertain upload to resolve.')
+            con.execute("UPDATE factory_publications SET status='failed',error='Owner confirmed no post was published.',updated_at=? "
+                        "WHERE idea_id=? AND revision=? AND platform=? AND status='uncertain'",
+                        (jobs_db._utcnow(), str(idea_id), row['revision'], platform))
+        return {'status': 'ready_to_retry'}
 
     @app.put('/api/factory/ideas/{idea_id}/video/review')
     def review_factory_video(idea_id: UUID, body: FactoryVideoReview):

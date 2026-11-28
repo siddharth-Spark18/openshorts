@@ -127,3 +127,22 @@ def test_upload_location_must_be_google_https(tmp_path, monkeypatch):
     assert client.post(f'/api/factory/ideas/{idea}/youtube/publish').status_code == 502
     with jobs_db._conn() as con:
         assert con.execute('SELECT status FROM factory_publications').fetchone()['status'] == 'failed'
+
+
+def test_uncertain_publication_requires_explicit_reconciliation(tmp_path, monkeypatch):
+    monkeypatch.setattr(jobs_db, '_DB_PATH', str(tmp_path / 'jobs.db'))
+    jobs_db.init_db()
+    app = FastAPI()
+    install(app, 'password', ClipLibrary(tmp_path / 'library'))
+    client = TestClient(app, follow_redirects=False)
+    client.post('/owner/login', data={'password': 'password'})
+    project = client.post('/api/factory/channels', json={'name': 'Office', 'content_type': 'workplace_skits'}).json()['id']
+    idea = client.post(f'/api/factory/channels/{project}/ideas', json={'idea': 'A meeting'}).json()['id']
+    with jobs_db._conn() as con:
+        con.execute("INSERT INTO factory_scripts VALUES (?, 'Boss: Hello.', 'approved', 2, 'now')", (idea,))
+        con.execute("INSERT INTO factory_publications VALUES (?,2,'youtube','uncertain',NULL,NULL,'now')", (idea,))
+    endpoint = f'/api/factory/ideas/{idea}/youtube/confirm-not-published'
+    assert client.post(endpoint).json() == {'status': 'ready_to_retry'}
+    assert client.post(endpoint).status_code == 409
+    with jobs_db._conn() as con:
+        assert con.execute('SELECT status FROM factory_publications').fetchone()['status'] == 'failed'

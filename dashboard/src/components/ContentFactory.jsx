@@ -105,10 +105,12 @@ function ScriptEditor({ idea, busy, act, youtubeConnected, instagramConnected })
         {idea.instagram_schedule_status === 'failed' && <p className="text-sm text-muted">Scheduled Instagram upload failed. Check Instagram before retrying.</p>}
         {idea.youtube_publication_status === 'published' && <p><a className="text-brass underline" href={`https://www.youtube.com/watch?v=${encodeURIComponent(idea.youtube_video_id)}`} target="_blank" rel="noreferrer">View published YouTube video</a></p>}
         {['preparing', 'uploading', 'uncertain'].includes(idea.youtube_publication_status) && <p role="status" className="text-sm text-muted">Upload is in progress or its outcome is uncertain. Check YouTube Studio before attempting another upload.</p>}
+        {idea.youtube_publication_status === 'uncertain' && <button type="button" className="btn-quiet px-3 py-2" disabled={busy} onClick={() => { if (window.confirm('Have you checked YouTube Studio and confirmed this video was not published?')) act(idea, 'confirm-youtube'); }}>I checked YouTube — allow retry</button>}
         {idea.queue_status === 'approved' && youtubeConnected && !['published', 'preparing', 'uploading', 'uncertain'].includes(idea.youtube_publication_status) &&
           <button type="button" className="btn-primary px-3 py-2" disabled={busy} onClick={() => act(idea, 'publish-youtube')}>Publish to YouTube</button>}
         {idea.instagram_publication_status === 'published' && <p className="text-sm text-muted">Published to Instagram.</p>}
         {['preparing', 'uploading', 'uncertain'].includes(idea.instagram_publication_status) && <p role="status" className="text-sm text-muted">Instagram upload is in progress or uncertain. Check Instagram before trying again.</p>}
+        {idea.instagram_publication_status === 'uncertain' && <button type="button" className="btn-quiet px-3 py-2" disabled={busy} onClick={() => { if (window.confirm('Have you checked Instagram and confirmed this video was not published?')) act(idea, 'confirm-instagram'); }}>I checked Instagram — allow retry</button>}
         {idea.queue_status === 'approved' && instagramConnected && !['published', 'preparing', 'uploading', 'uncertain'].includes(idea.instagram_publication_status) &&
           <button type="button" className="btn-primary px-3 py-2" disabled={busy} onClick={() => act(idea, 'publish-instagram')}>Publish to Instagram</button>}
       </div>}
@@ -147,7 +149,9 @@ export default function ContentFactory() {
             body: JSON.stringify(action === 'save' ? { script: text, revision: idea.script_revision }
               : { status: action, revision: idea.script_revision }) };
       const ideaBase = base.replace(/\/script$/, '');
-      if (action === 'publish-youtube' || action === 'publish-instagram') {
+      if (action === 'confirm-youtube' || action === 'confirm-instagram') {
+        await apiJson(`${ideaBase}/${action.slice(8)}/confirm-not-published`, { method: 'POST' });
+      } else if (action === 'publish-youtube' || action === 'publish-instagram') {
         await apiJson(`${ideaBase}/${action.slice(8)}/publish`, { method: 'POST' });
       } else if (action.startsWith('video-')) {
         await apiJson(`${ideaBase}/video/review`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ status: action.slice(6), revision: idea.script_revision }) });
