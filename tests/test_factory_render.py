@@ -26,6 +26,13 @@ def test_speech_poses_follow_audio_activity(tmp_path):
     assert factory_render._speech_poses(path) == [0, 1]
 
 
+def test_caption_chunks_preserve_words_and_stay_short():
+    text = 'The meeting could have been a short email to everyone in the office.'
+    chunks = factory_render._caption_chunks(text)
+    assert ' '.join(chunks) == text
+    assert len(chunks) > 1 and all(len(chunk) <= 35 for chunk in chunks)
+
+
 @pytest.mark.skipif(not shutil.which('ffmpeg'), reason='ffmpeg unavailable')
 def test_offline_render_produces_playable_video(tmp_path):
     speech = tmp_path / 'fake-speech'

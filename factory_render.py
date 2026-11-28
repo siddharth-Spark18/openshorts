@@ -63,7 +63,7 @@ def _draw_frame(path, title, speaker, text, index, *, mouth_open=False, gesture=
     d.ellipse((168 if gesture else 198, 703 if gesture else 783, 202 if gesture else 232, 737 if gesture else 817), fill=skin)
     d.rounded_rectangle((40, 930, 680, 1230), radius=18, fill='#fffaf1')
     d.text((65, 950), speaker[:25], font=_font(32), fill='#2f5873')
-    font = _font(32)
+    font = _font(42)
     words, current, lines = text.split(), '', []
     for word in words:
         candidate = f'{current} {word}'.strip()
@@ -74,8 +74,23 @@ def _draw_frame(path, title, speaker, text, index, *, mouth_open=False, gesture=
             current = candidate
     if current:
         lines.append(current)
-    d.multiline_text((65, 1000), '\n'.join(lines[:5]), font=font, fill='#1b2631', spacing=8)
+    d.multiline_text((65, 1000), '\n'.join(lines[:3]), font=font, fill='#1b2631', spacing=8)
     image.save(path)
+
+
+def _caption_chunks(text, limit=35):
+    """Keep captions short enough to read on a vertical screen."""
+    chunks, current = [], ''
+    for word in text.split():
+        candidate = f'{current} {word}'.strip()
+        if current and len(candidate) > limit:
+            chunks.append(current)
+            current = word
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    return chunks or [text]
 
 
 def _speech_poses(path, frames_per_second=8):
@@ -95,7 +110,7 @@ def _speech_poses(path, frames_per_second=8):
     return poses or [0]
 
 
-def render(script, output_path, *, speech_command='espeak-ng', ffmpeg_command='ffmpeg'):
+def render(script, output_path, *, speech_command='espeak-ng', ffmpeg_command='ffmpeg', voice_settings=None):
     lines = dialogue_lines(script)
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -106,21 +121,38 @@ def render(script, output_path, *, speech_command='espeak-ng', ffmpeg_command='f
         for idx, (speaker, text) in enumerate(lines):
             speaker_id = speakers.setdefault(speaker.lower(), len(speakers))
             wav, segment = temp / f'{idx}.wav', temp / f'{idx}.mp4'
-            subprocess.run([speech_command, '-s', '155', '-p', str(40 + (speaker_id % 4) * 12),
-                            '-w', str(wav)], input=text.encode('utf-8'), check=True, timeout=60, capture_output=True)
-            frames = [temp / f'{idx}-pose-{pose}.png' for pose in range(4)]
-            for pose, frame in enumerate(frames):
-                _draw_frame(frame, 'WORKPLACE STORIES', speaker, text, speaker_id,
-                            mouth_open=bool(pose % 2), gesture=pose >= 2)
+            if voice_settings and voice_settings['provider'] == 'google':
+                import factory_tts
+                voice = voice_settings['voice_one'] if speaker_id % 2 == 0 else voice_settings['voice_two']
+                factory_tts.synthesize(text, wav, voice)
+            else:
+                subprocess.run([speech_command, '-s', '155', '-p', str(40 + (speaker_id % 4) * 12),
+                                '-w', str(wav)], input=text.encode('utf-8'), check=True, timeout=60, capture_output=True)
+            captions = _caption_chunks(text)
+            frames = []
+            for caption_index, caption in enumerate(captions):
+                variants = [temp / f'{idx}-caption-{caption_index}-pose-{pose}.png' for pose in range(4)]
+                for pose, frame in enumerate(variants):
+                    _draw_frame(frame, 'WORKPLACE STORIES', speaker, caption, speaker_id,
+                                mouth_open=bool(pose % 2), gesture=pose >= 2)
+                frames.append(variants)
             poses = _speech_poses(wav)
             manifest = temp / f'{idx}-poses.txt'
-            frame_names = [frames[mouth + (2 if (n // 8) % 2 else 0)].name for n, mouth in enumerate(poses)]
+            total_weight = sum(len(caption) for caption in captions)
+            frame_names = []
+            for n, mouth in enumerate(poses):
+                position = n * total_weight / len(poses)
+                caption_index = 0
+                while caption_index < len(captions) - 1 and position >= len(captions[caption_index]):
+                    position -= len(captions[caption_index])
+                    caption_index += 1
+                frame_names.append(frames[caption_index][mouth + (2 if (n // 8) % 2 else 0)].name)
             manifest.write_text(''.join(f"file '{name}'\nduration 0.125\n" for name in frame_names) +
                                 f"file '{frame_names[-1]}'\n", encoding='utf-8')
             subprocess.run([ffmpeg_command, '-v', 'error', '-y', '-f', 'concat', '-safe', '1',
                             '-i', str(manifest), '-i', str(wav), '-r', '12', '-shortest', '-c:v', 'libx264',
                             '-preset', 'ultrafast', '-threads', '1', '-pix_fmt', 'yuv420p',
-                            '-c:a', 'aac', '-movflags', '+faststart', str(segment)],
+                            '-c:a', 'aac', '-af', 'adenorm,loudnorm=I=-16:TP=-1.5:LRA=11', '-ar', '24000', '-movflags', '+faststart', str(segment)],
                            check=True, timeout=180, capture_output=True)
             segments.append(segment)
         manifest = temp / 'concat.txt'

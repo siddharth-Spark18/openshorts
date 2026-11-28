@@ -130,6 +130,14 @@ def init_db() -> None:
                     publishing_mode TEXT NOT NULL DEFAULT 'manual',
                     FOREIGN KEY(channel_id) REFERENCES factory_channels(id)
                 );
+                CREATE TABLE IF NOT EXISTS factory_voice_settings (
+                    channel_id TEXT PRIMARY KEY, provider TEXT NOT NULL DEFAULT 'offline',
+                    voice_one TEXT NOT NULL DEFAULT 'en-US-Neural2-F',
+                    voice_two TEXT NOT NULL DEFAULT 'en-US-Neural2-D'
+                );
+                CREATE TABLE IF NOT EXISTS factory_tts_usage (
+                    month TEXT PRIMARY KEY, characters INTEGER NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS factory_ideas (
                     id TEXT PRIMARY KEY, channel_id TEXT NOT NULL, idea TEXT NOT NULL,
                     status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,

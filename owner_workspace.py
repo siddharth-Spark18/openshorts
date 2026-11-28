@@ -201,6 +201,11 @@ def install(app, password, library):
         daily_target: int = 1
         publishing_mode: str = 'manual'
 
+    class FactoryVoiceSettings(BaseModel):
+        provider: str = 'offline'
+        voice_one: str = 'en-US-Neural2-F'
+        voice_two: str = 'en-US-Neural2-D'
+
     @app.get("/api/factory/channels")
     def list_factory_channels():
         with jobs_db._conn() as con:
@@ -209,6 +214,8 @@ def install(app, password, library):
             for channel in channels:
                 settings = con.execute("SELECT style,daily_target,publishing_mode FROM factory_project_settings WHERE channel_id=?", (channel['id'],)).fetchone()
                 channel['settings'] = dict(settings) if settings else {'style': '', 'daily_target': 1, 'publishing_mode': 'manual'}
+                voice = con.execute('SELECT provider,voice_one,voice_two FROM factory_voice_settings WHERE channel_id=?', (channel['id'],)).fetchone()
+                channel['voice_settings'] = dict(voice) if voice else {'provider': 'offline', 'voice_one': 'en-US-Neural2-F', 'voice_two': 'en-US-Neural2-D'}
                 connection = factory_youtube.read_connection(library.root, channel['id'])
                 instagram = factory_instagram.read_connection(library.root, channel['id'])
                 channel['connections'] = {'youtube': {'connected': bool(connection.get('refresh_token')),
@@ -278,6 +285,19 @@ def install(app, password, library):
             if not changed.rowcount:
                 raise HTTPException(409, 'There is no failed production to retry.')
         return {'status': 'idle'}
+
+    @app.put('/api/factory/channels/{channel_id}/voice')
+    def update_factory_voice(channel_id: UUID, body: FactoryVoiceSettings):
+        import factory_tts
+        if body.provider not in {'offline', 'google'} or body.voice_one not in factory_tts.VOICES or body.voice_two not in factory_tts.VOICES:
+            raise HTTPException(400, 'Choose a valid voice provider and voices.')
+        with jobs_db._conn() as con:
+            if not con.execute('SELECT 1 FROM factory_channels WHERE id=?', (str(channel_id),)).fetchone():
+                raise HTTPException(404, 'Project not found.')
+            con.execute('INSERT INTO factory_voice_settings VALUES (?,?,?,?) ON CONFLICT(channel_id) DO UPDATE SET '
+                        'provider=excluded.provider,voice_one=excluded.voice_one,voice_two=excluded.voice_two',
+                        (str(channel_id), body.provider, body.voice_one, body.voice_two))
+        return body.model_dump()
 
     @app.post("/api/factory/channels/{channel_id}/ideas", status_code=201)
     def create_factory_idea(channel_id: UUID, body: FactoryIdea):
@@ -416,11 +436,15 @@ def install(app, password, library):
             con.execute("UPDATE factory_publish_queue SET status='cancelled',updated_at=? WHERE idea_id=? AND status='pending'", (jobs_db._utcnow(), str(idea_id)))
         return {"status": body.status, "revision": body.revision + 1}
 
-    async def _run_factory_skit(idea_id, revision, script, output):
+    async def _run_factory_skit(idea_id, revision, script, output, voice_settings):
         import factory_render
+        import factory_tts
         status, error = 'failed', 'Rendering was interrupted. Try again.'
         try:
-            await asyncio.to_thread(factory_render.render, script, output)
+            if voice_settings and voice_settings['provider'] == 'google':
+                await asyncio.to_thread(factory_render.render, script, output, voice_settings=voice_settings)
+            else:
+                await asyncio.to_thread(factory_render.render, script, output)
             with jobs_db._conn() as con:
                 con.execute("BEGIN IMMEDIATE")
                 current = con.execute("SELECT s.revision FROM factory_scripts s JOIN factory_ideas i ON i.id=s.idea_id "
@@ -448,7 +472,7 @@ def install(app, password, library):
                     status, error = 'completed', None
         except Exception as exc:
             print(f"Skit render failed: {type(exc).__name__}")
-            error = 'Could not render the skit. Check server logs and try again.'
+            error = str(exc) if isinstance(exc, factory_tts.SpeechError) else 'Could not render the skit. Check server logs and try again.'
         finally:
             try:
                 with jobs_db._conn() as con:
@@ -478,6 +502,8 @@ def install(app, password, library):
                 row = con.execute("SELECT s.script,s.revision FROM factory_scripts s "
                                   "JOIN factory_ideas i ON i.id=s.idea_id "
                                   "WHERE s.idea_id=? AND s.status='approved' AND i.status='approved'", (str(idea_id),)).fetchone()
+                voice = con.execute('SELECT v.provider,v.voice_one,v.voice_two FROM factory_voice_settings v '
+                                    'JOIN factory_ideas i ON i.channel_id=v.channel_id WHERE i.id=?', (str(idea_id),)).fetchone()
                 active = con.execute("SELECT 1 FROM jobs WHERE status IN ('queued','processing') LIMIT 1").fetchone()
                 if not row:
                     raise HTTPException(400, "Approve the idea and script before rendering.")
@@ -496,13 +522,13 @@ def install(app, password, library):
                             (jobs_db._utcnow(), str(idea_id), row['revision']))
             app.state.factory_render_active = True
             output = library.root / 'factory' / str(idea_id) / f'{row["revision"]}.mp4'
-            asyncio.create_task(_run_factory_skit(str(idea_id), row['revision'], row['script'], output))
+            asyncio.create_task(_run_factory_skit(str(idea_id), row['revision'], row['script'], output, dict(voice) if voice else None))
             return {"status": "processing"}
 
     app.state.factory_render_skit = render_factory_skit
 
     @app.get("/api/factory/ideas/{idea_id}/video")
-    def factory_skit_video(idea_id: UUID):
+    def factory_skit_video(idea_id: UUID, inline: bool = False):
         with jobs_db._conn() as con:
             row = con.execute("SELECT r.revision FROM factory_renders r JOIN factory_scripts s ON s.idea_id=r.idea_id "
                               "JOIN factory_ideas i ON i.id=s.idea_id WHERE r.idea_id=? AND r.revision=s.revision "
@@ -510,7 +536,8 @@ def install(app, password, library):
         path = library.root / 'factory' / str(idea_id) / f'{row["revision"]}.mp4' if row else None
         if not path or not path.is_file():
             raise HTTPException(404, "No current skit video is available.")
-        return FileResponse(path, media_type='video/mp4', filename='workplace-skit.mp4')
+        return FileResponse(path, media_type='video/mp4', filename='workplace-skit.mp4',
+                            content_disposition_type='inline' if inline else 'attachment')
 
     class FactoryVideoReview(BaseModel):
         status: str

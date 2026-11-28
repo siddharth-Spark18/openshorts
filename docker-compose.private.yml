@@ -18,6 +18,7 @@ services:
       INSTAGRAM_APP_SECRET: ${INSTAGRAM_APP_SECRET:-}
       INSTAGRAM_OAUTH_REDIRECT_URI: ${INSTAGRAM_OAUTH_REDIRECT_URI:-https://openshorts-dev.duckdns.org/api/factory/instagram/callback}
       FACTORY_PUBLIC_SITE_URL: ${FACTORY_PUBLIC_SITE_URL:-https://openshorts-dev.duckdns.org}
+      GOOGLE_TTS_CREDENTIALS_JSON: ${GOOGLE_TTS_CREDENTIALS_JSON:-}
       DRIVE_PICKER_API_KEY: ${DRIVE_PICKER_API_KEY:-}
       YOUTUBE_DATA_API_KEY: ${YOUTUBE_DATA_API_KEY:-}
       YOUTUBE_COOKIES_PATH: /app/output/.youtube-cookies.txt
