@@ -37,4 +37,12 @@ elif compose ps --status running --services | grep -qx backend; then
   echo "Existing backend has no deployment pause. Checking jobs again before build."
 fi
 
+# Keep recent build layers for fast rebuilds; Docker only prunes unused cache.
+# Never prune volumes or tagged images: they may contain data or support rollback.
+echo "Removing unused Docker build cache older than seven days."
+docker builder prune --force --filter until=168h || echo "Warning: build cache cleanup failed." >&2
+
 compose up --build -d
+
+echo "Removing dangling Docker images older than seven days."
+docker image prune --force --filter until=168h || echo "Warning: image cleanup failed." >&2
